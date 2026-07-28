@@ -967,6 +967,19 @@ test('rapid 1M to 5m keeps old commit until rearmed subscriber commits the lates
   assert.equal(runtime.snapshot().committed?.tradingViewResolution, '5')
 })
 
+test('Spot chart loading overlay stays opaque while TradingView initializes', () => {
+  const chartSource = readFileSync(
+    fileURLToPath(new URL('../SpotTradingViewChart.tsx', import.meta.url)),
+    'utf8',
+  )
+
+  assert.match(
+    chartSource,
+    /pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-\[#12161c\]/,
+  )
+  assert.doesNotMatch(chartSource, /bg-\[#12161c\]\/75/)
+})
+
 test('Spot chart uses Runtime Coordinator as its only lifecycle commit authority', () => {
   const chartSource = readFileSync(
     fileURLToPath(new URL('../SpotTradingViewChart.tsx', import.meta.url)),

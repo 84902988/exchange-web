@@ -516,6 +516,26 @@ def _effective_gas_price_wei(w3: Any, is_eip1559: bool) -> int:
     return int(w3.eth.gas_price)
 
 
+def _calculate_dynamic_withdraw_fee_usdt(
+    *,
+    fee_native: Decimal,
+    native_price_usdt: Decimal,
+    buffer: Decimal,
+    min_fee: Decimal,
+) -> Tuple[Decimal, Decimal, str]:
+    raw_fee_usdt = (fee_native * native_price_usdt).quantize(
+        Decimal("0.000001"),
+        rounding=ROUND_HALF_UP,
+    )
+    buffered_fee_usdt = (raw_fee_usdt * buffer).quantize(
+        Decimal("0.000001"),
+        rounding=ROUND_HALF_UP,
+    )
+    fee_source = "DYNAMIC" if buffered_fee_usdt >= min_fee else "MIN_FEE"
+    final_fee = buffered_fee_usdt if buffered_fee_usdt >= min_fee else min_fee
+    return raw_fee_usdt, final_fee, fee_source
+
+
 def _make_fee_web3(rpc_url: str) -> Any:
     from app.services.rpc_no_proxy import build_web3_no_proxy
 
@@ -709,9 +729,12 @@ def estimate_fee_usdt_detail(db: Session, symbol: str, chain_key: str, amount: O
             )
 
             fee_native = (Decimal(gas_price_wei) * Decimal(gas_limit)) / Decimal(10**18)
-            raw_fee_usdt = (fee_native * price * buffer).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
-            fee_source = "DYNAMIC" if raw_fee_usdt >= min_fee else "MIN_FEE"
-            final_fee = raw_fee_usdt if raw_fee_usdt >= min_fee else min_fee
+            raw_fee_usdt, final_fee, fee_source = _calculate_dynamic_withdraw_fee_usdt(
+                fee_native=fee_native,
+                native_price_usdt=price,
+                buffer=buffer,
+                min_fee=min_fee,
+            )
             if fee_source == "MIN_FEE":
                 logger.debug(
                     "[withdraw-fee] dynamic success below min chain=%s symbol=%s raw_fee=%s min_fee=%s gas_limit=%s gas_price=%s native=%s price=%s source=%s rpc=%s",

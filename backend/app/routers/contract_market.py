@@ -7,6 +7,7 @@ from typing import Any, Callable, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 
+from app.db.models.asset import Asset
 from app.db.models.contract_symbol import ContractSymbol
 from app.db.session import SessionLocal, get_db
 from app.schemas.contract_market import (
@@ -191,13 +192,54 @@ def _normalize_contract_category(value: str) -> str:
     return normalized.upper()
 
 
-def _contract_symbol_payload(item: ContractSymbol) -> dict:
+def _contract_base_asset_symbol(item: ContractSymbol) -> str:
+    symbol = str(getattr(item, "symbol", "") or "").strip().upper()
+    quote_asset = str(getattr(item, "quote_asset", "") or "").strip().upper()
+    market_symbol = symbol.removesuffix("_PERP")
+    if quote_asset and market_symbol.endswith(quote_asset) and len(market_symbol) > len(quote_asset):
+        return market_symbol[: -len(quote_asset)]
+    return market_symbol
+
+
+def _load_contract_base_asset_logo_urls(
+    db: Session,
+    items: List[ContractSymbol],
+) -> dict[str, Optional[str]]:
+    base_assets = sorted(
+        {
+            base_asset
+            for item in items
+            if (base_asset := _contract_base_asset_symbol(item))
+        }
+    )
+    if not base_assets:
+        return {}
+
+    rows = (
+        db.query(Asset.symbol, Asset.icon_url)
+        .filter(Asset.symbol.in_(base_assets))
+        .all()
+    )
+    return {
+        str(row.symbol or "").strip().upper(): str(row.icon_url or "").strip() or None
+        for row in rows
+        if str(row.symbol or "").strip()
+    }
+
+
+def _contract_symbol_payload(
+    item: ContractSymbol,
+    base_asset_logo_urls: Optional[dict[str, Optional[str]]] = None,
+) -> dict:
+    base_asset = _contract_base_asset_symbol(item)
     return {
         "symbol": item.symbol,
         "display_name": item.display_name,
         "category": item.category,
         "provider": item.provider,
         "provider_symbol": item.provider_symbol,
+        "base_asset": base_asset,
+        "base_asset_logo_url": (base_asset_logo_urls or {}).get(base_asset),
         "quote_asset": item.quote_asset,
         "tp_sl_trigger_price_type": str(getattr(item, "tp_sl_trigger_price_type", "") or "MARK_PRICE").strip().upper(),
         "closed_market_execution_mode": str(
@@ -350,8 +392,12 @@ def contract_market_symbols(
             .all()
         )
         attach_contract_symbol_market_metadata(db, rows)
+        base_asset_logo_urls = _load_contract_base_asset_logo_urls(db, rows)
         data = ContractSymbolListResponse(
-            items=[_contract_symbol_payload(item) for item in rows],
+            items=[
+                _contract_symbol_payload(item, base_asset_logo_urls)
+                for item in rows
+            ],
             total=total,
             page=normalized_page,
             page_size=normalized_page_size,

@@ -1,0 +1,24 @@
+[Unit]
+Description=Exchange immutable daily dividend eligibility snapshot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/exchange-web/backend
+EnvironmentFile=/opt/exchange-web/backend/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=DB_POOL_SIZE=1
+Environment=DB_MAX_OVERFLOW=0
+User=exchange
+Group=exchange
+ExecStart=/opt/exchange-web/backend/.venv/bin/python scripts/capture_dividend_eligibility_snapshot.py
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+UMask=0027

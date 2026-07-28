@@ -7,7 +7,7 @@ export type HeroBackgroundVideoProps = {
 };
 
 export default function HeroBackgroundVideo({
-  src = "/homepage-bg.mp4",
+  src = "/homepage-bg480.mp4",
   onReady,
   onError,
 }: HeroBackgroundVideoProps) {
@@ -28,8 +28,10 @@ export default function HeroBackgroundVideo({
       muted
       playsInline
       preload="auto"
-      onCanPlay={onReady}
+      onLoadedData={onReady}
       onError={onError}
+      data-testid="home-hero-video"
+      aria-hidden="true"
     />
   );
 }

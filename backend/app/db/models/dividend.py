@@ -40,6 +40,9 @@ class DividendPool(Base):
         nullable=False,
         default=lambda: Decimal("0"),
     )
+    rcb_price_snapshot_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    rcb_price_source_trade_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    rcb_price_source_trade_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     total_dividend_usdt: Mapped[Decimal] = mapped_column(
         Numeric(36, 18),
         nullable=False,
@@ -103,6 +106,70 @@ class DividendPoolItem(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
 
     pool = relationship("DividendPool", back_populates="items")
+
+
+class DividendEligibilitySnapshot(Base):
+    __tablename__ = "dividend_eligibility_snapshots"
+    __table_args__ = (
+        UniqueConstraint("dividend_date", name="uq_dividend_eligibility_snapshots_date"),
+        Index("idx_dividend_eligibility_snapshots_status", "status"),
+        {"extend_existing": True},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    dividend_date: Mapped[date] = mapped_column(Date, nullable=False)
+    snapshot_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="READY")
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default="AUTO")
+    created_by: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    eligible_user_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+
+    items = relationship("DividendEligibilitySnapshotItem", back_populates="snapshot")
+
+
+class DividendEligibilitySnapshotItem(Base):
+    __tablename__ = "dividend_eligibility_snapshot_items"
+    __table_args__ = (
+        UniqueConstraint(
+            "snapshot_id",
+            "user_id",
+            name="uq_dividend_eligibility_snapshot_items_user",
+        ),
+        Index("idx_dividend_eligibility_snapshot_items_level", "snapshot_id", "level_code"),
+        {"extend_existing": True},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey(
+            "dividend_eligibility_snapshots.id",
+            name="fk_dividend_eligibility_snapshot_items_snapshot",
+        ),
+        nullable=False,
+    )
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    level_code: Mapped[str] = mapped_column(String(30), nullable=False)
+    qualified_lock_amount: Mapped[Decimal] = mapped_column(
+        Numeric(36, 18),
+        nullable=False,
+        default=lambda: Decimal("0"),
+    )
+    required_lock_amount: Mapped[Decimal] = mapped_column(
+        Numeric(36, 18),
+        nullable=False,
+        default=lambda: Decimal("0"),
+    )
+    required_lock_period_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dividend_rate: Mapped[Decimal] = mapped_column(
+        Numeric(18, 8),
+        nullable=False,
+        default=lambda: Decimal("0.05"),
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+
+    snapshot = relationship("DividendEligibilitySnapshot", back_populates="items")
 
 
 class UserDividendRecord(Base):

@@ -329,7 +329,7 @@ export const CONTRACT_TIME_SERIES_OVERRIDES = {
 } as const;
 
 export const CONTRACT_CHART_LOADING_OVERLAY_CLASS_NAME =
-  'pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-[#12161c]/75';
+  'pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-[#12161c]';
 
 export function resolveContractEffectiveKlineInterval(
   chartMode: ContractChartMode,
@@ -958,13 +958,13 @@ export function resolveContractTradingViewActiveOverlayPrice(
   latestKlinePrice: number | null,
   referenceOverlayPrice: number | null,
 ) {
-  const numericReferencePrice = Number(referenceOverlayPrice);
-  if (Number.isFinite(numericReferencePrice) && numericReferencePrice > 0) {
-    return numericReferencePrice;
-  }
   const numericKlinePrice = Number(latestKlinePrice);
-  return Number.isFinite(numericKlinePrice) && numericKlinePrice > 0
-    ? numericKlinePrice
+  if (Number.isFinite(numericKlinePrice) && numericKlinePrice > 0) {
+    return numericKlinePrice;
+  }
+  const numericReferencePrice = Number(referenceOverlayPrice);
+  return Number.isFinite(numericReferencePrice) && numericReferencePrice > 0
+    ? numericReferencePrice
     : null;
 }
 

@@ -1496,6 +1496,67 @@ def test_gateway_preview_never_opens_a_future_provider_bucket(monkeypatch):
     assert second_preview["preview"]["close"] == "1.14018"
 
 
+def test_gateway_preview_follows_native_provider_bucket_when_gateway_clock_lags(monkeypatch):
+    gateway = ContractMarketGateway()
+    symbol = "BTCUSDT_PERP"
+    local_open_time = (NOW_MS // 60_000) * 60_000
+    provider_open_time = local_open_time + 60_000
+    monkeypatch.setattr(
+        gateway_module,
+        "get_contract_provider_ws_kline_generation",
+        lambda *_args, **_kwargs: 9,
+    )
+    gateway._accept_candle_preview_native(
+        symbol,
+        "1m",
+        {
+            "provider": "OKX_SWAP",
+            "provider_generation": 9,
+            "revision_epoch": 9,
+            "revision_sequence": 12,
+            "open_time": provider_open_time,
+            "open": "64840.0",
+            "high": "64842.0",
+            "low": "64839.0",
+            "close": "64841.0",
+            "volume": "100",
+            "quote_volume": "6484100",
+            "is_closed": False,
+        },
+    )
+
+    messages = gateway._trade_preview_settlement_messages(
+        symbol,
+        ["1m"],
+        [{
+            "id": "btc-provider-clock-ahead",
+            "symbol": symbol,
+            "provider": "OKX_SWAP",
+            "price": "64843.0",
+            "qty": "2",
+            # Native and the provider trade already own the next minute, while
+            # the gateway receipt clock is still in the prior minute.
+            "time": provider_open_time + 12_000,
+        }],
+        {
+            "provider": "OKX_SWAP",
+            "received_at_ms": local_open_time + 49_000,
+        },
+    )
+
+    assert len(messages) == 2
+    trade_message, preview_message = messages
+    assert trade_message["trade"]["time"] == provider_open_time + 12_000
+    assert trade_message["candle_previews"] == [preview_message]
+    assert preview_message["preview"]["open_time"] == provider_open_time
+    assert preview_message["preview"]["close"] == "64843.0"
+    assert preview_message["base_native_revision"] == {
+        "epoch": 9,
+        "sequence": 12,
+    }
+    assert preview_message["preview"]["baseline_source"] == "NATIVE"
+
+
 def test_gateway_rollover_preview_tracks_late_anchor_revision(monkeypatch):
     gateway = ContractMarketGateway()
     symbol = "XAUUSDT_PERP"

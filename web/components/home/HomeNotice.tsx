@@ -20,15 +20,7 @@ export default function HomeNotice({
   loading?: boolean;
 }) {
   const { locale, t } = useLocaleContext();
-  const fallbackNotices: NoticeItem[] = [
-    {
-      id: "fallback-1",
-      title: t("fallbackNoticeTitle", "home"),
-      publishedAt: new Date().toISOString(),
-      type: "system",
-    },
-  ];
-  const notices = items && items.length > 0 ? items : fallbackNotices;
+  const notices = items ?? [];
 
   const dateLocale = locale === "ja" ? "ja-JP" : locale === "en" ? "en-US" : locale === "zh-TW" ? "zh-TW" : "zh-CN";
 

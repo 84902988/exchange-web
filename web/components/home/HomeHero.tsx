@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { useState } from "react";
 
@@ -52,9 +53,11 @@ export default function HomeHero({
   const [inputValue, setInputValue] = useState("");
   const [isTopBarVisible, setIsTopBarVisible] = useState(topBar.visible !== false);
   const [failedVideoSrc, setFailedVideoSrc] = useState("");
+  const [readyVideoSrc, setReadyVideoSrc] = useState("");
   const isVideoUnavailable = Boolean(heroVideoSrc) && failedVideoSrc === heroVideoSrc;
   const shouldShowVideo = Boolean(heroVideoSrc) && !isVideoUnavailable;
-  const visibleImageSrc = heroImageSrc || (isVideoUnavailable ? fallbackImageSrc : "");
+  const isVideoReady = Boolean(heroVideoSrc) && readyVideoSrc === heroVideoSrc;
+  const shouldShowFallbackImage = !heroImageSrc && !isVideoReady;
   const pickHeroLabel = (label: HeroLocalizedText | undefined, fallback: string) =>
     label?.[currentLanguage] ?? label?.en ?? label?.zh ?? label?.["zh-TW"] ?? fallback;
 
@@ -108,16 +111,39 @@ export default function HomeHero({
         {shouldShowVideo && (
           <HeroBackgroundVideo
             src={heroVideoSrc}
-            onReady={() => setFailedVideoSrc("")}
-            onError={() => setFailedVideoSrc(heroVideoSrc)}
+            onReady={() => {
+              setFailedVideoSrc("");
+              setReadyVideoSrc(heroVideoSrc);
+            }}
+            onError={() => {
+              setFailedVideoSrc(heroVideoSrc);
+              setReadyVideoSrc("");
+            }}
           />
         )}
 
-        {visibleImageSrc && (
+        {heroImageSrc && (
+          // Admin-configured media may use arbitrary HTTPS origins, so keep this
+          // path provider-agnostic instead of constraining it through next/image.
+          // eslint-disable-next-line @next/next/no-img-element
           <img
-            src={visibleImageSrc}
+            src={heroImageSrc}
             alt={backgroundAlt}
             className="absolute inset-0 z-0 h-full w-full object-cover"
+          />
+        )}
+
+        {shouldShowFallbackImage && (
+          <Image
+            src={fallbackImageSrc}
+            alt=""
+            fill
+            preload
+            sizes="100vw"
+            quality={55}
+            className="absolute inset-0 z-0 h-full w-full object-cover"
+            data-testid="home-hero-placeholder"
+            aria-hidden="true"
           />
         )}
 

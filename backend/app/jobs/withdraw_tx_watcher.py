@@ -508,33 +508,6 @@ def _settle_withdraw_success(db: Session, wid: int, tx_hash: str):
     _settle_success(db, wid, tx_hash, remark="withdraw_watcher", trace_id=None)
 
 
-def _mark_withdraw_success_only(db: Session, wid: int, tx_hash: str) -> None:
-    """
-    Receipt-confirmed fallback: only repair withdraw_logs status/tx_hash.
-    This deliberately does not send, freeze, unfreeze, or create balance logs.
-    """
-    now = _utcnow()
-    res = db.execute(
-        text(
-            """
-            UPDATE withdraw_logs
-            SET status='SUCCESS',
-                tx_hash=COALESCE(:tx_hash, tx_hash),
-                updated_at=:now
-            WHERE id=:id
-              AND tx_hash IS NOT NULL
-              AND tx_hash <> ''
-              AND status IN ('SENT', 'SENDING')
-            """
-        ),
-        {"tx_hash": tx_hash, "now": now, "id": wid},
-    )
-    if res.rowcount:
-        db.commit()
-    else:
-        db.rollback()
-
-
 def _settle_withdraw_failed(db: Session, wid: int, remark: str):
     """
     调用 asset_withdraw.py 里的幂等失败结算：退回 available + 扣 frozen + 置 FAILED
@@ -594,15 +567,10 @@ def process_once(db: Session, max_batch: int = DEFAULT_MAX_BATCH) -> int:
                 _log(f"SUCCESS id={wid} chain={chain_key} tx={tx}")
                 _settle_withdraw_success(db, wid, tx)
             except Exception as e:
-                # 不要让单次失败卡死整个 watcher
+                # 账务结算失败时必须保持待确认状态，避免前台 SUCCESS 与冻结账务不一致。
+                # 下一轮会继续按同一 tx_hash 幂等重试，不会重复发起链上转账。
                 _log(f"settle_success_error wid={wid} err={repr(e)}")
                 db.rollback()
-                try:
-                    _mark_withdraw_success_only(db, wid, tx)
-                    _log(f"status_success_only id={wid} chain={chain_key} tx={tx}")
-                except Exception as mark_error:
-                    _log(f"status_success_only_error wid={wid} err={repr(mark_error)}")
-                    db.rollback()
 
         # ✅ 失败：做“退回解冻”（幂等）
         elif status == 0:

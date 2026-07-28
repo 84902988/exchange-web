@@ -1233,12 +1233,16 @@ test('stale partial metadata returns provider bars without ending history', asyn
 
 
 test('unknown empty current metadata uses the error callback instead of noData', async () => {
-  requestKlines = async () => metadata([], {
-    history_complete: null,
-    has_more_before: null,
-    history_incomplete: false,
-    retryable: true,
-  });
+  let requestCount = 0;
+  requestKlines = async () => {
+    requestCount += 1;
+    return metadata([], {
+      history_complete: null,
+      has_more_before: null,
+      history_incomplete: false,
+      retryable: true,
+    });
+  };
   const historyCalls: HistoryCall[] = [];
   const errors: string[] = [];
   const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'CURRENT_EMPTY_PERP' });
@@ -1251,8 +1255,47 @@ test('unknown empty current metadata uses the error callback instead of noData',
     (reason: string) => errors.push(reason),
   );
 
+  assert.equal(requestCount, 2);
   assert.equal(historyCalls.length, 0);
   assert.equal(errors.length, 1);
+});
+
+
+test('initial retryable history retries once and renders the replacement baseline', async () => {
+  let requestCount = 0;
+  requestKlines = async () => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      return metadata([], {
+        cache_status: 'TIMEOUT',
+        history_complete: false,
+        has_more_before: null,
+        history_incomplete: true,
+        provider_error_code: 'TIMEOUT',
+        retryable: true,
+      });
+    }
+    return metadata(pageEndingAt(1_717_030_000_000, 100, '118'));
+  };
+  const historyCalls: HistoryCall[] = [];
+  const errors: string[] = [];
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol: 'RETRY_RECOVERY_PERP' });
+
+  await datafeed.getBars(
+    symbolInfo('RETRY_RECOVERY_PERP'),
+    '1',
+    period,
+    (bars: any[], meta: { noData?: boolean }) => historyCalls.push({ bars, meta }),
+    (reason: string) => errors.push(reason),
+  );
+
+  assert.equal(requestCount, 2);
+  assert.equal(historyCalls.length, 1);
+  assert.equal(historyCalls[0].bars.length, 100);
+  assert.equal(historyCalls[0].bars.at(-1)?.close, 118);
+  assert.equal(historyCalls[0].meta.noData, false);
+  assert.deepEqual(errors, []);
+  datafeed.destroy();
 });
 
 
@@ -2002,7 +2045,11 @@ test('empty error stale partial and rejected current responses never become L1 e
       );
     }
 
-    assert.equal(apiCalls, 2, `${invalid.name} unexpectedly hit L1`);
+    const expectedApiCalls = (
+      invalid.response?.items.length === 0
+      && invalid.response.retryable === true
+    ) ? 4 : 2;
+    assert.equal(apiCalls, expectedApiCalls, `${invalid.name} unexpectedly hit L1`);
     if (invalid.response?.items.length) {
       assert.equal(historyCalls.length, 2, `${invalid.name} history callback count`);
       assert.equal(errors.length, 0, `${invalid.name} error callback count`);
@@ -5104,13 +5151,21 @@ test('AAPL 5m preview advances the active candle from the settled trade stream',
   const symbol = 'AAPLUSDT_PERP';
   const openTime = 1_717_099_800_000;
   const received: any[] = [];
+  const commitOrder: string[] = [];
   marketStoreModule.contractMarketStore.activateSymbol(symbol);
-  const datafeed = datafeedModule.createContractTradingViewDatafeed({ symbol });
+  const datafeed = datafeedModule.createContractTradingViewDatafeed({
+    symbol,
+    onLatestBar: (close: string | null) => commitOrder.push(`overlay:${close}`),
+  });
   await establishHistoryBaseline(datafeed, symbol, '5');
+  commitOrder.length = 0;
   datafeed.subscribeBars(
     symbolInfo(symbol),
     '5',
-    (bar: any) => received.push(bar),
+    (bar: any) => {
+      received.push(bar);
+      commitOrder.push(`bar:${bar.close}`);
+    },
     'aapl-five-minute-preview-subscriber',
   );
 
@@ -5150,6 +5205,12 @@ test('AAPL 5m preview advances the active candle from the settled trade stream',
       { close: 329.43, volume: 1002 },
     ],
   );
+  assert.deepEqual(commitOrder, [
+    'bar:329.54',
+    'overlay:329.54',
+    'bar:329.43',
+    'overlay:329.43',
+  ]);
   datafeed.destroy();
 });
 

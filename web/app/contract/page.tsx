@@ -272,9 +272,12 @@ function buildContractPairOption(item: ContractSymbolItem, t: ContractTranslator
     symbol: item.symbol,
     label: getContractDisplayLabel(item, t),
     displaySymbol: getContractDisplayLabel(item, t),
-    baseAsset: marketSymbol.endsWith(item.quote_asset)
-      ? marketSymbol.slice(0, -item.quote_asset.length)
-      : marketSymbol,
+    baseAsset: String(item.base_asset || '').trim().toUpperCase() || (
+      marketSymbol.endsWith(item.quote_asset)
+        ? marketSymbol.slice(0, -item.quote_asset.length)
+        : marketSymbol
+    ),
+    baseAssetLogoUrl: String(item.base_asset_logo_url || '').trim() || null,
     quoteAsset: item.quote_asset,
     assetType: category || 'CONTRACT',
     dataSource: item.provider,
@@ -665,34 +668,33 @@ function ContractPageContent() {
 
   const refreshContractPairs = useCallback(async ({
     dropMissingBootstrap = false,
-    force = false,
+    includeBootstrap = true,
   }: {
     dropMissingBootstrap?: boolean;
-    force?: boolean;
+    includeBootstrap?: boolean;
   } = {}) => {
-    if (force) {
-      contractSymbolRequestStore.clear();
-    }
     setContractPairsLoading(true);
     const bootstrapSymbol = initialContractSymbolRef.current;
-    const bootstrapTask = (async () => {
-      const bootstrapResponse = await loadContractSymbols({
-        keyword: bootstrapSymbol,
-        page: 1,
-        page_size: 1,
-      });
-      const bootstrapItem = bootstrapResponse.items.find(
-        (item) => normalizeContractSymbol(item.symbol) === bootstrapSymbol,
-      );
-      if (bootstrapItem) {
-        const bootstrapPair = buildContractPairOption(bootstrapItem, t);
-        setContractPairs((previous) => {
-          const existingIndex = previous.findIndex((item) => item.symbol === bootstrapPair.symbol);
-          if (existingIndex < 0) return [bootstrapPair, ...previous];
-          return previous.map((item, index) => index === existingIndex ? bootstrapPair : item);
-        });
-      }
-    })();
+    const bootstrapTask = includeBootstrap
+      ? (async () => {
+          const bootstrapResponse = await loadContractSymbols({
+            keyword: bootstrapSymbol,
+            page: 1,
+            page_size: 1,
+          });
+          const bootstrapItem = bootstrapResponse.items.find(
+            (item) => normalizeContractSymbol(item.symbol) === bootstrapSymbol,
+          );
+          if (bootstrapItem) {
+            const bootstrapPair = buildContractPairOption(bootstrapItem, t);
+            setContractPairs((previous) => {
+              const existingIndex = previous.findIndex((item) => item.symbol === bootstrapPair.symbol);
+              if (existingIndex < 0) return [bootstrapPair, ...previous];
+              return previous.map((item, index) => index === existingIndex ? bootstrapPair : item);
+            });
+          }
+        })()
+      : Promise.resolve();
 
     const catalogTask = (async () => {
       const contractResponse = await loadContractSymbolCatalog();
@@ -729,7 +731,10 @@ function ContractPageContent() {
   }, [t]);
 
   const refreshContractPairCatalog = useCallback(
-    () => refreshContractPairs({ force: true }),
+    // The mounted page already owns an authoritative catalog. Revalidate that
+    // membership in the background without bypassing the short request cache
+    // or repeating the current-symbol bootstrap lookup on every menu open.
+    () => refreshContractPairs({ includeBootstrap: false }),
     [refreshContractPairs],
   );
 

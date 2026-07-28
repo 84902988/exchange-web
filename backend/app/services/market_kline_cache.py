@@ -196,12 +196,24 @@ def _sanitize_provider_error_provider(value: Optional[str]) -> Optional[str]:
 
 
 def _classify_provider_error(exc: Exception) -> tuple[str, Optional[str]]:
-    code = getattr(exc, "provider_error_code", None)
-    provider = getattr(exc, "provider_error_provider", None)
-    if code:
-        return _normalize_provider_error_code(str(code)), _sanitize_provider_error_provider(provider)
+    current: Optional[BaseException] = exc
+    seen: set[int] = set()
+    messages: list[str] = []
+    provider: Optional[str] = None
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        code = getattr(current, "provider_error_code", None)
+        current_provider = getattr(current, "provider_error_provider", None)
+        if current_provider and not provider:
+            provider = str(current_provider)
+        if code:
+            return _normalize_provider_error_code(str(code)), _sanitize_provider_error_provider(current_provider)
+        message = str(current or "").strip()
+        if message:
+            messages.append(message)
+        current = current.__cause__ or current.__context__
 
-    lowered = str(exc or "").lower()
+    lowered = " ".join(messages).lower()
     if "timeout" in lowered or "timed out" in lowered or "over_budget" in lowered:
         code = KLINE_PROVIDER_ERROR_TIMEOUT
     elif "cooldown" in lowered:

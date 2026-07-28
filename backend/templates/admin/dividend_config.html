@@ -339,6 +339,7 @@
       <div class="section-title">分红全局参数</div>
       <div class="global-grid">
         <div class="global-item"><div class="global-label">分红周期</div><div class="global-value">每日</div></div>
+        <div class="global-item"><div class="global-label">资格快照时间</div><div class="global-value">{{ config.eligibility_snapshot_time_utc or '00:00' }} UTC（固定）</div></div>
         <div class="global-item"><div class="global-label">每日计划执行时间</div><div class="global-value">{{ config.run_time_utc or '00:10' }} UTC</div></div>
         <div class="global-item"><div class="global-label">最低分红金额</div><div class="global-value">按批次实际计算</div></div>
         <div class="global-item"><div class="global-label">手续费归集范围</div><div class="global-value">平台交易手续费池</div></div>
@@ -348,7 +349,7 @@
       <form method="post" action="/admin/dividend-config" class="filter-form">
         <div class="field">
           <label for="run_time_utc">每日计划执行时间</label>
-          <input id="run_time_utc" name="run_time_utc" value="{{ config.run_time_utc or '00:10' }}" placeholder="HH:MM" />
+          <input id="run_time_utc" name="run_time_utc" value="{{ config.run_time_utc or '00:10' }}" placeholder="HH:MM（不得早于 00:05）" />
         </div>
         <div class="field">
           <label for="rcb_price_snapshot_time">每日价格快照时间</label>
@@ -358,6 +359,7 @@
           <button type="submit" class="btn admin-btn admin-btn-primary">保存参数</button>
         </div>
       </form>
+      <div class="page-subtitle">资格名单在分红日结束后的 00:00 UTC 固化；RCB 价格按配置时间读取该时点之前最后一笔成交；执行时间必须至少晚 5 分钟，且不会改写历史资格。</div>
     </div>
   </section>
 

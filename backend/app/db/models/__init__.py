@@ -27,7 +27,13 @@ from .system_config import SystemConfig
 from .site_content import Announcement, HelpArticle, HelpCategory, HomeBanner, SiteSettings
 from .support_ticket import SupportTicket, SupportTicketMessage
 from .activity import Activity, ActivityBanner
-from .dividend import DividendPool, DividendPoolItem, UserDividendRecord
+from .dividend import (
+    DividendEligibilitySnapshot,
+    DividendEligibilitySnapshotItem,
+    DividendPool,
+    DividendPoolItem,
+    UserDividendRecord,
+)
 from .dividend_job_log import DividendJobLog
 from .bd_account import BdAccount
 from .bd_user_relation import BdUserRelation
@@ -120,6 +126,8 @@ __all__ = [
     "ActivityBanner",
     "DividendPool",
     "DividendPoolItem",
+    "DividendEligibilitySnapshot",
+    "DividendEligibilitySnapshotItem",
     "UserDividendRecord",
     "DividendJobLog",
     "BdAccount",

@@ -376,6 +376,7 @@ def confirm_collection_candidate_onchain(
         token_balance=balances.token_balance,
         native_balance=balances.native_balance,
         token_contract_address=token_contract_address,
+        token_decimals=balances.token_decimals,
         estimated_gas_native=estimated_gas_native,
         estimated_gas_usdt=estimated_gas_usdt,
         min_collect_amount=min_collect_amount,

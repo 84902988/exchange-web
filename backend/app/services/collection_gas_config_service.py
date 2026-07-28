@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models.system_config import SystemConfig
 from app.services.collection_chain_helper import DEFAULT_GAS_NATIVE, GAS_TOPUP_BUFFER, GAS_TOPUP_CAP
+from app.services.collection_evm_gas_estimator import bounded_dynamic_gas_buffer
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +251,7 @@ def resolve_gas_topup_parameters(
     chain_key: str,
     token_symbol: Optional[str],
     estimated_required_native: Decimal,
+    estimate_source: Optional[str] = None,
 ) -> dict[str, Any]:
     ck = _normalize_chain_key(chain_key)
     if db is not None:
@@ -260,25 +262,32 @@ def resolve_gas_topup_parameters(
     config = load_gas_topup_config(db, chain_key)
     mode = str(config.get("gas_topup_mode") or "DEFAULT").upper()
     estimated = _to_decimal(estimated_required_native)
-    estimate_source = "DEFAULT"
+    resolved_estimate_source = (estimate_source or "DEFAULT").strip().upper()[:32]
     stats = {"sample_count": 0, "p95_native_fee": Decimal("0")}
 
     if mode == "STATS_BASED":
         stats = load_stats_p95_native_fee(db, chain_key=chain_key, token_symbol=token_symbol)
         if stats["p95_native_fee"] > 0:
             estimated = stats["p95_native_fee"]
-            estimate_source = "STATS_P95"
-        else:
-            estimate_source = "DEFAULT_FALLBACK"
+            resolved_estimate_source = "STATS_P95"
+        elif resolved_estimate_source == "DEFAULT":
+            resolved_estimate_source = "DEFAULT_FALLBACK"
     elif mode == "MANUAL":
-        estimate_source = "MANUAL"
+        resolved_estimate_source = "MANUAL"
 
     config["estimated_required_native"] = estimated
-    config["estimate_source"] = estimate_source
+    config["estimate_source"] = resolved_estimate_source
     config["stats_sample_count"] = int(stats["sample_count"])
     config["stats_p95_native_fee"] = stats["p95_native_fee"]
     if mode == "MANUAL":
+        config["effective_buffer"] = Decimal("0")
         config["target_balance"] = _to_decimal(config.get("cap"))
     else:
-        config["target_balance"] = estimated * _to_decimal(config.get("safe_multiplier")) + _to_decimal(config.get("buffer"))
+        effective_buffer = bounded_dynamic_gas_buffer(
+            configured_buffer=_to_decimal(config.get("buffer")),
+            estimated_required_native=estimated,
+            estimate_source=resolved_estimate_source,
+        )
+        config["effective_buffer"] = effective_buffer
+        config["target_balance"] = estimated * _to_decimal(config.get("safe_multiplier")) + effective_buffer
     return config

@@ -58,6 +58,14 @@ describe('Contract TradingView bootstrap experience', () => {
     expect(pageSource).toContain('contractConfigMissing,');
   });
 
+  test('revalidates an open selector without bypassing catalog cache or repeating bootstrap lookup', () => {
+    expect(pageSource).toContain('includeBootstrap = true');
+    expect(pageSource).toContain('includeBootstrap?: boolean;');
+    expect(pageSource).toContain('const bootstrapTask = includeBootstrap');
+    expect(pageSource).toContain('refreshContractPairs({ includeBootstrap: false })');
+    expect(pageSource).not.toContain('refreshContractPairs({ force: true })');
+  });
+
   test('gives authoritative realtime a bootstrap grace before REST fallbacks', () => {
     expect(marketStateSource).toContain('CONTRACT_QUOTE_REST_BOOTSTRAP_GRACE_MS');
     expect(marketStateSource).toContain("if (marketRealtimeStatus === 'connected') return undefined;");

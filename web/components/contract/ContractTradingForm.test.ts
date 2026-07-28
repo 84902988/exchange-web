@@ -111,6 +111,21 @@ test('page adds Price Authority without removing legacy Contract form inputs', (
   assert.match(formSource, /priceAuthority: ContractPriceAuthorityV1;/);
 });
 
+test('TradingForm uses the coordinated execution authority for unavailable feedback', () => {
+  assert.match(
+    formSource,
+    /selectedPrice,\s*executable,\s*reasonCode,\s*priceAuthority,/,
+  );
+  assert.match(
+    formSource,
+    /const resolvedExecutable = typeof executable === 'boolean'\s*\? executable\s*:\s*marketViewAuthority\.executable;/,
+  );
+  assert.match(
+    formSource,
+    /const resolvedReasonCode = String\(reasonCode \|\| ''\)\.trim\(\)\s*\|\| marketViewAuthority\.reasonCode;/,
+  );
+});
+
 test('TradingForm resolves all four execution directions through Price Authority', () => {
   for (const intent of ['OPEN_LONG', 'OPEN_SHORT', 'CLOSE_LONG', 'CLOSE_SHORT']) {
     assert.match(formSource, new RegExp(`intent: '${intent}'`));

@@ -88,10 +88,15 @@ def test_alive_scheduler_with_failed_tick_is_reported_as_degraded(monkeypatch) -
     assert "db unavailable" in result["detail"]
 
 
-def test_disabled_dividend_job_is_not_reported_as_failed(monkeypatch) -> None:
-    monkeypatch.delenv("ENABLE_DIVIDEND_JOB", raising=False)
+def test_service_overview_uses_dedicated_withdraw_watcher_owner(monkeypatch) -> None:
     empty_workers = admin_queries._admin_service_empty_worker_counts()
     empty_heartbeats = admin_queries._admin_service_empty_heartbeats()
+    monkeypatch.setattr(
+        admin_queries,
+        "_admin_service_runtime_enabled",
+        lambda service_name, *_args, **_kwargs: service_name
+        not in {"withdraw_tx_watcher", "dividend_auto_scheduler"},
+    )
     monkeypatch.setattr(
         admin_queries,
         "_admin_service_observe_redis_and_workers",
@@ -99,16 +104,20 @@ def test_disabled_dividend_job_is_not_reported_as_failed(monkeypatch) -> None:
     )
 
     result = admin_queries.admin_query_service_overview()
-    dividend = next(
-        service
+    services = {
+        service["key"]: service
         for group in result["groups"]
         for service in group["services"]
-        if service["key"] == "dividend_job"
-    )
+    }
 
-    assert dividend["observed"] == "未启用"
-    assert dividend["observed_badge"] == "neutral"
-    assert dividend["run_mode"] == "API 进程内嵌（可选）"
+    assert "dividend_job" not in services
+    assert services["withdraw_tx_watcher"]["systemd"] == "exchange-withdraw-tx-watcher.service"
+    assert services["withdraw_tx_watcher"]["observed"] == "未启用"
+    assert services["withdraw_tx_watcher"]["run_mode"] == "仅 Linux 独立 systemd 服务"
+    assert services["dividend_auto_scheduler"]["systemd"] == (
+        "exchange-dividend-auto-scheduler.service"
+    )
+    assert services["dividend_auto_scheduler"]["observed"] == "未启用"
 
 
 def test_dashboard_withdraw_fee_status_combines_config_and_runtime() -> None:
@@ -243,7 +252,11 @@ def test_operations_center_reuses_rq_snapshot_and_separates_history(monkeypatch)
     for queue_name in worker_counts:
         worker_counts[queue_name]["online"] = 1
 
-    monkeypatch.delenv("ENABLE_DIVIDEND_JOB", raising=False)
+    monkeypatch.setattr(
+        admin_queries,
+        "_admin_service_runtime_enabled",
+        lambda *_args, **_kwargs: True,
+    )
     monkeypatch.setattr(admin_queries, "admin_query_rq_status", lambda: rq_status)
 
     def observe(snapshot=None):
@@ -259,9 +272,15 @@ def test_operations_center_reuses_rq_snapshot_and_separates_history(monkeypatch)
     assert result["summary"]["stale_workers"] == 2
     assert result["failed_queue_rows"][0]["status_key"] == "failed_registry"
     assert result["failed_queue_rows"][0]["status_badge"] == "warning"
-    dividend = next(row for row in result["service_rows"] if row["key"] == "dividend_job")
-    assert dividend["status_key"] == "disabled"
+    watcher = next(row for row in result["service_rows"] if row["key"] == "withdraw_tx_watcher")
+    assert watcher["status_key"] == "running"
+    assert watcher not in result["abnormal_services"]
+    dividend = next(
+        row for row in result["service_rows"] if row["key"] == "dividend_auto_scheduler"
+    )
+    assert dividend["status_key"] == "running"
     assert dividend not in result["abnormal_services"]
+    assert all(row["key"] != "dividend_job" for row in result["service_rows"])
 
 
 def test_contract_heartbeat_failure_does_not_escape(monkeypatch) -> None:

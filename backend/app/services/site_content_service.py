@@ -206,7 +206,7 @@ DEFAULT_SITE_CONFIG = {
     "home_hero_subtitle": "Trade digital assets with a fast, secure, and configurable exchange experience.",
     "home_hero_cta_text": "Get Started",
     "home_hero_cta_link": "/register",
-    "home_hero_image": "/homepage-bg.mp4",
+    "home_hero_image": "/homepage-bg480.mp4",
     "app_android_qr_url": "",
     "app_ios_qr_url": "",
     "app_download_title": "",

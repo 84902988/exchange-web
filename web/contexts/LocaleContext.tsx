@@ -7,7 +7,7 @@ import useLocale from '@/hooks/useLocale';
 export type Locale = 'en' | 'zh' | 'zh-TW' | 'ja';
 
 // 翻译函数类型定义
-type TranslateFunction = <T extends string>(key: string, namespace?: 'common' | 'auth' | 'home' | 'footer' | 'asset' | 'markets' | 'opportunities' | 'user' | 'committee' | 'contracts' | 'activity') => T;
+type TranslateFunction = <T extends string>(key: string, namespace?: 'common' | 'auth' | 'home' | 'footer' | 'asset' | 'markets' | 'opportunities' | 'user' | 'committee' | 'contracts' | 'activity' | 'mastercard') => T;
 
 // 翻译数据类型定义
 interface TranslationData {
@@ -44,6 +44,9 @@ interface TranslationData {
   activity: {
     [key: string]: string;
   };
+  mastercard?: {
+    [key: string]: string;
+  };
 }
 
 // 语言上下文类型定义
@@ -52,6 +55,7 @@ interface LocaleContextType {
   changeLocale: (locale: Locale) => void;
   t: TranslateFunction;
   isLoading: boolean;
+  isInitialized: boolean;
   availableLocales: Locale[];
   translations: TranslationData;
 }

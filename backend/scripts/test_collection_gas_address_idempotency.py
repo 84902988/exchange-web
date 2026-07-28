@@ -32,6 +32,7 @@ class FakeEvaluation:
     should_collect: bool = True
     gas_required: bool = False
     min_collect_amount: Decimal = Decimal("0.01")
+    collect_amount: Decimal = Decimal("12")
     reason: str = "GAS_BALANCE_SUFFICIENT"
     token_balance: Decimal = Decimal("12")
     native_balance: Decimal = Decimal("0.02")

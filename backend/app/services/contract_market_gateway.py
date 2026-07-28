@@ -62,6 +62,7 @@ from app.services.contract_candle_preview import (
     ContractCandlePreview,
     ContractCandlePreviewEngine,
     ContractPreviewTradeStatus,
+    contract_candle_bucket_start_ms,
 )
 from app.services.contract_market_provider_ws import (
     ContractProviderKlineRevisionAccepted,
@@ -334,18 +335,41 @@ def _trade_candle_event_time_ms(
     row: dict[str, Any],
     *,
     received_at_ms: int,
+    interval: str | None = None,
+    native_open_time: int | None = None,
 ) -> int | None:
-    """Keep trade-driven previews out of provider-dated future buckets.
+    """Align trade previews with the accepted Native candle timeline.
 
-    Provider event time remains the ordering authority whenever it is not ahead
-    of the gateway receipt clock.  Some iTick feeds can lead that clock by
-    several seconds; capping only the candle event time prevents TradingView
-    from receiving a next-minute bar before that minute exists locally.  The
-    original trade payload and provider timestamp remain unchanged.
+    Provider event time remains the ordering authority when its interval bucket
+    already matches the accepted Native baseline.  If a provider clock leads
+    the gateway while Native still owns the local receipt bucket, keep the
+    existing future-bucket guard.  This prevents a one-sided clamp from placing
+    Preview and Native in different buckets after Native has already advanced.
+    The original trade payload and provider timestamp remain unchanged.
     """
     provider_event_time_ms = _trade_event_time_ms(row)
     if provider_event_time_ms is None:
         return None
+    if interval and native_open_time is not None:
+        try:
+            provider_bucket = contract_candle_bucket_start_ms(
+                provider_event_time_ms,
+                interval,
+            )
+            received_bucket = contract_candle_bucket_start_ms(
+                received_at_ms,
+                interval,
+            )
+        except (TypeError, ValueError):
+            pass
+        else:
+            if provider_bucket == native_open_time:
+                return provider_event_time_ms
+            if (
+                provider_event_time_ms > received_at_ms
+                and received_bucket == native_open_time
+            ):
+                return received_at_ms
     return min(provider_event_time_ms, received_at_ms)
 
 
@@ -1921,10 +1945,23 @@ class ContractMarketGateway:
                 provider=provider,
                 generation=generation,
             )
+            native_preview = self._candle_preview_engine.get_preview(
+                normalized_symbol,
+                interval,
+            )
+            native_open_time = (
+                native_preview.open_time
+                if native_preview is not None
+                and native_preview.provider == provider
+                and native_preview.generation == generation
+                else None
+            )
             for trade in ordered_trades:
                 event_time_ms = _trade_candle_event_time_ms(
                     trade,
                     received_at_ms=received_at_ms,
+                    interval=interval,
+                    native_open_time=native_open_time,
                 )
                 if event_time_ms is None:
                     continue

@@ -25,6 +25,11 @@
       line-height:1.45;
       font-weight:700;
     }
+    .recovery-table{ min-width:760px; }
+    .recovery-summary{ display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin:14px 0; }
+    .recovery-stat{ border:1px solid var(--border-color,#2b2f36); border-radius:10px; padding:12px; }
+    .recovery-stat-label{ color:#9299a6; font-size:12px; }
+    .recovery-stat-value{ margin-top:6px; font-weight:700; overflow-wrap:anywhere; }
   </style>
 
   {% if notice %}
@@ -74,21 +79,123 @@
       <p class="muted">只能选择已结束的日期，不能选择今天或未来日期。</p>
     </div>
 
-    <div class="filter-card">
-      <div class="section-title">补跑指定日期自动分红</div>
-      <form method="post" action="/admin/dividend-pools/rerun-auto" class="filter-form" data-rerun-auto-form>
+    <div class="filter-card" id="dividend-recovery">
+      <div class="section-title">运营补发中心</div>
+      <form method="get" action="/admin/dividend-pools" class="filter-form">
         <div class="field">
-          <label for="rerun_dividend_date">分红日期（UTC）</label>
-          <input id="rerun_dividend_date" type="date" name="dividend_date" value="{{ utc_yesterday }}" max="{{ utc_yesterday }}" data-utc-today="{{ utc_today }}" required />
+          <label for="recovery_date">补发日期（UTC）</label>
+          <input id="recovery_date" type="date" name="recovery_date" value="{{ selected_recovery_date or utc_yesterday }}" max="{{ utc_yesterday }}" required />
         </div>
-        <input type="hidden" name="confirm_text" value="" data-rerun-confirm />
         <div class="filter-actions">
-          <button type="submit" class="btn admin-btn admin-btn-danger">补跑自动分红</button>
+          <button type="submit" class="btn admin-btn admin-btn-primary">生成补发预览</button>
         </div>
       </form>
-      <p class="muted">仅用于补跑已结束日期的自动分红，不可用于当天分红。</p>
+      <p class="muted">系统自动恢复资格、历史价格和手续费数据。生成预览不会修改余额。</p>
     </div>
   </section>
+
+  <section class="page-section">
+    <div class="table-card">
+      <div class="section-title">检测到的缺失批次（最近 60 天）</div>
+      {% if recovery_candidates %}
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table recovery-table">
+            <thead><tr><th>分红日期</th><th>资格数据</th><th>状态</th><th>操作</th></tr></thead>
+            <tbody>
+              {% for candidate in recovery_candidates %}
+                <tr>
+                  <td class="mono-cell">{{ candidate.dividend_date }}</td>
+                  <td>{{ candidate.snapshot_label }}</td>
+                  <td><span class="admin-badge admin-badge-danger">缺少分红池</span></td>
+                  <td><a class="btn secondary admin-btn admin-btn-secondary admin-btn-sm" href="/admin/dividend-pools?recovery_date={{ candidate.dividend_date }}#dividend-recovery-preview">生成预览</a></td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% else %}
+        <div class="empty-state admin-empty">最近 60 天没有检测到缺失分红批次。</div>
+      {% endif %}
+    </div>
+  </section>
+
+  {% if recovery_preview_error %}
+    <section class="page-section" id="dividend-recovery-preview"><div class="card"><div class="section-title">补发预览不可用</div><p class="muted">{{ recovery_preview_error }}</p></div></section>
+  {% endif %}
+
+  {% if recovery_preview %}
+    <section class="page-section" id="dividend-recovery-preview">
+      <div class="table-card">
+        <div class="section-title">{{ recovery_preview.dividend_date }} 补发预览</div>
+        <div class="recovery-summary">
+          <div class="recovery-stat"><div class="recovery-stat-label">资格数据</div><div class="recovery-stat-value">{{ recovery_preview.snapshot_label }}</div></div>
+          <div class="recovery-stat"><div class="recovery-stat-label">符合资格用户</div><div class="recovery-stat-value">{{ recovery_preview.eligible_user_count }}</div></div>
+          <div class="recovery-stat"><div class="recovery-stat-label">手续费池</div><div class="recovery-stat-value">{{ recovery_preview.total_fee_usdt }} USDT</div></div>
+          <div class="recovery-stat"><div class="recovery-stat-label">历史 RCB 价格</div><div class="recovery-stat-value">{{ recovery_preview.rcb_price }} USDT</div></div>
+          <div class="recovery-stat"><div class="recovery-stat-label">预计用户入账</div><div class="recovery-stat-value">{{ recovery_preview.total_credit_rcb }} RCB</div></div>
+          <div class="recovery-stat"><div class="recovery-stat-label">平台可用余额</div><div class="recovery-stat-value">{{ recovery_preview.platform_available_rcb }} RCB</div></div>
+          <div class="recovery-stat"><div class="recovery-stat-label">价格成交证据</div><div class="recovery-stat-value">ID {{ recovery_preview.price_trade_id or '-' }} / {{ recovery_preview.price_trade_at or '-' }}</div></div>
+        </div>
+
+        {% if not recovery_preview.platform_balance_sufficient %}
+          <div class="premature-note">平台 RCB 可用余额不足，当前预览禁止提交。请先在运营后台完成平台资金补充后重新生成预览。</div>
+        {% endif %}
+
+        <div class="section-title">等级汇总</div>
+        <div class="table-wrap admin-table-wrap">
+          <table class="data-table admin-table recovery-table">
+            <thead><tr><th>等级</th><th class="text-right">比例</th><th class="text-right">人数</th><th class="text-right">每人 USDT</th><th class="text-right">每人 RCB</th><th class="text-right">本级入账 RCB</th></tr></thead>
+            <tbody>
+              {% for level in recovery_preview.levels %}
+                <tr>
+                  <td>{{ level.level_code }}</td>
+                  <td class="text-right">{{ level.dividend_rate }}</td>
+                  <td class="text-right">{{ level.eligible_user_count }}</td>
+                  <td class="text-right">{{ level.per_user_usdt }}</td>
+                  <td class="text-right">{{ level.per_user_rcb }}</td>
+                  <td class="text-right">{{ level.credit_rcb }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+
+        <div class="section-title" style="margin-top:18px;">用户明细</div>
+        {% if recovery_preview.users %}
+          <div class="table-wrap admin-table-wrap">
+            <table class="data-table admin-table recovery-table">
+              <thead><tr><th>用户ID</th><th>等级</th><th class="text-right">有效锁仓 RCB</th><th class="text-right">补发 USDT</th><th class="text-right">补发 RCB</th></tr></thead>
+              <tbody>
+                {% for user in recovery_preview.users %}
+                  <tr>
+                    <td class="mono-cell">{{ user.user_id }}</td>
+                    <td>{{ user.level_code }}</td>
+                    <td class="text-right">{{ user.qualified_lock_amount }}</td>
+                    <td class="text-right">{{ user.dividend_usdt }}</td>
+                    <td class="text-right">{{ user.dividend_rcb }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <div class="empty-state admin-empty">该日期没有符合资格的用户；提交后仍会生成已处理的零用户批次，避免再次被识别为漏跑。</div>
+        {% endif %}
+
+        {% if recovery_preview.can_execute %}
+        <form method="post" action="/admin/dividend-pools/recover" class="filter-form" style="margin-top:18px;" onsubmit="return confirm('确认按当前预览立即补发？提交后将直接变更用户和平台 RCB 余额。');">
+          <input type="hidden" name="dividend_date" value="{{ recovery_preview.dividend_date }}" />
+          <input type="hidden" name="preview_fingerprint" value="{{ recovery_preview.fingerprint }}" />
+          <div class="field">
+            <label for="recovery_confirm_text">输入 EXECUTE 确认立即补发</label>
+            <input id="recovery_confirm_text" name="confirm_text" autocomplete="off" placeholder="EXECUTE" required />
+          </div>
+          <div class="filter-actions"><button type="submit" class="btn admin-btn admin-btn-danger">确认并立即补发</button></div>
+        </form>
+        {% endif %}
+      </div>
+    </section>
+  {% endif %}
 
   <section class="page-section">
     <div class="table-card">
@@ -183,28 +290,6 @@
           alert("分红日期必须早于当前 UTC 日期。");
           input.focus();
         }
-      });
-      var rerunForm = document.querySelector("[data-rerun-auto-form]");
-      var rerunInput = document.getElementById("rerun_dividend_date");
-      var rerunConfirm = document.querySelector("[data-rerun-confirm]");
-      if (!rerunForm || !rerunInput || !rerunConfirm) {
-        return;
-      }
-      rerunForm.addEventListener("submit", function (event) {
-        var utcTodayValue = rerunInput.getAttribute("data-utc-today") || "";
-        if (rerunInput.value && utcTodayValue && rerunInput.value >= utcTodayValue) {
-          event.preventDefault();
-          alert("只能补跑已结束的 UTC 日期，不能选择今天或未来日期。");
-          rerunInput.focus();
-          return;
-        }
-        var value = prompt("该操作会复用自动分红状态机处理所选日期。请输入 EXECUTE 确认。");
-        if (value !== "EXECUTE") {
-          event.preventDefault();
-          alert("未输入 EXECUTE，已取消补跑。");
-          return;
-        }
-        rerunConfirm.value = value;
       });
     })();
   </script>
