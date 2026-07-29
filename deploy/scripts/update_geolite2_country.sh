@@ -4,9 +4,17 @@ set -Eeuo pipefail
 readonly CONFIG_PATH="${GEOIPUPDATE_CONFIG:-/etc/GeoIP.conf}"
 readonly TARGET_DIR="${GEOIP_TARGET_DIR:-/opt/exchange-web/data/geoip}"
 readonly TARGET_FILE="${TARGET_DIR}/GeoLite2-Country.mmdb"
-readonly PYTHON_BIN="${GEOIP_PYTHON_BIN:-/opt/exchange-web/.venv/bin/python}"
 readonly TARGET_OWNER="${GEOIP_TARGET_OWNER:-exchange}"
 readonly TARGET_GROUP="${GEOIP_TARGET_GROUP:-exchange}"
+
+if [[ -n "${GEOIP_PYTHON_BIN:-}" ]]; then
+  PYTHON_BIN="${GEOIP_PYTHON_BIN}"
+elif [[ -x /opt/exchange-web/.venv/bin/python ]]; then
+  PYTHON_BIN=/opt/exchange-web/.venv/bin/python
+else
+  PYTHON_BIN=/opt/exchange-web/backend/.venv/bin/python
+fi
+readonly PYTHON_BIN
 
 command -v geoipupdate >/dev/null 2>&1 || {
   echo "geoipupdate is not installed" >&2
