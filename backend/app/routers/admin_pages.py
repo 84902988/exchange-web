@@ -245,9 +245,10 @@ from app.services.geo_access_service import (
     GEO_ACCESS_LOG_RETENTION_DAYS,
     RULE_ALLOW,
     RULE_BLOCK,
+    SYSTEM_RESTRICTED_COUNTRIES,
     create_geo_ip_rule,
     delete_geo_ip_rule,
-    get_or_create_geo_access_settings,
+    load_geo_access_config,
     parse_country_list,
     set_geo_ip_rule_enabled,
     update_geo_access_settings,
@@ -9393,10 +9394,10 @@ def geo_access_page(
     if redir:
         return redir
 
-    settings_row = get_or_create_geo_access_settings(db)
+    settings_row = load_geo_access_config(db)
     db.commit()
     rules = db.query(GeoIpRule).order_by(GeoIpRule.id.desc()).limit(200).all()
-    restricted_country_codes = list(parse_country_list(settings_row.restricted_countries_json))
+    restricted_country_codes = list(settings_row.restricted_countries)
     restricted_countries = ",".join(restricted_country_codes)
     restricted_country_display = _format_geo_access_country_list(restricted_country_codes)
     safe_limit = min(max(int(limit or 100), 1), 200)
@@ -9505,6 +9506,7 @@ def geo_access_page(
             "restricted_countries": restricted_countries,
             "restricted_country_display": restricted_country_display,
             "restricted_country_count": len(restricted_country_codes),
+            "system_locked_country_codes": SYSTEM_RESTRICTED_COUNTRIES,
             "rules": rules,
             "log_summaries": log_summaries,
             "logs": logs,

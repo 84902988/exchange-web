@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily GeoLite2 Country database update check
+
+[Timer]
+OnCalendar=daily
+AccuracySec=1h
+RandomizedDelaySec=30m
+Persistent=true
+Unit=exchange-geoip-update.service
+
+[Install]
+WantedBy=timers.target

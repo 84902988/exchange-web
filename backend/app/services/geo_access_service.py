@@ -40,6 +40,15 @@ RULE_BLOCK = "BLOCK"
 GEO_ACCESS_LOG_BUCKET_SECONDS = 300
 GEO_ACCESS_LOG_RETENTION_DAYS = 90
 
+# Platform security baseline. These values are intentionally not operator-configurable:
+# mainland China public traffic is always blocked, while authenticated admin routes
+# remain reachable for operations. Additional countries and UNKNOWN handling may still
+# be configured through the admin console.
+SYSTEM_GEO_ACCESS_ENABLED = True
+SYSTEM_GEO_ACCESS_MONITOR_MODE = False
+SYSTEM_GEO_ACCESS_ADMIN_EXEMPT = True
+SYSTEM_RESTRICTED_COUNTRIES = ("CN",)
+
 
 @dataclass(frozen=True)
 class GeoAccessConfig:
@@ -142,13 +151,19 @@ def country_list_json(countries: Sequence[str]) -> str:
     return json.dumps(list(parse_country_list(countries)), ensure_ascii=False)
 
 
+def merge_system_restricted_countries(countries: object) -> tuple[str, ...]:
+    return parse_country_list((*SYSTEM_RESTRICTED_COUNTRIES, *parse_country_list(countries)))
+
+
 def env_default_config() -> GeoAccessConfig:
     return GeoAccessConfig(
-        enabled=_truthy(getattr(settings, "GEO_ACCESS_ENABLED", False), default=False),
-        monitor_mode=_truthy(getattr(settings, "GEO_ACCESS_MONITOR_MODE", True), default=True),
+        enabled=SYSTEM_GEO_ACCESS_ENABLED,
+        monitor_mode=SYSTEM_GEO_ACCESS_MONITOR_MODE,
         block_unknown=_truthy(getattr(settings, "GEO_ACCESS_BLOCK_UNKNOWN", False), default=False),
-        restricted_countries=parse_country_list(getattr(settings, "GEO_ACCESS_RESTRICTED_COUNTRIES", "")),
-        admin_exempt=_truthy(getattr(settings, "GEO_ACCESS_ADMIN_EXEMPT", False), default=False),
+        restricted_countries=merge_system_restricted_countries(
+            getattr(settings, "GEO_ACCESS_RESTRICTED_COUNTRIES", "")
+        ),
+        admin_exempt=SYSTEM_GEO_ACCESS_ADMIN_EXEMPT,
     )
 
 
@@ -175,11 +190,11 @@ def get_or_create_geo_access_settings(db: Session) -> GeoAccessSettings:
 def load_geo_access_config(db: Session) -> GeoAccessConfig:
     row = get_or_create_geo_access_settings(db)
     return GeoAccessConfig(
-        enabled=bool(row.enabled),
-        monitor_mode=bool(row.monitor_mode),
+        enabled=SYSTEM_GEO_ACCESS_ENABLED,
+        monitor_mode=SYSTEM_GEO_ACCESS_MONITOR_MODE,
         block_unknown=bool(row.block_unknown),
-        restricted_countries=parse_country_list(row.restricted_countries_json),
-        admin_exempt=bool(row.admin_exempt),
+        restricted_countries=merge_system_restricted_countries(row.restricted_countries_json),
+        admin_exempt=SYSTEM_GEO_ACCESS_ADMIN_EXEMPT,
     )
 
 
@@ -193,11 +208,13 @@ def update_geo_access_settings(
     restricted_countries: object,
 ) -> GeoAccessSettings:
     row = get_or_create_geo_access_settings(db)
-    row.enabled = bool(enabled)
-    row.monitor_mode = bool(monitor_mode)
+    row.enabled = SYSTEM_GEO_ACCESS_ENABLED
+    row.monitor_mode = SYSTEM_GEO_ACCESS_MONITOR_MODE
     row.block_unknown = bool(block_unknown)
-    row.admin_exempt = bool(admin_exempt)
-    row.restricted_countries_json = country_list_json(parse_country_list(restricted_countries))
+    row.admin_exempt = SYSTEM_GEO_ACCESS_ADMIN_EXEMPT
+    row.restricted_countries_json = country_list_json(
+        merge_system_restricted_countries(restricted_countries)
+    )
     row.updated_at = datetime.utcnow()
     db.add(row)
     db.flush()
@@ -299,12 +316,14 @@ def evaluate_geo_access(
     normalized_country = normalize_country_code(country_code)
     request_path = str(path or "")
 
-    if not config.enabled:
-        return GeoAccessDecision(DECISION_ALLOW, REASON_DISABLED, False)
     if is_local_or_private_ip(ip_address):
         return GeoAccessDecision(DECISION_ALLOW, REASON_LOCAL_PRIVATE, False)
-    if config.admin_exempt and request_path.startswith("/admin"):
+    if request_path.startswith("/admin"):
         return GeoAccessDecision(DECISION_ALLOW, REASON_ADMIN_EXEMPT, False)
+    if normalized_country in SYSTEM_RESTRICTED_COUNTRIES:
+        return GeoAccessDecision(DECISION_BLOCK, REASON_COUNTRY_RESTRICTED, True)
+    if not config.enabled:
+        return GeoAccessDecision(DECISION_ALLOW, REASON_DISABLED, False)
     if _matches_rule(ip_address, rules, RULE_ALLOW):
         return GeoAccessDecision(DECISION_ALLOW, REASON_ALLOWLIST, False)
     if _matches_rule(ip_address, rules, RULE_BLOCK):
