@@ -3,7 +3,7 @@
 {% block title %}地区访问控制{% endblock %}
 {% block page_title %}地区访问控制{% endblock %}
 {% block page_subtitle %}
-  <div class="page-subtitle">优先读取 Cloudflare 国家码；无 Cloudflare 头时使用本地 GeoIP 地址库识别；支持限制国家、IP 白名单、黑名单和访问日志。</div>
+  <div class="page-subtitle">中国大陆公开访问限制属于系统安全基线；后台路径固定豁免。支持配置其他限制国家、IP 规则和访问日志。</div>
 {% endblock %}
 
 {% block content %}
@@ -70,6 +70,7 @@
     .geo-transfer-item:last-child{margin-bottom:0}
     .geo-transfer-item:hover{border-color:rgba(96,165,250,.28);background:rgba(96,165,250,.08)}
     .geo-transfer-item.is-selected{border-color:rgba(96,165,250,.65);background:rgba(37,99,235,.24);color:#fff}
+    .geo-transfer-item.is-locked{cursor:not-allowed;border-color:rgba(245,158,11,.25);background:rgba(245,158,11,.08)}
     .geo-transfer-name{font-size:13px;font-weight:800}
     .geo-transfer-code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;color:var(--muted)}
     .geo-transfer-empty{height:100%;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:13px;text-align:center}
@@ -124,17 +125,13 @@
         <div class="geo-status-item">
           <div class="geo-status-label">启用状态</div>
           <div class="geo-status-value">
-            <span class="badge {% if settings_row.enabled %}badge-danger{% else %}badge-neutral{% endif %}">
-              {% if settings_row.enabled %}已启用{% else %}未启用{% endif %}
-            </span>
+            <span class="badge badge-danger">已启用 · 系统锁定</span>
           </div>
         </div>
         <div class="geo-status-item">
           <div class="geo-status-label">运行模式</div>
           <div class="geo-status-value">
-            <span class="badge {% if settings_row.monitor_mode %}badge-warning{% else %}badge-danger{% endif %}">
-              {% if settings_row.monitor_mode %}仅监控{% else %}正式拦截{% endif %}
-            </span>
+            <span class="badge badge-danger">正式拦截 · 系统锁定</span>
           </div>
         </div>
         <div class="geo-status-item">
@@ -147,7 +144,7 @@
         </div>
         <div class="geo-status-item">
           <div class="geo-status-label">后台路径豁免</div>
-          <div class="geo-status-value">{{ "是" if settings_row.admin_exempt else "否" }}</div>
+          <div class="geo-status-value">是 · 系统锁定</div>
         </div>
         <div class="geo-status-item">
           <div class="geo-status-label">限制国家/地区数量</div>
@@ -164,13 +161,12 @@
 
   <section class="page-section">
     <div class="card">
-      <div class="section-title">当前建议流程</div>
+      <div class="section-title">系统安全基线</div>
       <ol class="geo-runbook">
-        <li>先开启“启用地区限制”</li>
-        <li>保持“仅监控，不实际拦截”</li>
-        <li>配置限制国家/地区代码</li>
-        <li>观察访问日志摘要</li>
-        <li>确认无误后再关闭“仅监控”进入正式拦截</li>
+        <li>中国大陆（CN）普通前台和 API 请求始终正式拦截</li>
+        <li>后台路径（/admin）始终豁免，确保运营入口可用</li>
+        <li>中国大陆限制优先于 IP 白名单，不能通过后台配置绕过</li>
+        <li>运营仍可配置其他限制国家和未识别地区处理方式</li>
       </ol>
     </div>
   </section>
@@ -181,15 +177,15 @@
       <form method="post" action="/admin/geo-access/settings">
         <div class="geo-settings-grid">
           <div class="geo-checks">
-            <label class="geo-check"><input type="checkbox" name="enabled" value="1" {% if settings_row.enabled %}checked{% endif %} /> 启用地区限制</label>
-            <label class="geo-check"><input type="checkbox" name="monitor_mode" value="1" {% if settings_row.monitor_mode %}checked{% endif %} /> 仅监控，不实际拦截</label>
+            <label class="geo-check"><input type="checkbox" checked disabled /> 启用地区限制（系统锁定）</label>
+            <label class="geo-check"><input type="checkbox" disabled /> 仅监控（系统固定关闭）</label>
             <label class="geo-check"><input type="checkbox" name="block_unknown" value="1" {% if settings_row.block_unknown %}checked{% endif %} /> 拦截未识别地区</label>
-            <label class="geo-check"><input type="checkbox" name="admin_exempt" value="1" {% if settings_row.admin_exempt %}checked{% endif %} /> 后台路径豁免</label>
+            <label class="geo-check"><input type="checkbox" checked disabled /> 后台路径豁免（系统锁定）</label>
           </div>
           <div class="field">
             <label>限制国家/地区</label>
             <input id="geo_country_hidden" type="hidden" name="restricted_countries" value="{{ restricted_countries }}" />
-            <div class="geo-help">选择需要限制访问的国家/地区。建议先开启“仅监控，不实际拦截”，观察日志确认无误后再关闭监控模式。</div>
+            <div class="geo-help">中国大陆（CN）为系统锁定项，不能移除。这里可以继续添加或删除其他限制国家/地区。</div>
 
             <div class="geo-transfer">
               <div class="geo-transfer-column">
@@ -212,7 +208,7 @@
           </div>
         </div>
         <div class="filter-actions" style="margin-top:12px">
-          <button type="submit" class="btn">保存设置</button>
+          <button type="submit" class="btn">保存可配置项</button>
         </div>
       </form>
     </div>
@@ -221,6 +217,7 @@
   <section class="page-section">
     <div class="table-card">
       <div class="section-title">IP 白名单 / 黑名单</div>
+      <div class="geo-help">IP 白名单适用于其他地区的例外放行，不能绕过系统锁定的中国大陆访问限制。</div>
       <form method="post" action="/admin/geo-access/rules" class="geo-rule-form">
         <div class="field">
           <label>规则类型</label>
@@ -437,6 +434,11 @@
           { code: "{{ code }}", label: "{{ label }}" }{% if not loop.last %},{% endif %}
         {% endfor %}
       ];
+      const lockedCountryCodes = new Set([
+        {% for code in system_locked_country_codes %}
+          "{{ code }}"{% if not loop.last %},{% endif %}
+        {% endfor %}
+      ]);
       const labelMap = new Map(countryOptions.map((item) => [item.code, item.label]));
       const optionMap = new Map(countryOptions.map((item) => [item.code, item]));
       const hidden = document.getElementById("geo_country_hidden");
@@ -494,6 +496,10 @@
           row.setAttribute("role", "option");
           row.setAttribute("aria-selected", activeSet.has(item.code) ? "true" : "false");
           if (activeSet.has(item.code)) row.classList.add("is-selected");
+          if (lockedCountryCodes.has(item.code)) {
+            row.classList.add("is-locked");
+            row.setAttribute("aria-disabled", "true");
+          }
 
           const text = document.createElement("span");
           text.className = "geo-transfer-name";
@@ -502,10 +508,11 @@
 
           const codeText = document.createElement("span");
           codeText.className = "geo-transfer-code";
-          codeText.textContent = item.code;
+          codeText.textContent = lockedCountryCodes.has(item.code) ? `${item.code} · 系统锁定` : item.code;
           row.appendChild(codeText);
 
           row.addEventListener("click", () => {
+            if (lockedCountryCodes.has(item.code)) return;
             if (activeSet.has(item.code)) activeSet.delete(item.code);
             else activeSet.add(item.code);
             refresh();
@@ -519,7 +526,7 @@
           if (selected.has(code)) activeAvailable.delete(code);
         });
         activeRestricted.forEach((code) => {
-          if (!selected.has(code)) activeRestricted.delete(code);
+          if (!selected.has(code) || lockedCountryCodes.has(code)) activeRestricted.delete(code);
         });
       };
 
@@ -552,7 +559,7 @@
 
       removeButton?.addEventListener("click", () => {
         activeRestricted.forEach((code) => {
-          selected.delete(code);
+          if (!lockedCountryCodes.has(code)) selected.delete(code);
         });
         activeRestricted.clear();
         refresh();

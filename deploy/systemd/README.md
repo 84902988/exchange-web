@@ -18,6 +18,7 @@ schedulers as dedicated single-instance systemd services.
 - `exchange-dividend-auto-scheduler.service` is the only owner that automatically calculates and pays a due dividend batch.
 - Matching, scheduling, liquidation, TP/SL, contract limit orders, and accounting reconciliation each have one dedicated unit.
 - `exchange-dividend-eligibility-snapshot.timer` owns the immutable daily eligibility snapshot only; it never calculates or pays dividends.
+- `exchange-geoip-update.timer` checks daily for an authorized GeoLite2 Country update, validates it, and atomically replaces the local database without restarting the API.
 - `exchange-backend.target` groups all 19 services for enable/start/stop and status operations. A member failure does not restart unrelated members.
 - The API has no embedded withdrawal-confirmation or automatic-dividend owner, so `.env` cannot accidentally create duplicate processes for either workflow.
 
@@ -40,6 +41,7 @@ sudo systemctl daemon-reload
 sudo systemd-analyze verify /etc/systemd/system/exchange-*.service /etc/systemd/system/exchange-*.timer /etc/systemd/system/exchange-backend.target
 sudo systemctl enable --now exchange-backend.target
 sudo systemctl enable --now exchange-dividend-eligibility-snapshot.timer
+sudo systemctl enable --now exchange-geoip-update.timer
 sudo systemctl enable --now exchange-web.service
 ```
 
@@ -47,6 +49,15 @@ Keep `/opt/exchange-web/backend/.env` readable by `exchange` but not world-reada
 Keep `/opt/exchange-web/web/.env.production` readable by `www` but not
 world-readable. Follow `deploy/systemd/FRONTEND_RELEASE.md` for frontend
 build, permission, restart, listener-ownership, and browser verification.
+
+GeoLite2 data and credentials are not included in the repository. Each user or deployer must obtain its own authorization, install the official `geoipupdate` utility, keep `/etc/GeoIP.conf` root-owned with mode `0600`, and comply with the applicable update and attribution requirements. After installing the unit files, verify the first update before relying on country filtering:
+
+```bash
+sudo systemctl start exchange-geoip-update.service
+sudo systemctl status exchange-geoip-update.service --no-pager
+sudo systemctl list-timers exchange-geoip-update.timer --no-pager
+sudo -u exchange test -r /opt/exchange-web/data/geoip/GeoLite2-Country.mmdb
+```
 
 Automatic dividend payout is owned only by `exchange-dividend-auto-scheduler.service`, which reads the run time configured in the operations console. It has no environment enable switch and is never embedded in the API. The eligibility timer independently retries at `00:01`, `00:04`, `00:07`, `00:10`, and `00:13 UTC` within the bounded snapshot window. Snapshot creation is idempotent and writes no balance or payout records; the automatic scheduler fails closed if that immutable snapshot is missing.
 

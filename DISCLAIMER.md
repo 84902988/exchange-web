@@ -12,3 +12,8 @@ The authors and contributors are not responsible for any direct or indirect loss
 
 Do not deploy or operate this system with real users or real funds unless you fully understand the risks and have completed independent technical, legal, and security verification.
 
+## Geographic access controls and GeoLite2
+
+The default application policy rejects public and API requests that are identified as originating from mainland China (`CN`). Administrative paths are handled separately. IP geolocation is inherently approximate and can be affected by missing or outdated databases, mobile networks, proxies, VPNs, and upstream header configuration. This control is not a guarantee of legal or regulatory compliance.
+
+The GeoLite2 database is not distributed with this repository. Each user or deployer must obtain its own authorized and current copy from MaxMind, comply with the applicable license and attribution requirements, configure ongoing updates, and remove outdated copies when required. A disclaimer does not grant redistribution rights for GeoLite2 data.
