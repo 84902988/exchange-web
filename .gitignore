@@ -57,7 +57,8 @@ logs/
 *.db
 *.mmdb
 GeoIP.conf
-data/geoip/
+data/geoip/*
+!data/geoip/README.md
 backend/data/geoip/
 
 # IDE / OS

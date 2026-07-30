@@ -1,0 +1,17 @@
+[Unit]
+Description=Update and validate the GeoLite2 Country database
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash /opt/exchange-web/deploy/scripts/update_geolite2_country.sh
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/exchange-web/data/geoip
+UMask=0027

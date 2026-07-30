@@ -5,7 +5,7 @@ import Link from 'next/link';
 import AssetTransferModal from '@/components/asset/AssetTransferModal';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import type { ContractAccountSummary } from '@/lib/api/modules/contract';
-import { formatNumber, toNumber } from './contractFormat';
+import { formatNumber } from './contractFormat';
 
 type ContractAccountPanelProps = {
   account: ContractAccountSummary | null;
@@ -28,10 +28,6 @@ export default function ContractAccountPanel({
   const { t } = useLocaleContext();
   const [transferOpen, setTransferOpen] = useState(false);
   const accountEquityUsable = account?.equity_usable !== false;
-  const accountUnrealizedPnl = accountEquityUsable
-    ? account?.unrealized_pnl
-      ?? (account as (ContractAccountSummary & { unrealizedPnl?: string | null }) | null)?.unrealizedPnl
-    : null;
   const accountEquity = accountEquityUsable ? account?.equity : null;
 
   return (
@@ -60,8 +56,6 @@ export default function ContractAccountPanel({
             <AccountRow label={t('positionMargin', 'contracts')} value={account?.used_margin || account?.position_margin} />
             <AccountRow label={t('frozenMargin', 'contracts')} value={account?.frozen_margin} />
             <AccountRow label={t('accountEquity', 'contracts')} value={accountEquity} strong />
-            <AccountRow label={t('unrealizedPnl', 'contracts')} value={accountUnrealizedPnl} colored />
-            <AccountRow label={t('realizedPnl', 'contracts')} value={account?.realized_pnl} colored />
           </div>
 
           <div className="grid grid-cols-2 gap-2">
@@ -98,24 +92,13 @@ function AccountRow({
   label,
   value,
   strong = false,
-  colored = false,
 }: {
   label: string;
   value?: string | null;
   strong?: boolean;
-  colored?: boolean;
 }) {
   const hasValue = value !== undefined && value !== null && value !== '';
-  const num = toNumber(value);
-  const colorClass = colored
-    ? num > 0
-      ? 'text-[#00c087]'
-      : num < 0
-        ? 'text-[#f6465d]'
-        : 'text-white/85'
-    : strong
-      ? 'text-white'
-      : 'text-white/85';
+  const colorClass = strong ? 'text-white' : 'text-white/85';
 
   return (
     <div className="flex items-center justify-between gap-2 py-1 text-[12px]">
