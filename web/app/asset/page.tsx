@@ -478,17 +478,11 @@ export default function AssetPage() {
     [contractAccount],
   );
   const contractDetailMetrics = useMemo<AccountDetailMetric[]>(() => {
-    const realizedPnl = safeNum(contractAccount.realized_pnl);
     return [
       { label: t('availableMargin', 'asset'), value: `${formatUsdtAmount(contractAccount.available_margin)} USDT` },
       { label: t('positionMargin', 'asset'), value: `${formatUsdtAmount(contractAccount.position_margin || contractAccount.used_margin)} USDT` },
       { label: t('frozenMargin', 'asset'), value: `${formatUsdtAmount(contractAccount.frozen_margin)} USDT` },
       { label: t('accountEquity', 'asset'), value: `${formatUsdtAmount(contractAccount.equity)} USDT` },
-      {
-        label: t('realizedPnl', 'asset'),
-        value: `${formatUsdtAmount(contractAccount.realized_pnl)} USDT`,
-        tone: realizedPnl > 0 ? 'positive' : realizedPnl < 0 ? 'negative' : 'muted',
-      },
     ];
   }, [contractAccount, t]);
 
@@ -841,16 +835,6 @@ export default function AssetPage() {
               { label: t('positionMargin', 'asset'), value: `${formatUsdtAmount(contractAccount.position_margin || contractAccount.used_margin)} USDT` },
               { label: t('frozenMargin', 'asset'), value: `${formatUsdtAmount(contractAccount.frozen_margin)} USDT` },
               { label: t('accountEquity', 'asset'), value: `${formatUsdtAmount(contractAccount.equity)} USDT` },
-              {
-                label: t('realizedPnl', 'asset'),
-                value: `${formatUsdtAmount(contractAccount.realized_pnl)} USDT`,
-                tone:
-                  safeNum(contractAccount.realized_pnl) > 0
-                    ? 'positive'
-                    : safeNum(contractAccount.realized_pnl) < 0
-                      ? 'negative'
-                      : 'muted',
-              },
             ]}
             actions={
               <>
@@ -1281,7 +1265,7 @@ function AccountDetailModal({
           )}
 
           {account === 'contract' && contractMetrics && contractMetrics.length > 0 ? (
-            <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+            <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
               {contractMetrics.map((metric) => (
                 <div key={metric.label} className="rounded-xl border border-white/10 bg-black/15 p-3">
                   <div className="text-xs text-white/45">{metric.label}</div>

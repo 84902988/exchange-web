@@ -12,4 +12,6 @@ test('contract account hides unusable equity instead of formatting it as zero', 
   expect(source).toContain('const accountEquity = accountEquityUsable ? account?.equity : null;');
   expect(source).toContain("const hasValue = value !== undefined && value !== null && value !== '';");
   expect(source).toContain("{hasValue ? `${formatNumber(value, 4)} USDT` : '--'}");
+  expect(source).not.toContain("t('unrealizedPnl', 'contracts')");
+  expect(source).not.toContain("t('realizedPnl', 'contracts')");
 });
