@@ -1,7 +1,7 @@
 import React from 'react';
-import {Pressable, ScrollView, StyleSheet, Text, View} from 'react-native';
-import type {MarketCategoryKey} from '../../api/market';
-import {colors, typography} from '../../theme';
+import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import type { MarketCategoryKey } from '../../api/market';
+import { colors, typography } from '../../theme';
 
 export type MarketCategoryTab = {
   key: MarketCategoryKey;
@@ -14,24 +14,37 @@ type Props = {
   onChange: (key: MarketCategoryKey) => void;
 };
 
-export default function MarketCategoryTabs({tabs, activeKey, onChange}: Props) {
+export default function MarketCategoryTabs({
+  tabs,
+  activeKey,
+  onChange,
+}: Props) {
   return (
     <ScrollView
       horizontal
       showsHorizontalScrollIndicator={false}
-      contentContainerStyle={styles.content}>
+      contentContainerStyle={styles.content}
+    >
       {tabs.map(tab => {
         const active = tab.key === activeKey;
         return (
           <Pressable
             key={tab.key}
-            accessibilityRole="button"
-            style={styles.tab}
-            onPress={() => onChange(tab.key)}>
+            accessibilityRole="tab"
+            accessibilityState={{ selected: active }}
+            android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
+            style={({ pressed }) => [
+              styles.tab,
+              pressed ? styles.pressed : null,
+            ]}
+            onPress={() => onChange(tab.key)}
+          >
             <Text style={[styles.label, active ? styles.activeLabel : null]}>
               {tab.label}
             </Text>
-            <View style={[styles.indicator, active ? styles.activeIndicator : null]} />
+            <View
+              style={[styles.indicator, active ? styles.activeIndicator : null]}
+            />
           </Pressable>
         );
       })}
@@ -40,14 +53,15 @@ export default function MarketCategoryTabs({tabs, activeKey, onChange}: Props) {
 }
 
 const styles = StyleSheet.create({
+  pressed: { opacity: 0.72, transform: [{ scale: 0.98 }] },
   content: {
     gap: 16,
-    height: 44,
+    height: 48,
     alignItems: 'center',
     paddingRight: 8,
   },
   tab: {
-    height: 34,
+    height: 44,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 1,

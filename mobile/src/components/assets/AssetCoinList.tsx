@@ -1,20 +1,29 @@
 import React from 'react';
-import {StyleSheet, Text, View} from 'react-native';
-import {
-  estimateUsdtValue,
-  formatAssetNumber,
-  type AssetAccountBalance,
-} from '../../api/assets';
-import {colors, typography} from '../../theme';
+import { StyleSheet, Text, useWindowDimensions, View } from 'react-native';
+import { formatAssetNumber } from '../../api/assets';
+import type { AssetValuationRow } from '../../services/assetSnapshot';
+import { useLanguage } from '../../i18n';
+import { colors, typography } from '../../theme';
 import AssetEmptyState from './AssetEmptyState';
+import { shouldUseCompactAssetLayout } from './assetLayout';
 
 type Props = {
-  items: AssetAccountBalance[];
+  items: AssetValuationRow[];
   hidden?: boolean;
   emptyTitle: string;
+  title?: string;
 };
 
-function AssetCoinList({items, hidden = false, emptyTitle}: Props) {
+function AssetCoinList({
+  items,
+  hidden = false,
+  emptyTitle,
+  title,
+}: Props) {
+  const { t } = useLanguage();
+  const { width, fontScale } = useWindowDimensions();
+  const compact = shouldUseCompactAssetLayout(width, fontScale);
+
   if (items.length === 0) {
     return <AssetEmptyState title={emptyTitle} />;
   }
@@ -22,32 +31,81 @@ function AssetCoinList({items, hidden = false, emptyTitle}: Props) {
   return (
     <View style={styles.card}>
       <View style={styles.header}>
-        <Text style={[styles.headerText, styles.symbolColumn]}>币种</Text>
-        <Text style={styles.headerText}>可用</Text>
-        <Text style={styles.headerText}>冻结</Text>
-        <Text style={styles.headerText}>估值</Text>
+        <View>
+          <Text style={styles.cardTitle}>{title ?? t('assets.coinDetails')}</Text>
+          <Text style={styles.cardSubtitle}>{t('assets.realtimeSummary')}</Text>
+        </View>
+        <View style={styles.countChip}>
+          <Text style={styles.countText}>
+            {t('assets.countItems', { count: items.length })}
+          </Text>
+        </View>
       </View>
       {items.map(item => {
-        const valuation = estimateUsdtValue(item);
         return (
-          <View key={`${item.accountKey}-${item.symbol}`} style={styles.row}>
-            <View style={styles.symbolColumn}>
-              <Text style={styles.symbol}>{item.symbol}</Text>
-              <Text style={styles.account}>{accountLabel(item.accountKey)}</Text>
+          <View key={item.key} style={styles.row}>
+            <View
+              style={[styles.rowTop, compact ? styles.rowTopCompact : null]}
+            >
+              <View style={styles.coinIdentity}>
+                <View style={styles.coinBadge}>
+                  <Text style={styles.coinBadgeText}>
+                    {item.symbol.slice(0, 2)}
+                  </Text>
+                </View>
+                <View>
+                  <Text style={styles.symbol}>{item.symbol}</Text>
+                  <Text style={styles.account}>
+                    {t('assets.accountSuffix', {
+                      account: accountLabel(item.accountKey, t),
+                    })}
+                  </Text>
+                </View>
+              </View>
+              <View
+                style={[
+                  styles.valuation,
+                  compact ? styles.valuationCompact : null,
+                ]}
+              >
+                <Text style={styles.balanceLabel}>{t('assets.valuation')}</Text>
+                <Text numberOfLines={2} style={styles.valuationValue}>
+                  {hidden
+                    ? '***'
+                    : !item.valuationComplete || item.valueUsdt === null
+                    ? '-- USDT'
+                    : `${formatAssetNumber(item.valueUsdt, 2)} USDT`}
+                </Text>
+              </View>
             </View>
-            <Text style={styles.value}>
-              {hidden ? '***' : formatAssetNumber(item.available, 4)}
-            </Text>
-            <Text style={styles.value}>
-              {hidden ? '***' : formatAssetNumber(item.frozen, 4)}
-            </Text>
-            <Text style={styles.value}>
-              {hidden
-                ? '***'
-                : valuation === null
-                  ? '-- USDT'
-                  : `${formatAssetNumber(valuation, 2)} USDT`}
-            </Text>
+            <View
+              style={[
+                styles.balanceRow,
+                compact ? styles.balanceRowCompact : null,
+              ]}
+            >
+              <BalanceMetric
+                label={t('assets.available')}
+                value={hidden ? '***' : formatAssetNumber(item.available, 4)}
+              />
+              <View style={styles.balanceDivider} />
+              <BalanceMetric
+                label={t('assets.frozen')}
+                value={hidden ? '***' : formatAssetNumber(item.frozen, 4)}
+              />
+              {!item.valuationComplete ? (
+                <View
+                  style={[
+                    styles.warningChip,
+                    compact ? styles.warningChipCompact : null,
+                  ]}
+                >
+                  <Text style={styles.warning}>
+                    {t('assets.valuationUnavailable')}
+                  </Text>
+                </View>
+              ) : null}
+            </View>
           </View>
         );
       })}
@@ -57,63 +115,164 @@ function AssetCoinList({items, hidden = false, emptyTitle}: Props) {
 
 export default React.memo(AssetCoinList);
 
-function accountLabel(value: string) {
+function BalanceMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <View style={styles.balanceMetric}>
+      <Text style={styles.balanceLabel}>{label}</Text>
+      <Text style={styles.balanceValue}>{value}</Text>
+    </View>
+  );
+}
+
+function accountLabel(value: string, t: ReturnType<typeof useLanguage>['t']) {
   const normalized = value.toLowerCase();
-  if (normalized === 'funding') return '资金';
-  if (normalized === 'spot') return '现货';
-  if (normalized === 'contract') return '合约';
+  if (normalized === 'funding') return t('assets.account.shortFunding');
+  if (normalized === 'spot') return t('assets.account.shortSpot');
+  if (normalized === 'contract') return t('assets.account.shortContract');
   return value;
 }
 
 const styles = StyleSheet.create({
   card: {
     marginTop: 12,
-    borderRadius: 8,
+    borderRadius: 16,
     borderWidth: 1,
     borderColor: colors.line,
     backgroundColor: colors.card,
-    padding: 12,
+    padding: 14,
   },
   header: {
-    minHeight: 28,
+    minHeight: 42,
     flexDirection: 'row',
     alignItems: 'center',
-    borderBottomWidth: 1,
-    borderBottomColor: colors.line,
+    justifyContent: 'space-between',
+    marginBottom: 8,
   },
-  headerText: {
-    flex: 1,
+  cardTitle: {
+    ...typography.bold,
+    color: colors.text,
+    fontSize: 14,
+  },
+  cardSubtitle: {
+    marginTop: 3,
     color: colors.textSubtle,
-    fontSize: 10,
-    textAlign: 'right',
+    fontSize: 9,
   },
-  symbolColumn: {
-    flex: 1.1,
-    textAlign: 'left',
+  countChip: {
+    borderRadius: 99,
+    backgroundColor: colors.cardAlt,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  countText: {
+    ...typography.medium,
+    color: colors.textMuted,
+    fontSize: 9,
   },
   row: {
-    minHeight: 54,
+    minHeight: 108,
+    borderTopWidth: 1,
+    borderTopColor: colors.line,
+    paddingVertical: 12,
+  },
+  rowTop: {
     flexDirection: 'row',
     alignItems: 'center',
-    borderBottomWidth: 1,
-    borderBottomColor: colors.line,
+    justifyContent: 'space-between',
+  },
+  rowTopCompact: {
+    alignItems: 'stretch',
+    flexDirection: 'column',
+  },
+  coinIdentity: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  coinBadge: {
+    width: 38,
+    height: 38,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 10,
+    borderRadius: 12,
+    backgroundColor: colors.goldSoft,
+  },
+  coinBadgeText: {
+    ...typography.bold,
+    color: colors.gold,
+    fontSize: 10,
   },
   symbol: {
     ...typography.bold,
     color: colors.text,
-    fontSize: 13,
+    fontSize: 14,
   },
   account: {
     marginTop: 3,
     color: colors.textSubtle,
-    fontSize: 10,
+    fontSize: 9,
   },
-  value: {
+  valuation: {
+    alignItems: 'flex-end',
+  },
+  valuationCompact: {
+    alignItems: 'flex-start',
+    marginTop: 10,
+  },
+  valuationValue: {
     ...typography.number,
-    flex: 1,
+    marginTop: 3,
+    color: colors.text,
+    fontSize: 12,
+    fontWeight: '900',
+  },
+  balanceRow: {
+    minHeight: 34,
+    marginTop: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderRadius: 10,
+    backgroundColor: colors.cardAlt,
+    paddingHorizontal: 10,
+  },
+  balanceRowCompact: {
+    flexWrap: 'wrap',
+    paddingVertical: 8,
+  },
+  balanceMetric: {
+    minWidth: 72,
+  },
+  balanceLabel: {
+    color: colors.textSubtle,
+    fontSize: 9,
+  },
+  balanceValue: {
+    ...typography.number,
+    marginTop: 2,
     color: colors.textMuted,
     fontSize: 11,
     fontWeight: '800',
-    textAlign: 'right',
+  },
+  balanceDivider: {
+    width: 1,
+    height: 23,
+    marginHorizontal: 14,
+    backgroundColor: colors.line,
+  },
+  warningChip: {
+    marginLeft: 'auto',
+    borderRadius: 99,
+    backgroundColor: colors.goldSoft,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+  },
+  warningChipCompact: {
+    marginTop: 8,
+  },
+  warning: {
+    color: colors.gold,
+    fontSize: 9,
   },
 });

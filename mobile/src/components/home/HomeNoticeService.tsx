@@ -1,80 +1,101 @@
 import React from 'react';
-import {Pressable, StyleSheet, Text, View} from 'react-native';
-import {Bell, ChevronRight, Headphones, ShieldCheck} from 'lucide-react-native';
-import type {LucideIcon} from 'lucide-react-native';
-import {colors, typography} from '../../theme';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { Bell, ChevronRight } from 'lucide-react-native';
+import type { MobileAnnouncementSummary } from '../../api/mobileContent';
+import { colors, typography } from '../../theme';
+import { useLanguage } from '../../i18n';
 
-type ServiceItem = {
-  title: string;
-  description: string;
-  Icon: LucideIcon;
+type Props = {
+  announcements?: readonly MobileAnnouncementSummary[];
+  onPressAnnouncement?: (announcement: MobileAnnouncementSummary) => void;
 };
 
-const services: ServiceItem[] = [
-  {
-    title: '保障与服务',
-    description: '平台保障基金持续守护用户资产安全',
-    Icon: ShieldCheck,
-  },
-  {
-    title: '帮助中心和客户服务',
-    description: '7×24 小时解答您的问题',
-    Icon: Headphones,
-  },
-  {
-    title: '最新公告',
-    description: '查看平台公告、活动通知与系统更新',
-    Icon: Bell,
-  },
-];
+export default function HomeNoticeService({
+  announcements = [],
+  onPressAnnouncement,
+}: Props) {
+  if (announcements.length === 0) {
+    return null;
+  }
 
-const notices = ['平台系统维护通知', '新用户注册活动已开启', '合约交易风险提示'];
-
-export default function HomeNoticeService() {
   return (
     <View style={styles.card}>
-      {services.map((item, index) => {
-        const Icon = item.Icon;
-
-        return (
-          <Pressable
-            accessibilityLabel={`${item.title}, ${item.description}`}
-            accessibilityRole="button"
-            key={item.title}
-            style={[styles.serviceRow, index > 0 ? styles.divider : null]}>
-            <View style={styles.iconWrap}>
-              <Icon color={colors.primary} size={19} strokeWidth={2.2} />
-            </View>
-            <View style={styles.serviceCopy}>
-              <Text style={styles.serviceTitle}>{item.title}</Text>
-              <Text style={styles.serviceDesc} numberOfLines={1}>
-                {item.description}
-              </Text>
-            </View>
-            <ChevronRight color={colors.textSubtle} size={17} strokeWidth={2.1} />
-          </Pressable>
-        );
-      })}
-      <View style={styles.noticeBox}>
-        {notices.map((item, index) => (
-          <Pressable
-            accessibilityLabel={item}
-            accessibilityRole="button"
-            key={item}
-            style={[styles.noticeRow, index > 0 ? styles.noticeDivider : null]}>
-            <View style={styles.noticeDot} />
-            <Text style={styles.noticeText} numberOfLines={1}>
-              {item}
-            </Text>
-            <Text style={styles.noticeTime}>今日</Text>
-          </Pressable>
-        ))}
-      </View>
+      {announcements.map((announcement, index) => (
+        <AnnouncementRow
+          announcement={announcement}
+          isFirst={index === 0}
+          key={announcement.id}
+          onPress={onPressAnnouncement}
+        />
+      ))}
     </View>
   );
 }
 
+function AnnouncementRow({
+  announcement,
+  isFirst,
+  onPress,
+}: {
+  announcement: MobileAnnouncementSummary;
+  isFirst: boolean;
+  onPress?: Props['onPressAnnouncement'];
+}) {
+  const { t } = useLanguage();
+  const content = (
+    <>
+      <View style={styles.iconWrap}>
+        <Bell color={colors.primary} size={18} strokeWidth={2.2} />
+      </View>
+      <View style={styles.copy}>
+        <View style={styles.meta}>
+          {announcement.isPinned ? (
+            <Text style={styles.pinned}>{t('home.pinned')}</Text>
+          ) : null}
+          {announcement.categoryLabel ? (
+            <Text style={styles.category}>{announcement.categoryLabel}</Text>
+          ) : null}
+          {announcement.publishedAt ? (
+            <Text style={styles.date}>
+              {announcement.publishedAt.slice(0, 10)}
+            </Text>
+          ) : null}
+        </View>
+        <Text style={styles.title} numberOfLines={1}>
+          {announcement.title}
+        </Text>
+        {announcement.summary ? (
+          <Text style={styles.summary} numberOfLines={2}>
+            {announcement.summary}
+          </Text>
+        ) : null}
+      </View>
+      {onPress ? (
+        <ChevronRight color={colors.textSubtle} size={17} strokeWidth={2.1} />
+      ) : null}
+    </>
+  );
+  const rowStyle = [styles.row, !isFirst ? styles.divider : null];
+
+  if (onPress) {
+    return (
+      <Pressable
+        accessibilityLabel={announcement.title}
+        accessibilityRole="button"
+        android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
+        onPress={() => onPress(announcement)}
+        style={({ pressed }) => [rowStyle, pressed ? styles.pressed : null]}
+      >
+        {content}
+      </Pressable>
+    );
+  }
+
+  return <View style={rowStyle}>{content}</View>;
+}
+
 const styles = StyleSheet.create({
+  pressed: { opacity: 0.8, transform: [{ scale: 0.995 }] },
   card: {
     overflow: 'hidden',
     borderRadius: 12,
@@ -82,8 +103,8 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(214, 168, 50, 0.14)',
   },
-  serviceRow: {
-    minHeight: 66,
+  row: {
+    minHeight: 70,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
@@ -104,55 +125,41 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(214, 168, 50, 0.2)',
   },
-  serviceCopy: {
+  copy: {
     flex: 1,
     gap: 3,
   },
-  serviceTitle: {
+  meta: {
+    minHeight: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  pinned: {
+    ...typography.semibold,
+    color: colors.primary,
+    fontSize: 10,
+  },
+  category: {
+    ...typography.caption,
+    color: colors.textSubtle,
+    fontSize: 10,
+  },
+  date: {
+    ...typography.caption,
+    marginLeft: 'auto',
+    color: colors.textSubtle,
+    fontSize: 10,
+  },
+  title: {
     ...typography.semibold,
     color: colors.text,
     fontSize: 14,
   },
-  serviceDesc: {
+  summary: {
     ...typography.caption,
     color: colors.textMuted,
     fontSize: 12,
     lineHeight: 16,
-  },
-  noticeBox: {
-    marginHorizontal: 12,
-    marginBottom: 12,
-    borderRadius: 10,
-    backgroundColor: 'rgba(155, 116, 30, 0.24)',
-    borderWidth: 1,
-    borderColor: 'rgba(214, 168, 50, 0.13)',
-  },
-  noticeRow: {
-    minHeight: 36,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    paddingHorizontal: 10,
-  },
-  noticeDivider: {
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: 'rgba(214, 168, 50, 0.12)',
-  },
-  noticeDot: {
-    width: 5,
-    height: 5,
-    borderRadius: 3,
-    backgroundColor: colors.gold,
-  },
-  noticeText: {
-    ...typography.caption,
-    flex: 1,
-    color: colors.textMuted,
-    fontSize: 12,
-  },
-  noticeTime: {
-    ...typography.caption,
-    color: colors.textSubtle,
-    fontSize: 11,
   },
 });

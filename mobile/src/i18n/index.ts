@@ -1,1 +1,2 @@
-export const defaultLocale = 'zh-CN';
+export * from './catalog';
+export * from './LanguageProvider';

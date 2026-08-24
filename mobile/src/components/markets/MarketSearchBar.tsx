@@ -1,6 +1,7 @@
 import React from 'react';
-import {Pressable, StyleSheet, TextInput, View} from 'react-native';
-import {MoreHorizontal, Search} from 'lucide-react-native';
+import {StyleSheet, TextInput, View} from 'react-native';
+import {Search} from 'lucide-react-native';
+import {useLanguage} from '../../i18n';
 import {colors, typography} from '../../theme';
 
 type Props = {
@@ -9,14 +10,16 @@ type Props = {
 };
 
 export default function MarketSearchBar({value, onChangeText}: Props) {
+  const {t} = useLanguage();
   return (
     <View style={styles.container}>
       <View style={styles.inputWrap}>
         <Search color={colors.marketMuted} size={16} strokeWidth={2.1} />
         <TextInput
+          accessibilityLabel={t('markets.searchA11y')}
           autoCapitalize="characters"
           autoCorrect={false}
-          placeholder="搜索"
+          placeholder={t('markets.searchPlaceholder')}
           placeholderTextColor={colors.marketSubtle}
           returnKeyType="search"
           style={styles.input}
@@ -24,13 +27,6 @@ export default function MarketSearchBar({value, onChangeText}: Props) {
           onChangeText={onChangeText}
         />
       </View>
-      <Pressable
-        accessibilityLabel="更多行情操作"
-        accessibilityRole="button"
-        hitSlop={8}
-        style={styles.more}>
-        <MoreHorizontal color={colors.marketText} size={22} strokeWidth={2.2} />
-      </Pressable>
     </View>
   );
 }
@@ -43,7 +39,7 @@ const styles = StyleSheet.create({
   },
   inputWrap: {
     flex: 1,
-    height: 40,
+    height: 44,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
@@ -59,15 +55,5 @@ const styles = StyleSheet.create({
     color: colors.marketText,
     fontSize: 13,
     padding: 0,
-  },
-  more: {
-    width: 40,
-    height: 40,
-    borderRadius: 10,
-    backgroundColor: colors.marketCard,
-    borderWidth: 1,
-    borderColor: colors.marketLine,
-    alignItems: 'center',
-    justifyContent: 'center',
   },
 });

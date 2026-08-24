@@ -1,170 +1,123 @@
 import React from 'react';
-import {Pressable, StyleSheet, Text, View} from 'react-native';
-import {BadgePercent, Gift, Sparkles, Trophy} from 'lucide-react-native';
-import type {LucideIcon} from 'lucide-react-native';
-import {colors, typography} from '../../theme';
+import {
+  Image,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from 'react-native';
+import type {
+  MobileContentAction,
+  MobilePromoContent,
+} from '../../api/mobileContent';
+import { colors, typography } from '../../theme';
+import { useLanguage } from '../../i18n';
 
-type PromoItem = {
-  title: string;
-  subtitle: string;
-  tag: string;
-  Icon: LucideIcon;
+type Props = {
+  promos?: readonly MobilePromoContent[];
+  onAction?: (action: MobileContentAction, promo: MobilePromoContent) => void;
 };
 
-const promos: PromoItem[] = [
-  {
-    title: '全民冠军杯',
-    subtitle: '参与交易活动，瓜分250,000 USDT 奖池',
-    tag: '限时活动',
-    Icon: Trophy,
-  },
-  {
-    title: '新人专属任务',
-    subtitle: '完成注册与首笔交易，领取新人奖励',
-    tag: '新人福利',
-    Icon: Gift,
-  },
-  {
-    title: 'VIP 权益升级',
-    subtitle: '提升等级，解锁更低手续费与专属权益',
-    tag: 'VIP',
-    Icon: Sparkles,
-  },
-  {
-    title: '邀请好友奖励',
-    subtitle: '邀请好友交易，获得 RCB 奖励',
-    tag: '邀请',
-    Icon: BadgePercent,
-  },
-];
-
-const activeIndex = 0;
-const activePromo = promos[activeIndex];
-
-export default function HomePromoCarousel() {
-  const Icon = activePromo.Icon;
+export default function HomePromoCarousel({ promos = [], onAction }: Props) {
+  if (promos.length === 0) {
+    return null;
+  }
 
   return (
-    <View style={styles.wrap}>
-      <Pressable
-        accessibilityLabel={`${activePromo.title}, ${activePromo.subtitle}`}
-        accessibilityRole="button"
-        style={styles.banner}>
-        <View style={styles.glow} />
-        <View style={styles.iconWrap}>
-          <Icon color={colors.primary} size={25} strokeWidth={2.2} />
-        </View>
-        <View style={styles.copy}>
-          <View style={styles.titleRow}>
-            <Text style={styles.tag}>{activePromo.tag}</Text>
-            <Text style={styles.page}>
-              {activeIndex + 1}/{promos.length}
-            </Text>
-          </View>
-          <Text style={styles.title}>{activePromo.title}</Text>
-          <Text style={styles.subtitle} numberOfLines={1}>
-            {activePromo.subtitle}
-          </Text>
-        </View>
-      </Pressable>
-      <View style={styles.dotRow}>
-        {promos.map((item, index) => (
-          <View
-            key={item.title}
-            style={index === activeIndex ? styles.activeDot : styles.dot}
-          />
-        ))}
-      </View>
-    </View>
+    <ScrollView
+      horizontal
+      showsHorizontalScrollIndicator={false}
+      contentContainerStyle={styles.track}
+    >
+      {promos.map(promo => (
+        <PromoCard key={promo.id} promo={promo} onAction={onAction} />
+      ))}
+    </ScrollView>
   );
 }
 
+function PromoCard({
+  promo,
+  onAction,
+}: {
+  promo: MobilePromoContent;
+  onAction?: Props['onAction'];
+}) {
+  const { t } = useLanguage();
+  const content = (
+    <>
+      <Image
+        accessibilityIgnoresInvertColors
+        source={{ uri: promo.image.url }}
+        style={styles.image}
+        resizeMode="cover"
+      />
+      <View style={styles.copy}>
+        <Text style={styles.title} numberOfLines={1}>
+          {promo.title}
+        </Text>
+        {promo.subtitle ? (
+          <Text style={styles.subtitle} numberOfLines={2}>
+            {promo.subtitle}
+          </Text>
+        ) : null}
+      </View>
+    </>
+  );
+
+  if (promo.action && onAction) {
+    return (
+      <Pressable
+        accessibilityLabel={`${promo.title}${t('common.a11ySeparator')}${t(
+          'common.viewDetails',
+        )}`}
+        accessibilityRole="button"
+        android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
+        onPress={() => onAction(promo.action!, promo)}
+        style={({ pressed }) => [styles.card, pressed ? styles.pressed : null]}
+      >
+        {content}
+      </Pressable>
+    );
+  }
+
+  return <View style={styles.card}>{content}</View>;
+}
+
 const styles = StyleSheet.create({
-  wrap: {
-    gap: 8,
+  pressed: { opacity: 0.84, transform: [{ scale: 0.992 }] },
+  track: {
+    gap: 10,
+    paddingRight: 2,
   },
-  banner: {
-    minHeight: 98,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
+  card: {
+    width: 286,
     overflow: 'hidden',
-    borderRadius: 14,
-    paddingHorizontal: 14,
-    paddingVertical: 12,
+    borderRadius: 12,
     backgroundColor: '#151424',
     borderWidth: 1,
     borderColor: 'rgba(214, 168, 50, 0.16)',
   },
-  glow: {
-    position: 'absolute',
-    right: -34,
-    top: -46,
-    width: 112,
-    height: 112,
-    borderRadius: 56,
-    backgroundColor: 'rgba(214, 168, 50, 0.48)',
-  },
-  iconWrap: {
-    width: 46,
-    height: 46,
-    borderRadius: 23,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: 'rgba(214, 168, 50, 0.26)',
-    borderWidth: 1,
-    borderColor: 'rgba(214, 168, 50, 0.34)',
+  image: {
+    width: '100%',
+    aspectRatio: 3,
+    backgroundColor: colors.card,
   },
   copy: {
-    flex: 1,
-    gap: 5,
-  },
-  titleRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  tag: {
-    ...typography.semibold,
-    overflow: 'hidden',
-    borderRadius: 8,
-    paddingHorizontal: 7,
-    paddingVertical: 2,
-    color: colors.primary,
-    fontSize: 10,
-    backgroundColor: 'rgba(214, 168, 50, 0.16)',
-  },
-  page: {
-    ...typography.number,
-    color: colors.textSubtle,
-    fontSize: 11,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    gap: 4,
   },
   title: {
     ...typography.sectionTitle,
     color: colors.text,
-    fontSize: 16,
+    fontSize: 15,
   },
   subtitle: {
     ...typography.caption,
     color: colors.textMuted,
     fontSize: 12,
     lineHeight: 17,
-  },
-  dotRow: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    gap: 5,
-  },
-  activeDot: {
-    width: 16,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: colors.tabActive,
-  },
-  dot: {
-    width: 4,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: colors.textSubtle,
   },
 });

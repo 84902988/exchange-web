@@ -1,25 +1,41 @@
-import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Pressable,
   RefreshControl,
-  ScrollView,
   StatusBar,
   StyleProp,
   StyleSheet,
   Text,
+  useWindowDimensions,
   View,
   ViewStyle,
 } from 'react-native';
-import {SafeAreaView} from 'react-native-safe-area-context';
+import {
+  useNavigation,
+  useRoute,
+  type RouteProp,
+} from '@react-navigation/native';
+import type { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import {
   fetchMobileMarkets,
   getCachedMobileMarkets,
   getOverviewMarkets,
-  MARKET_FALLBACK_ITEMS,
   type MarketCategoryKey,
   type MarketInstrument,
 } from '../../api/market';
+import {
+  resolveContractTradingInstrument,
+  resolveSpotTradingInstrument,
+} from '../../api/tradingCatalog';
 import MarketCategoryTabs, {
   type MarketCategoryTab,
 } from '../../components/markets/MarketCategoryTabs';
@@ -28,38 +44,45 @@ import MarketSearchBar from '../../components/markets/MarketSearchBar';
 import MarketSectionList, {
   type MarketSection,
 } from '../../components/markets/MarketSectionList';
-import {colors, layout, typography} from '../../theme';
+import type { MainTabParamList } from '../../navigation/types';
+import { useLanguage, type TranslationKey, type Translator } from '../../i18n';
+import { colors, layout, typography } from '../../theme';
+import {resolveResponsiveLayout} from '../../constants/responsiveLayout';
 
-const CATEGORY_TABS: MarketCategoryTab[] = [
-  {key: 'overview', label: '总览'},
-  {key: 'favorites', label: '自选'},
-  {key: 'crypto', label: '加密货币'},
-  {key: 'stock', label: '股票'},
-  {key: 'cfd', label: 'CFD'},
-  {key: 'onchain', label: '链上交易'},
+const CATEGORY_TAB_KEYS: Array<{
+  key: MarketCategoryKey;
+  labelKey: TranslationKey;
+}> = [
+  { key: 'overview', labelKey: 'markets.category.overview' },
+  { key: 'crypto', labelKey: 'markets.category.crypto' },
+  { key: 'stock', labelKey: 'markets.category.stock' },
+  { key: 'cfd', labelKey: 'markets.category.cfd' },
 ];
 
-const CATEGORY_LABELS: Record<
+const CATEGORY_LABEL_KEYS: Record<
   Exclude<MarketCategoryKey, 'overview' | 'favorites'>,
-  string
+  TranslationKey
 > = {
-  stock: '股票',
-  crypto: '现货',
-  cfd: '合约 / CFD',
-  onchain: '链上交易',
+  stock: 'markets.section.stock',
+  crypto: 'markets.section.spot',
+  cfd: 'markets.section.cfd',
+  onchain: 'markets.section.onchain',
 };
 
-const SECTION_ORDER: Array<Exclude<MarketCategoryKey, 'overview' | 'favorites'>> =
-  ['stock', 'crypto', 'cfd', 'onchain'];
-const SCROLL_INDICATOR_INSETS = {bottom: layout.tabBarContentInset};
+const SECTION_ORDER: Array<
+  Exclude<MarketCategoryKey, 'overview' | 'favorites'>
+> = ['stock', 'crypto', 'cfd'];
+const SCROLL_INDICATOR_INSETS = { bottom: layout.tabBarContentInset };
 
 function getSearchText(item: MarketInstrument) {
   return `${item.symbol} ${item.displaySymbol} ${item.name}`.toLowerCase();
 }
 
-function filterByCategory(items: MarketInstrument[], category: MarketCategoryKey) {
+function filterByCategory(
+  items: MarketInstrument[],
+  category: MarketCategoryKey,
+) {
   if (category === 'overview') return items;
-  if (category === 'favorites') return [];
   return items.filter(item => item.category === category);
 }
 
@@ -71,18 +94,43 @@ function sortByActivity(items: MarketInstrument[]) {
   });
 }
 
-function buildSections(items: MarketInstrument[]): MarketSection[] {
+function buildSections(
+  items: MarketInstrument[],
+  limit: number | null,
+  t: Translator,
+): MarketSection[] {
   return SECTION_ORDER.map(category => ({
     key: category,
-    title: CATEGORY_LABELS[category],
-    items: sortByActivity(items.filter(item => item.category === category)).slice(
-      0,
-      5,
-    ),
+    title: t(CATEGORY_LABEL_KEYS[category]),
+    items: (() => {
+      const sorted = sortByActivity(
+        items.filter(item => item.category === category),
+      );
+      return limit === null ? sorted : sorted.slice(0, limit);
+    })(),
   })).filter(section => section.items.length > 0);
 }
 
 export default function MarketsScreen() {
+  const { t } = useLanguage();
+  const {fontScale, height, width} = useWindowDimensions();
+  const responsiveContentStyle = useMemo<ViewStyle>(() => {
+    const responsive = resolveResponsiveLayout(
+      width,
+      height,
+      fontScale,
+      'dashboard',
+    );
+    return {
+      width: '100%',
+      alignSelf: 'center',
+      maxWidth: responsive.contentMaxWidth,
+      paddingHorizontal: responsive.horizontalPadding,
+    };
+  }, [fontScale, height, width]);
+  const navigation =
+    useNavigation<BottomTabNavigationProp<MainTabParamList, 'Markets'>>();
+  const route = useRoute<RouteProp<MainTabParamList, 'Markets'>>();
   const cachedMarkets = useMemo(() => getCachedMobileMarkets(), []);
   const [query, setQuery] = useState('');
   const [activeCategory, setActiveCategory] =
@@ -91,13 +139,46 @@ export default function MarketsScreen() {
   const [loading, setLoading] = useState(cachedMarkets.length === 0);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const marketsRef = useRef(markets);
+  const [routeError, setRouteError] = useState<string | null>(null);
+  const mountedRef = useRef(true);
+  const loadRequestGenerationRef = useRef(0);
+  const tRef = useRef(t);
+  const navigationRequestGenerationRef = useRef(0);
+  const activeNavigationRowRef = useRef<string | null>(null);
+  tRef.current = t;
+
+  const categoryTabs = useMemo<MarketCategoryTab[]>(
+    () =>
+      CATEGORY_TAB_KEYS.map(tab => ({
+        key: tab.key,
+        label: t(tab.labelKey),
+      })),
+    [t],
+  );
 
   useEffect(() => {
-    marketsRef.current = markets;
-  }, [markets]);
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      loadRequestGenerationRef.current += 1;
+      navigationRequestGenerationRef.current += 1;
+      activeNavigationRowRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const requestedCategory = route.params?.category;
+    if (!requestedCategory) return;
+    navigationRequestGenerationRef.current += 1;
+    activeNavigationRowRef.current = null;
+    setRouteError(null);
+    setQuery('');
+    setActiveCategory(requestedCategory);
+    navigation.setParams({ category: undefined });
+  }, [navigation, route.params?.category]);
 
   const loadMarkets = useCallback(async (refresh = false) => {
+    const generation = ++loadRequestGenerationRef.current;
     if (refresh) {
       setRefreshing(true);
     } else {
@@ -106,19 +187,31 @@ export default function MarketsScreen() {
 
     try {
       const nextMarkets = await fetchMobileMarkets();
+      if (
+        !mountedRef.current ||
+        generation !== loadRequestGenerationRef.current
+      ) {
+        return;
+      }
       setMarkets(nextMarkets);
       setError(null);
     } catch {
-      if (marketsRef.current.length > 0) {
-        setError('行情刷新失败，已继续显示上次行情');
-      } else {
-        // TODO: remove this fallback when the mobile market catalog is complete.
-        setMarkets(MARKET_FALLBACK_ITEMS);
-        setError('行情接口暂不可用，正在展示开发占位行情');
+      if (
+        !mountedRef.current ||
+        generation !== loadRequestGenerationRef.current
+      ) {
+        return;
       }
+      setMarkets([]);
+      setError(tRef.current('markets.loadFailed'));
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (
+        mountedRef.current &&
+        generation === loadRequestGenerationRef.current
+      ) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
   }, []);
 
@@ -142,74 +235,228 @@ export default function MarketsScreen() {
   }, [filteredMarkets, markets, query]);
 
   const sections = useMemo(
-    () => buildSections(filteredMarkets),
-    [filteredMarkets],
+    () =>
+      buildSections(
+        filteredMarkets,
+        activeCategory === 'overview' ? 5 : null,
+        t,
+      ),
+    [activeCategory, filteredMarkets, t],
   );
 
   const hasData = markets.length > 0;
   const showInitialSkeleton = loading && !hasData;
   const showInlineRefreshing = loading && hasData && !refreshing;
   const showSearchEmpty =
-    query.trim().length > 0 && !showInitialSkeleton && filteredMarkets.length === 0;
+    query.trim().length > 0 &&
+    !showInitialSkeleton &&
+    filteredMarkets.length === 0;
   const showEmpty =
-    !query.trim() &&
-    !showInitialSkeleton &&
-    activeCategory !== 'favorites' &&
-    filteredMarkets.length === 0;
-  const showFavoriteEmpty =
-    !showInitialSkeleton &&
-    activeCategory === 'favorites' &&
-    filteredMarkets.length === 0;
+    !query.trim() && !showInitialSkeleton && filteredMarkets.length === 0;
+  const handleCategoryChange = useCallback(
+    (nextCategory: MarketCategoryKey) => {
+      navigationRequestGenerationRef.current += 1;
+      activeNavigationRowRef.current = null;
+      setRouteError(null);
+      setActiveCategory(nextCategory);
+    },
+    [],
+  );
 
-  const handleRowPress = useCallback((_item: MarketInstrument) => {
-    // TODO: wire this to symbol detail or the corresponding trade page once
-    // mobile route params for market symbols are finalized.
-  }, []);
+  const handleRowPress = useCallback(
+    async (item: MarketInstrument) => {
+      // Crypto rows are resolved once more against the authoritative spot
+      // catalog before navigation. This also repairs stale mobile-overview
+      // metadata for RWA spot pairs without inventing a local trade route.
+      if (item.tradable === false && item.category !== 'crypto') {
+        Alert.alert(
+          tRef.current('markets.tradeUnsupportedTitle'),
+          tRef.current('markets.tradeUnsupportedMessage', {
+            symbol: item.displaySymbol,
+          }),
+        );
+        return;
+      }
+      if (
+        item.category !== 'crypto' &&
+        item.category !== 'stock' &&
+        item.category !== 'cfd'
+      ) {
+        return;
+      }
+      if (activeNavigationRowRef.current !== null) return;
+
+      const generation = ++navigationRequestGenerationRef.current;
+      activeNavigationRowRef.current = item.id;
+      setRouteError(null);
+
+      try {
+        if (item.category === 'crypto') {
+          const instrument = await resolveSpotTradingInstrument(
+            item.tradeSymbol || item.symbol,
+          );
+          if (
+            generation !== navigationRequestGenerationRef.current ||
+            !mountedRef.current
+          ) {
+            return;
+          }
+          if (!instrument) {
+            const message = tRef.current('markets.spotUnavailable');
+            setRouteError(message);
+            Alert.alert(tRef.current('markets.spotUnavailableTitle'), message);
+            return;
+          }
+          navigation.navigate('Trade', {
+            symbol: instrument.symbol,
+            baseAsset: instrument.baseAsset,
+            quoteAsset: instrument.quoteAsset,
+            displayLabel: instrument.displaySymbol,
+            ...(item.logoUrl ? {logoUrl: item.logoUrl} : {}),
+          });
+          return;
+        }
+
+        const instrument = await resolveContractTradingInstrument(
+          item.tradeSymbol || item.displaySymbol || item.symbol,
+        );
+        if (
+          generation !== navigationRequestGenerationRef.current ||
+          !mountedRef.current
+        ) {
+          return;
+        }
+        if (!instrument) {
+          const message = tRef.current('markets.contractUnavailable');
+          setRouteError(message);
+          Alert.alert(
+            tRef.current('markets.contractUnavailableTitle'),
+            message,
+          );
+          return;
+        }
+        navigation.navigate('Contract', {
+          symbol: instrument.symbol,
+          baseAsset: instrument.baseAsset,
+          quoteAsset: instrument.quoteAsset,
+          displayLabel: instrument.displayName,
+          marketCategory: item.category,
+          ...(item.logoUrl ? {logoUrl: item.logoUrl} : {}),
+        });
+      } catch (requestError) {
+        if (
+          generation !== navigationRequestGenerationRef.current ||
+          !mountedRef.current
+        ) {
+          return;
+        }
+        const fallback =
+          item.category === 'crypto'
+            ? tRef.current('markets.spotCatalogFailed')
+            : tRef.current('markets.contractCatalogFailed');
+        const message =
+          requestError instanceof Error && requestError.message.trim()
+            ? requestError.message.trim()
+            : fallback;
+        setRouteError(message);
+        Alert.alert(tRef.current('markets.entryFailedTitle'), message);
+      } finally {
+        if (
+          generation === navigationRequestGenerationRef.current &&
+          mountedRef.current
+        ) {
+          activeNavigationRowRef.current = null;
+        }
+      }
+    },
+    [navigation],
+  );
 
   return (
     <SafeAreaView edges={['top', 'left', 'right']} style={styles.safe}>
       <StatusBar barStyle="light-content" backgroundColor={colors.marketBg} />
-      <ScrollView
-        keyboardShouldPersistTaps="handled"
-        refreshControl={
-          <RefreshControl
-            refreshing={refreshing}
-            tintColor={colors.gold}
-            onRefresh={() => loadMarkets(true)}
-          />
+      <MarketSectionList
+        contentContainerStyle={[styles.content, responsiveContentStyle]}
+        footer={
+          showInitialSkeleton ? null : (
+            <>
+              {showSearchEmpty ? (
+                <View style={styles.stateCard}>
+                  <Text style={styles.stateTitle}>
+                    {t('markets.searchEmpty')}
+                  </Text>
+                  <Text style={styles.stateText}>
+                    {t('markets.searchEmptyDescription')}
+                  </Text>
+                </View>
+              ) : null}
+
+              {showEmpty ? (
+                <View style={styles.stateCard}>
+                  <Text style={styles.stateTitle}>{t('markets.empty')}</Text>
+                  <Text style={styles.stateText}>
+                    {t('markets.emptyDescription')}
+                  </Text>
+                  <Pressable
+                    accessibilityRole="button"
+                    android_ripple={{ color: 'rgba(212, 175, 55, 0.12)' }}
+                    style={({ pressed }) => [
+                      styles.stateRetryButton,
+                      pressed ? styles.pressed : null,
+                    ]}
+                    onPress={() => loadMarkets(true)}
+                  >
+                    <Text style={styles.retryText}>{t('common.retry')}</Text>
+                  </Pressable>
+                </View>
+              ) : null}
+            </>
+          )
         }
-        scrollIndicatorInsets={SCROLL_INDICATOR_INSETS}
-        showsVerticalScrollIndicator={false}
-        style={styles.scroller}
-        contentContainerStyle={styles.content}>
-        <MarketSearchBar value={query} onChangeText={setQuery} />
-        <MarketCategoryTabs
-          activeKey={activeCategory}
-          tabs={CATEGORY_TABS}
-          onChange={setActiveCategory}
-        />
-
-        {error ? (
-          <View style={styles.warning}>
-            <Text style={styles.warningText}>{error}</Text>
-            <Pressable style={styles.retryButton} onPress={() => loadMarkets(true)}>
-              <Text style={styles.retryText}>重试</Text>
-            </Pressable>
-          </View>
-        ) : null}
-
-        {showInlineRefreshing ? (
-          <View style={styles.inlineLoading}>
-            <ActivityIndicator color={colors.gold} size="small" />
-            <Text style={styles.inlineLoadingText}>行情刷新中</Text>
-          </View>
-        ) : null}
-
-        {showInitialSkeleton ? (
-          <MarketLoadingSkeleton />
-        ) : (
+        header={
           <>
-            {activeCategory === 'overview' && overviewCards.length > 0 ? (
+            <MarketSearchBar value={query} onChangeText={setQuery} />
+            <MarketCategoryTabs
+              activeKey={activeCategory}
+              tabs={categoryTabs}
+              onChange={handleCategoryChange}
+            />
+
+            {error ? (
+              <View style={styles.warning}>
+                <Text style={styles.warningText}>{error}</Text>
+                <Pressable
+                  accessibilityRole="button"
+                  android_ripple={{ color: 'rgba(212, 175, 55, 0.12)' }}
+                  style={({ pressed }) => [
+                    styles.retryButton,
+                    pressed ? styles.pressed : null,
+                  ]}
+                  onPress={() => loadMarkets(true)}
+                >
+                  <Text style={styles.retryText}>{t('common.retry')}</Text>
+                </Pressable>
+              </View>
+            ) : null}
+
+            {routeError ? (
+              <View style={styles.warning}>
+                <Text style={styles.warningText}>{routeError}</Text>
+              </View>
+            ) : null}
+
+            {showInlineRefreshing ? (
+              <View style={styles.inlineLoading}>
+                <ActivityIndicator color={colors.gold} size="small" />
+                <Text style={styles.inlineLoadingText}>
+                  {t('markets.refreshing')}
+                </Text>
+              </View>
+            ) : null}
+
+            {showInitialSkeleton ? (
+              <MarketLoadingSkeleton />
+            ) : activeCategory === 'overview' && overviewCards.length > 0 ? (
               <>
                 <View style={styles.overviewHeader}>
                   <View style={styles.coinDots}>
@@ -218,47 +465,30 @@ export default function MarketsScreen() {
                     <View style={[styles.coinDot, styles.greenDot]} />
                     <View style={[styles.coinDot, styles.goldDot]} />
                   </View>
-                  <Text style={styles.overviewTitle}>一站买尽全球核心资产</Text>
+                  <Text style={styles.overviewTitle}>
+                    {t('markets.coreMarkets')}
+                  </Text>
                 </View>
-                <MarketOverviewCards items={overviewCards} />
+                <MarketOverviewCards
+                  items={overviewCards}
+                  onPress={handleRowPress}
+                />
               </>
             ) : null}
-
-            {sections.length > 0 ? (
-              <MarketSectionList
-                sections={sections}
-                onRowPress={handleRowPress}
-              />
-            ) : null}
-
-            {showFavoriteEmpty ? (
-              <View style={styles.stateCard}>
-                <Text style={styles.stateTitle}>自选列表为空</Text>
-                <Text style={styles.stateText}>自选行情将在后续版本接入</Text>
-              </View>
-            ) : null}
-
-            {showSearchEmpty ? (
-              <View style={styles.stateCard}>
-                <Text style={styles.stateTitle}>没有找到匹配交易对</Text>
-                <Text style={styles.stateText}>换个关键词试试</Text>
-              </View>
-            ) : null}
-
-            {showEmpty ? (
-              <View style={styles.stateCard}>
-                <Text style={styles.stateTitle}>暂无行情数据</Text>
-                <Text style={styles.stateText}>下拉刷新或稍后再试</Text>
-                <Pressable
-                  style={styles.stateRetryButton}
-                  onPress={() => loadMarkets(true)}>
-                  <Text style={styles.retryText}>重试</Text>
-                </Pressable>
-              </View>
-            ) : null}
           </>
-        )}
-      </ScrollView>
+        }
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            tintColor={colors.gold}
+            onRefresh={() => loadMarkets(true)}
+          />
+        }
+        scrollIndicatorInsets={SCROLL_INDICATOR_INSETS}
+        sections={showInitialSkeleton ? [] : sections}
+        style={styles.scroller}
+        onRowPress={handleRowPress}
+      />
     </SafeAreaView>
   );
 }
@@ -276,7 +506,7 @@ function MarketLoadingSkeleton() {
         <SkeletonBlock style={styles.skeletonTitle} />
       </View>
       <View style={styles.skeletonGrid}>
-        {Array.from({length: 6}).map((_, index) => (
+        {Array.from({ length: 6 }).map((_, index) => (
           <View key={`overview-skeleton-${index}`} style={styles.skeletonCard}>
             <SkeletonBlock style={styles.skeletonSymbol} />
             <SkeletonBlock style={styles.skeletonPrice} />
@@ -285,14 +515,20 @@ function MarketLoadingSkeleton() {
           </View>
         ))}
       </View>
-      {Array.from({length: 3}).map((_, sectionIndex) => (
-        <View key={`section-skeleton-${sectionIndex}`} style={styles.skeletonSection}>
+      {Array.from({ length: 3 }).map((_, sectionIndex) => (
+        <View
+          key={`section-skeleton-${sectionIndex}`}
+          style={styles.skeletonSection}
+        >
           <View style={styles.skeletonSectionHeader}>
             <SkeletonBlock style={styles.skeletonSectionTitle} />
             <SkeletonBlock style={styles.skeletonChevron} />
           </View>
-          {Array.from({length: 4}).map((__, rowIndex) => (
-            <View key={`row-skeleton-${sectionIndex}-${rowIndex}`} style={styles.skeletonRow}>
+          {Array.from({ length: 4 }).map((__, rowIndex) => (
+            <View
+              key={`row-skeleton-${sectionIndex}-${rowIndex}`}
+              style={styles.skeletonRow}
+            >
               <SkeletonBlock style={styles.skeletonAvatar} />
               <View style={styles.skeletonNameWrap}>
                 <SkeletonBlock style={styles.skeletonRowSymbol} />
@@ -308,11 +544,12 @@ function MarketLoadingSkeleton() {
   );
 }
 
-function SkeletonBlock({style}: {style: StyleProp<ViewStyle>}) {
+function SkeletonBlock({ style }: { style: StyleProp<ViewStyle> }) {
   return <View style={[styles.skeletonBlock, style]} />;
 }
 
 const styles = StyleSheet.create({
+  pressed: { opacity: 0.8, transform: [{ scale: 0.992 }] },
   safe: {
     flex: 1,
     backgroundColor: colors.marketBg,
@@ -322,7 +559,6 @@ const styles = StyleSheet.create({
     backgroundColor: colors.marketBg,
   },
   content: {
-    paddingHorizontal: 12,
     paddingTop: 10,
     paddingBottom: layout.tabBarContentInset,
   },
@@ -346,7 +582,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
   },
   retryButton: {
-    height: 28,
+    minHeight: 44,
     alignItems: 'center',
     justifyContent: 'center',
     borderRadius: 6,
@@ -426,7 +662,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
   },
   stateRetryButton: {
-    height: 32,
+    minHeight: 44,
     alignItems: 'center',
     justifyContent: 'center',
     marginTop: 12,

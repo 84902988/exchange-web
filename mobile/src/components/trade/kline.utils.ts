@@ -1,4 +1,5 @@
 import type {SpotKline} from '../../api/spot';
+import {formatFixedPrice} from '../../utils/format';
 
 export type KlineInterval = '1m' | '5m' | '15m' | '1h' | '4h' | '1d';
 
@@ -11,6 +12,74 @@ export const klineIntervals: KlineInterval[] = [
   '1d',
 ];
 
+const KLINE_PRICE_AXIS_WIDTH = 58;
+const TARGET_CANDLE_STEP = 10;
+const MIN_VISIBLE_CANDLES = 18;
+
+export function resolveAdaptiveKlineVisibleCount({
+  chartWidth,
+  dataLength,
+  preferredMaximum,
+}: {
+  chartWidth: number;
+  dataLength: number;
+  preferredMaximum: number;
+}) {
+  if (dataLength <= 0 || preferredMaximum <= 0) return 0;
+  const usableWidth = Math.max(chartWidth - KLINE_PRICE_AXIS_WIDTH, 1);
+  const widthCapacity = Math.max(
+    MIN_VISIBLE_CANDLES,
+    Math.floor(usableWidth / TARGET_CANDLE_STEP) + 1,
+  );
+  return Math.min(dataLength, preferredMaximum, widthCapacity);
+}
+
+export function resolveKlineDragIndex({
+  candleStep,
+  deltaX,
+  dragStartIndex,
+  maximumStartIndex,
+}: {
+  candleStep: number;
+  deltaX: number;
+  dragStartIndex: number;
+  maximumStartIndex: number;
+}) {
+  if (!Number.isFinite(candleStep) || candleStep <= 0) {
+    return Math.max(0, Math.min(maximumStartIndex, dragStartIndex));
+  }
+  const indexShift = Math.trunc(deltaX / candleStep);
+  return Math.max(
+    0,
+    Math.min(maximumStartIndex, dragStartIndex - indexShift),
+  );
+}
+
+export function reconcileKlineVisibleStartIndex({
+  current,
+  previousMax,
+  nextMax,
+  intervalChanged,
+  previousAnchorTime = null,
+  nextOpenTimes = [],
+}: {
+  current: number;
+  previousMax: number;
+  nextMax: number;
+  intervalChanged: boolean;
+  previousAnchorTime?: number | null;
+  nextOpenTimes?: readonly number[];
+}) {
+  if (intervalChanged || current >= previousMax) return nextMax;
+  if (previousAnchorTime !== null) {
+    const anchoredIndex = nextOpenTimes.indexOf(previousAnchorTime);
+    if (anchoredIndex >= 0) {
+      return Math.max(0, Math.min(nextMax, anchoredIndex));
+    }
+  }
+  return Math.max(0, Math.min(nextMax, current));
+}
+
 export type NormalizedKline = {
   time: number;
   open: number;
@@ -18,6 +87,24 @@ export type NormalizedKline = {
   low: number;
   close: number;
   volume: number;
+};
+
+export type CandlePathInput = {
+  up: boolean;
+  x: number;
+  highY: number;
+  lowY: number;
+  bodyX: number;
+  bodyY: number;
+  bodyWidth: number;
+  bodyHeight: number;
+};
+
+export type CandlePathBuckets = {
+  upWicks: string;
+  downWicks: string;
+  upBodies: string;
+  downBodies: string;
 };
 
 type ScaleInput = {
@@ -50,46 +137,65 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function readNumber(row: Record<string, unknown>, keys: string[]) {
   for (const key of keys) {
-    const value = Number(row[key]);
+    const raw = row[key];
+    if (raw === null || raw === undefined || raw === '') continue;
+    const value = Number(raw);
     if (Number.isFinite(value)) return value;
   }
   return null;
 }
 
 export function normalizeKlineData(rows: Array<SpotKline | unknown>) {
-  return rows
-    .map(row => {
-      const record = isRecord(row) ? row : {};
-      const time = readNumber(record, ['openTime', 'open_time', 'timestamp', 'time']);
-      const open = readNumber(record, ['open']);
-      const high = readNumber(record, ['high']);
-      const low = readNumber(record, ['low']);
-      const close = readNumber(record, ['close']);
-      const volume = readNumber(record, ['volume']);
+  const byTime = new Map<number, NormalizedKline>();
+  for (const row of rows) {
+    const record = isRecord(row) ? row : {};
+    const time = readNumber(record, [
+      'openTime',
+      'open_time',
+      'timestamp',
+      'time',
+    ]);
+    const open = readNumber(record, ['open']);
+    const high = readNumber(record, ['high']);
+    const low = readNumber(record, ['low']);
+    const close = readNumber(record, ['close']);
+    const volume = readNumber(record, ['volume']);
 
-      if (
-        time === null ||
-        open === null ||
-        high === null ||
-        low === null ||
-        close === null
-      ) {
-        return null;
-      }
+    if (
+      time === null ||
+      open === null ||
+      high === null ||
+      low === null ||
+      close === null ||
+      volume === null ||
+      time <= 0 ||
+      open <= 0 ||
+      high <= 0 ||
+      low <= 0 ||
+      close <= 0 ||
+      volume < 0 ||
+      high < Math.max(open, low, close) ||
+      low > Math.min(open, high, close)
+    ) {
+      continue;
+    }
 
-      const nextHigh = Math.max(open, high, low, close);
-      const nextLow = Math.min(open, high, low, close);
-      return {
-        time: normalizeTimestamp(time),
-        open,
-        high: nextHigh,
-        low: nextLow,
-        close,
-        volume: volume ?? 0,
-      };
-    })
-    .filter((item): item is NormalizedKline => item !== null)
-    .sort((a, b) => a.time - b.time);
+    const normalizedTime = normalizeTimestamp(time);
+    if (!Number.isSafeInteger(normalizedTime) || normalizedTime <= 0) {
+      continue;
+    }
+    byTime.set(normalizedTime, {
+      time: normalizedTime,
+      open,
+      high,
+      low,
+      close,
+      volume,
+    });
+  }
+  return Array.from(byTime.values()).sort(
+    (a, b) => a.time - b.time,
+  );
 }
 
 export function calculateMA(data: NormalizedKline[], period: number) {
@@ -102,11 +208,7 @@ export function calculateMA(data: NormalizedKline[], period: number) {
 }
 
 export function formatPrice(value: number | null | undefined, precision = 2) {
-  if (value === null || value === undefined || !Number.isFinite(value)) return '--';
-  return value.toLocaleString('en-US', {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: precision,
-  });
+  return formatFixedPrice(value, precision);
 }
 
 export function formatTimeLabel(timestamp: number, interval: KlineInterval) {
@@ -181,6 +283,43 @@ export function buildTimeTicks(data: NormalizedKline[], interval: KlineInterval)
   }));
 }
 
+/**
+ * Collapses every candle into four reusable SVG paths. This keeps the same
+ * OHLC geometry while avoiding a native Group + Line + Rect tree per candle.
+ */
+export function buildCandlePathBuckets(
+  candles: readonly CandlePathInput[],
+): CandlePathBuckets {
+  const paths: Record<keyof CandlePathBuckets, string[]> = {
+    upWicks: [],
+    downWicks: [],
+    upBodies: [],
+    downBodies: [],
+  };
+
+  for (const candle of candles) {
+    const wick = `M ${pathCoordinate(candle.x)} ${pathCoordinate(
+      candle.highY,
+    )} V ${pathCoordinate(candle.lowY)}`;
+    const bodyRight = candle.bodyX + candle.bodyWidth;
+    const bodyBottom = candle.bodyY + candle.bodyHeight;
+    const body = `M ${pathCoordinate(candle.bodyX)} ${pathCoordinate(
+      candle.bodyY,
+    )} H ${pathCoordinate(bodyRight)} V ${pathCoordinate(
+      bodyBottom,
+    )} H ${pathCoordinate(candle.bodyX)} Z`;
+    paths[candle.up ? 'upWicks' : 'downWicks'].push(wick);
+    paths[candle.up ? 'upBodies' : 'downBodies'].push(body);
+  }
+
+  return {
+    upWicks: paths.upWicks.join(' '),
+    downWicks: paths.downWicks.join(' '),
+    upBodies: paths.upBodies.join(' '),
+    downBodies: paths.downBodies.join(' '),
+  };
+}
+
 function buildTimeTickIndexes(length: number) {
   if (length <= 0) return [];
   if (length === 1) return [0];
@@ -191,4 +330,8 @@ function buildTimeTickIndexes(length: number) {
 function normalizeTimestamp(value: number) {
   if (!Number.isFinite(value)) return 0;
   return value < 10000000000 ? value * 1000 : value;
+}
+
+function pathCoordinate(value: number) {
+  return Math.round(value * 100) / 100;
 }

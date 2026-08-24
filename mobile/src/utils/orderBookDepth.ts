@@ -9,14 +9,28 @@ export function aggregateOrderBookLevels<T extends OrderBookDepthLevel>(
   step: number,
 ): OrderBookDepthLevel[] {
   if (!Number.isFinite(step) || step <= 0) {
-    return levels.map(level => ({price: level.price, amount: level.amount}));
+    return levels
+      .filter(
+        level =>
+          Number.isFinite(level.price) &&
+          Number.isFinite(level.amount) &&
+          level.price > 0 &&
+          level.amount > 0,
+      )
+      .map(level => ({price: level.price, amount: level.amount}));
   }
 
   const precision = getStepPrecision(step);
   const grouped = new Map<string, OrderBookDepthLevel>();
 
   levels.forEach(level => {
-    if (!Number.isFinite(level.price) || !Number.isFinite(level.amount)) return;
+    if (
+      !Number.isFinite(level.price) ||
+      !Number.isFinite(level.amount) ||
+      level.price <= 0 ||
+      level.amount <= 0
+    )
+      return;
 
     const rawPrice =
       side === 'ask'
@@ -38,6 +52,8 @@ export function aggregateOrderBookLevels<T extends OrderBookDepthLevel>(
 }
 
 function getStepPrecision(step: number) {
-  const [, decimal = ''] = step.toString().split('.');
-  return decimal.length;
+  const [coefficient, exponentText] = step.toString().toLowerCase().split('e');
+  const [, decimal = ''] = coefficient.split('.');
+  const exponent = Number(exponentText || 0);
+  return Math.max(0, decimal.length - exponent);
 }

@@ -1,8 +1,14 @@
-import React, {useCallback, useEffect, useMemo, useState} from 'react';
-import {Pressable, StyleSheet, Text, View} from 'react-native';
-import {useNavigation} from '@react-navigation/native';
-import type {NativeStackNavigationProp} from '@react-navigation/native-stack';
-import {ArrowDownUp} from 'lucide-react-native';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { useNavigation } from '@react-navigation/native';
+import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { ArrowDownUp, ChevronRight } from 'lucide-react-native';
 import AppScreen from '../../components/common/AppScreen';
 import PrimaryButton from '../../components/common/PrimaryButton';
 import {
@@ -18,7 +24,7 @@ import {
   formatAmount,
   toChineseError,
 } from '../../components/assets/action/ActionPrimitives';
-import type {RootStackParamList} from '../../navigation/types';
+import type { RootStackParamList } from '../../navigation/types';
 import {
   fetchAssetAccountBalances,
   submitContractTransfer,
@@ -26,8 +32,14 @@ import {
   type AssetAccountBalance,
   type AssetTransferAccountKey,
 } from '../../api/assets';
-import {useAuth} from '../../store/authStore';
-import {colors, typography} from '../../theme';
+import { useAuth } from '../../store/authStore';
+import { useLanguage, type Translator } from '../../i18n';
+import { colors, typography } from '../../theme';
+import {
+  compareNonNegativeDecimalText,
+  isPositiveDecimalText,
+  multiplyDecimalTextByPercent,
+} from '../../utils/decimalText';
 
 type RootNavigation = NativeStackNavigationProp<RootStackParamList>;
 
@@ -36,7 +48,10 @@ const percents = [25, 50, 75, 100];
 
 export default function TransferScreen() {
   const navigation = useNavigation<RootNavigation>();
-  const {isLoggedIn} = useAuth();
+  const { isLoggedIn } = useAuth();
+  const { t } = useLanguage();
+  const tRef = useRef(t);
+  tRef.current = t;
   const [balances, setBalances] = useState<AssetAccountBalance[]>([]);
   const [from, setFrom] = useState<AssetTransferAccountKey>('funding');
   const [to, setTo] = useState<AssetTransferAccountKey>('spot');
@@ -46,28 +61,79 @@ export default function TransferScreen() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
+  const mountedRef = useRef(true);
+  const balancesControllerRef = useRef<AbortController | null>(null);
+  const balancesGenerationRef = useRef(0);
+  const balancesLoadLockRef = useRef(false);
+  const submitLockRef = useRef(false);
 
   const loadBalances = useCallback(async () => {
-    if (!isLoggedIn) return;
+    if (!isLoggedIn || !mountedRef.current || balancesLoadLockRef.current) {
+      return;
+    }
+    balancesLoadLockRef.current = true;
+    const generation = ++balancesGenerationRef.current;
+    const controller = new AbortController();
+    balancesControllerRef.current?.abort();
+    balancesControllerRef.current = controller;
     setLoading(true);
     setError('');
     try {
-      setBalances(await fetchAssetAccountBalances());
+      const result = await fetchAssetAccountBalances({
+        signal: controller.signal,
+      });
+      if (
+        !mountedRef.current ||
+        controller.signal.aborted ||
+        generation !== balancesGenerationRef.current
+      ) {
+        return;
+      }
+      setBalances(result);
     } catch (requestError) {
+      if (
+        !mountedRef.current ||
+        controller.signal.aborted ||
+        generation !== balancesGenerationRef.current
+      ) {
+        return;
+      }
       setBalances([]);
-      setError(toChineseError(requestError, '账户余额加载失败，请稍后重试'));
+      setError(
+        toChineseError(
+          requestError,
+          tRef.current('transfer.loadFailed'),
+          tRef.current,
+        ),
+      );
     } finally {
-      setLoading(false);
+      if (generation === balancesGenerationRef.current) {
+        balancesLoadLockRef.current = false;
+        if (balancesControllerRef.current === controller) {
+          balancesControllerRef.current = null;
+        }
+        if (mountedRef.current && !controller.signal.aborted) {
+          setLoading(false);
+        }
+      }
     }
   }, [isLoggedIn]);
 
   useEffect(() => {
+    mountedRef.current = true;
     if (!isLoggedIn) {
       setBalances([]);
       setError('');
-      return;
+      return undefined;
     }
     loadBalances().catch(() => undefined);
+    return () => {
+      mountedRef.current = false;
+      balancesGenerationRef.current += 1;
+      balancesLoadLockRef.current = false;
+      balancesControllerRef.current?.abort();
+      balancesControllerRef.current = null;
+    };
   }, [isLoggedIn, loadBalances]);
 
   const routeSupported = isSupportedRoute(from, to);
@@ -77,18 +143,20 @@ export default function TransferScreen() {
     () =>
       accounts.map(account => ({
         value: account,
-        label: accountLabel(account),
+        label: accountLabel(account, t),
         disabled: account === from || !isSupportedRoute(from, account),
       })),
-    [from],
+    [from, t],
   );
 
   const coinOptions = useMemo(() => {
     if (!routeSupported) return [];
-    if (contractRoute) return [{value: 'USDT', label: 'USDT'}];
+    if (contractRoute) return [{ value: 'USDT', label: 'USDT' }];
     const rows = balances
       .filter(item => item.accountKey.toLowerCase() === from)
-      .filter(item => (item.available ?? 0) > 0)
+      .filter(item =>
+        isPositiveDecimalText(item.availableText ?? item.available ?? 0),
+      )
       .map(item => item.symbol.toUpperCase());
     return Array.from(new Set(rows))
       .sort((a, b) => {
@@ -96,7 +164,7 @@ export default function TransferScreen() {
         if (b === 'USDT') return 1;
         return a.localeCompare(b);
       })
-      .map(symbol => ({value: symbol, label: symbol}));
+      .map(symbol => ({ value: symbol, label: symbol }));
   }, [balances, contractRoute, from, routeSupported]);
 
   const selectedCoin = useMemo(() => {
@@ -105,23 +173,29 @@ export default function TransferScreen() {
     return coinOptions[0]?.value ?? '';
   }, [coin, coinOptions, contractRoute]);
 
-  const available = useMemo(() => {
+  const availableBalance = useMemo(() => {
     const row = balances.find(
       item =>
         item.accountKey.toLowerCase() === from &&
         item.symbol.toUpperCase() === selectedCoin,
     );
-    return row?.available ?? 0;
+    const available = row?.available ?? 0;
+    return {
+      text:
+        row?.availableText ??
+        (Number.isFinite(available) ? String(available) : '0'),
+    };
   }, [balances, from, selectedCoin]);
 
-  const amountNumber = Number(amount);
-  const amountValid = Number.isFinite(amountNumber) && amountNumber > 0;
+  const amountValid = isPositiveDecimalText(amount);
+  const amountExceedsAvailable =
+    compareNonNegativeDecimalText(amount, availableBalance.text) === 1;
   const submitDisabled =
     submitting ||
     !routeSupported ||
     !selectedCoin ||
     !amountValid ||
-    amountNumber > available;
+    amountExceedsAvailable;
 
   useEffect(() => {
     if (selectedCoin !== coin) {
@@ -135,7 +209,8 @@ export default function TransferScreen() {
       const normalized = nextFrom as AssetTransferAccountKey;
       const nextTo = isSupportedRoute(normalized, to)
         ? to
-        : accounts.find(account => isSupportedRoute(normalized, account)) ?? 'spot';
+        : accounts.find(account => isSupportedRoute(normalized, account)) ??
+          'spot';
       setFrom(normalized);
       setTo(nextTo);
       setAmount('');
@@ -163,41 +238,45 @@ export default function TransferScreen() {
 
   const setPercent = useCallback(
     (percent: number) => {
-      if (available <= 0) {
+      if (!isPositiveDecimalText(availableBalance.text)) {
         setAmount('');
         return;
       }
-      setAmount(String((available * percent) / 100));
+      setAmount(
+        multiplyDecimalTextByPercent(availableBalance.text, percent) ?? '',
+      );
       setError('');
       setMessage('');
     },
-    [available],
+    [availableBalance.text],
   );
 
   const submit = useCallback(async () => {
+    if (submitLockRef.current) return;
     setError('');
     setMessage('');
     if (!routeSupported) {
-      setError('当前账户方向暂不支持划转');
+      setError(tRef.current('transfer.unsupported'));
       return;
     }
     if (!selectedCoin) {
-      setError('当前转出账户暂无可划转币种');
+      setError(tRef.current('transfer.noCoins'));
       return;
     }
     if (contractRoute && selectedCoin !== 'USDT') {
-      setError('合约账户划转 V1 仅支持 USDT');
+      setError(tRef.current('transfer.contractUsdtOnly'));
       return;
     }
     if (!amountValid) {
-      setError('请输入正确的划转数量');
+      setError(tRef.current('transfer.invalidAmount'));
       return;
     }
-    if (amountNumber > available) {
-      setError('可划转余额不足');
+    if (amountExceedsAvailable) {
+      setError(tRef.current('transfer.insufficient'));
       return;
     }
 
+    submitLockRef.current = true;
     setSubmitting(true);
     try {
       if (from === 'funding' && to === 'spot') {
@@ -215,26 +294,36 @@ export default function TransferScreen() {
           amount,
         });
       } else if (from === 'funding' && to === 'contract') {
-        await submitContractTransfer({direction: 'in', amount});
+        await submitContractTransfer({ direction: 'in', amount });
       } else if (from === 'contract' && to === 'funding') {
-        await submitContractTransfer({direction: 'out', amount});
+        await submitContractTransfer({ direction: 'out', amount });
       } else {
-        setError('当前账户方向暂不支持划转');
+        setError(tRef.current('transfer.unsupported'));
         return;
       }
-      setMessage('划转成功，余额已刷新。');
-      setAmount('');
-      await loadBalances();
+      if (mountedRef.current) {
+        setMessage(tRef.current('transfer.success'));
+        setAmount('');
+        await loadBalances();
+      }
     } catch (requestError) {
-      setError(toChineseError(requestError, '划转失败，请稍后重试'));
+      if (mountedRef.current) {
+        setError(
+          toChineseError(
+            requestError,
+            tRef.current('transfer.failed'),
+            tRef.current,
+          ),
+        );
+      }
     } finally {
-      setSubmitting(false);
+      submitLockRef.current = false;
+      if (mountedRef.current) setSubmitting(false);
     }
   }, [
     amount,
-    amountNumber,
     amountValid,
-    available,
+    amountExceedsAvailable,
     contractRoute,
     from,
     loadBalances,
@@ -246,56 +335,99 @@ export default function TransferScreen() {
   return (
     <AppScreen>
       <ActionHeader
-        title="划转"
-        subtitle="资金账户、现货账户与合约账户之间划转"
+        title={t('transfer.title')}
+        subtitle={t('transfer.subtitle')}
         onBack={() => navigation.goBack()}
         right={<RefreshButton disabled={loading} onPress={loadBalances} />}
       />
 
+      {isLoggedIn ? (
+        <Pressable
+          accessibilityLabel={t('transfer.recordsA11y')}
+          accessibilityRole="button"
+          android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
+          style={({ pressed }) => [
+            styles.userTransferEntry,
+            pressed ? styles.pressed : null,
+          ]}
+          onPress={() => navigation.navigate('UserTransferRecords')}
+        >
+          <View style={styles.userTransferEntryText}>
+            <Text style={styles.userTransferEntryTitle}>
+              {t('transfer.recordsTitle')}
+            </Text>
+            <Text style={styles.userTransferEntrySubtitle}>
+              {t('transfer.recordsSubtitle')}
+            </Text>
+          </View>
+          <ChevronRight color={colors.gold} size={18} strokeWidth={2.2} />
+        </Pressable>
+      ) : null}
+
       {!isLoggedIn ? (
-        <AuthRequiredCard onLoginPress={() => navigation.navigate('Auth', {screen: 'Login'})} />
+        <AuthRequiredCard
+          onLoginPress={() => navigation.navigate('Auth', { screen: 'Login' })}
+        />
       ) : loading ? (
-        <StateCard title="正在加载账户余额" description="请稍候" />
+        <StateCard
+          title={t('transfer.loadingBalances')}
+          description={t('assetAction.loading')}
+        />
       ) : error && balances.length === 0 ? (
-        <StateCard title="加载失败" description={error} actionTitle="重试" onActionPress={loadBalances} />
+        <StateCard
+          title={t('assetAction.loadFailed')}
+          description={error}
+          actionTitle={t('assetAction.retry')}
+          onActionPress={loadBalances}
+        />
       ) : (
         <>
           <ActionCard>
             <SelectChips
-              label="转出账户"
+              label={t('transfer.fromAccount')}
               value={from}
               options={accounts.map(account => ({
                 value: account,
-                label: accountLabel(account),
+                label: accountLabel(account, t),
                 disabled: account === to,
               }))}
               onChange={changeFrom}
             />
             <View style={styles.swapWrap}>
               <Pressable
+                accessibilityLabel={t('transfer.swapA11y')}
+                accessibilityRole="button"
+                accessibilityState={{ disabled: !isSupportedRoute(to, from) }}
+                android_ripple={{ color: 'rgba(212, 175, 55, 0.14)' }}
                 disabled={!isSupportedRoute(to, from)}
-                style={styles.swapButton}
-                onPress={swap}>
+                style={({ pressed }) => [
+                  styles.swapButton,
+                  pressed ? styles.pressed : null,
+                ]}
+                onPress={swap}
+              >
                 <ArrowDownUp color={colors.gold} size={18} strokeWidth={2.2} />
               </Pressable>
             </View>
             <SelectChips
-              label="转入账户"
+              label={t('transfer.toAccount')}
               value={to}
               options={toOptions}
               onChange={changeTo}
             />
             {!routeSupported ? (
-              <InlineNotice tone="red">当前后端不支持该账户方向，已禁止提交。</InlineNotice>
+              <InlineNotice tone="red">
+                {t('transfer.routeUnavailable')}
+              </InlineNotice>
             ) : null}
             {contractRoute ? (
-              <InlineNotice>合约账户划转 V1 仅支持 USDT。</InlineNotice>
+              <InlineNotice>{t('transfer.contractUsdtNotice')}</InlineNotice>
             ) : null}
             <SelectChips
-              label="币种"
+              label={t('assetAction.coin')}
               value={selectedCoin}
               options={coinOptions}
-              emptyText="当前转出账户暂无可划转余额"
+              emptyText={t('transfer.noBalance')}
               onChange={value => {
                 setCoin(value);
                 setAmount('');
@@ -304,7 +436,8 @@ export default function TransferScreen() {
               }}
             />
             <ActionTextField
-              label="数量"
+              label={t('assetAction.amount')}
+              maxLength={85}
               value={amount}
               keyboardType="decimal-pad"
               onChangeText={value => {
@@ -312,15 +445,27 @@ export default function TransferScreen() {
                 setError('');
                 setMessage('');
               }}
-              placeholder="请输入划转数量"
+              placeholder={t('transfer.amountPlaceholder')}
             />
             <View style={styles.percentRow}>
               {percents.map(percent => (
                 <Pressable
                   key={percent}
-                  disabled={available <= 0}
-                  style={styles.percentButton}
-                  onPress={() => setPercent(percent)}>
+                  accessibilityLabel={
+                    percent === 100 ? t('assetAction.all') : `${percent}%`
+                  }
+                  accessibilityRole="button"
+                  accessibilityState={{
+                    disabled: !isPositiveDecimalText(availableBalance.text),
+                  }}
+                  android_ripple={{ color: 'rgba(212, 175, 55, 0.12)' }}
+                  disabled={!isPositiveDecimalText(availableBalance.text)}
+                  style={({ pressed }) => [
+                    styles.percentButton,
+                    pressed ? styles.pressed : null,
+                  ]}
+                  onPress={() => setPercent(percent)}
+                >
                   <Text style={styles.percentText}>
                     {percent === 100 ? 'MAX' : `${percent}%`}
                   </Text>
@@ -328,15 +473,33 @@ export default function TransferScreen() {
               ))}
             </View>
             <View style={styles.infoBlock}>
-              <InfoRow label="当前可划转" value={`${formatAmount(available)} ${selectedCoin || '--'}`} />
-              <InfoRow label="方向" value={`${accountLabel(from)} -> ${accountLabel(to)}`} />
+              <InfoRow
+                label={t('transfer.currentAvailable')}
+                value={`${formatAmount(availableBalance.text)} ${
+                  selectedCoin || '--'
+                }`}
+              />
+              <InfoRow
+                label={t('transfer.direction')}
+                value={`${accountLabel(from, t)} → ${accountLabel(to, t)}`}
+              />
             </View>
-            {amountNumber > available ? <InlineNotice tone="red">可划转余额不足</InlineNotice> : null}
+            {amountExceedsAvailable ? (
+              <InlineNotice tone="red">
+                {t('transfer.insufficient')}
+              </InlineNotice>
+            ) : null}
             {error ? <InlineNotice tone="red">{error}</InlineNotice> : null}
-            {message ? <InlineNotice tone="green">{message}</InlineNotice> : null}
+            {message ? (
+              <InlineNotice tone="green">{message}</InlineNotice>
+            ) : null}
             <View style={styles.buttonWrap}>
               <PrimaryButton
-                title={submitting ? '划转中...' : '确认划转'}
+                title={
+                  submitting
+                    ? t('transfer.transferring')
+                    : t('transfer.confirm')
+                }
                 disabled={submitDisabled}
                 onPress={submit}
               />
@@ -348,7 +511,10 @@ export default function TransferScreen() {
   );
 }
 
-function isSupportedRoute(from: AssetTransferAccountKey, to: AssetTransferAccountKey) {
+function isSupportedRoute(
+  from: AssetTransferAccountKey,
+  to: AssetTransferAccountKey,
+) {
   return (
     (from === 'funding' && to === 'spot') ||
     (from === 'spot' && to === 'funding') ||
@@ -357,30 +523,57 @@ function isSupportedRoute(from: AssetTransferAccountKey, to: AssetTransferAccoun
   );
 }
 
-function isContractRoute(from: AssetTransferAccountKey, to: AssetTransferAccountKey) {
+function isContractRoute(
+  from: AssetTransferAccountKey,
+  to: AssetTransferAccountKey,
+) {
   return (
     (from === 'funding' && to === 'contract') ||
     (from === 'contract' && to === 'funding')
   );
 }
 
-function accountLabel(account: AssetTransferAccountKey) {
-  if (account === 'funding') return '资金账户';
-  if (account === 'spot') return '现货账户';
-  return '合约账户';
+function accountLabel(account: AssetTransferAccountKey, t: Translator) {
+  if (account === 'funding') return t('assetAction.account.funding');
+  if (account === 'spot') return t('assetAction.account.spot');
+  return t('assetAction.account.contract');
 }
 
 const styles = StyleSheet.create({
+  pressed: { opacity: 0.78, transform: [{ scale: 0.99 }] },
+  userTransferEntry: {
+    minHeight: 62,
+    marginTop: 12,
+    paddingHorizontal: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.card,
+  },
+  userTransferEntryText: { flex: 1, paddingRight: 12 },
+  userTransferEntryTitle: {
+    ...typography.bold,
+    color: colors.text,
+    fontSize: 14,
+  },
+  userTransferEntrySubtitle: {
+    marginTop: 4,
+    color: colors.textMuted,
+    fontSize: 11,
+  },
   swapWrap: {
     alignItems: 'center',
     marginTop: 8,
   },
   swapButton: {
-    width: 38,
-    height: 38,
+    width: 44,
+    height: 44,
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: 19,
+    borderRadius: 22,
     borderWidth: 1,
     borderColor: colors.line,
     backgroundColor: colors.cardAlt,
@@ -392,7 +585,7 @@ const styles = StyleSheet.create({
   },
   percentButton: {
     flex: 1,
-    minHeight: 34,
+    minHeight: 44,
     alignItems: 'center',
     justifyContent: 'center',
     borderRadius: 8,

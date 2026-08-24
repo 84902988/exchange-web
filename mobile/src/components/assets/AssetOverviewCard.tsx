@@ -1,77 +1,156 @@
 import React from 'react';
-import {Pressable, StyleSheet, Text, View} from 'react-native';
-import Svg, {Circle, Path} from 'react-native-svg';
-import {Eye, EyeOff} from 'lucide-react-native';
-import {formatAssetNumber} from '../../api/assets';
-import {colors, typography} from '../../theme';
+import {
+  Pressable,
+  StyleSheet,
+  Text,
+  useWindowDimensions,
+  View,
+} from 'react-native';
+import {
+  CircleCheck,
+  Eye,
+  EyeOff,
+  LogIn,
+  TriangleAlert,
+} from 'lucide-react-native';
+import { formatAssetNumber } from '../../api/assets';
+import { useLanguage, type Translator } from '../../i18n';
+import { colors, typography } from '../../theme';
 
 type Props = {
-  totalUsdt: number;
+  isLoggedIn: boolean;
+  totalUsdt: number | null;
+  valuationComplete: boolean;
+  snapshotAvailable: boolean;
   hidden: boolean;
   loading?: boolean;
+  stale?: boolean;
+  fetchedAt?: number | null;
   onToggleHidden: () => void;
 };
 
 function AssetOverviewCard({
+  isLoggedIn,
   totalUsdt,
+  valuationComplete,
+  snapshotAvailable,
   hidden,
   loading = false,
+  stale = false,
+  fetchedAt = null,
   onToggleHidden,
 }: Props) {
+  const { t } = useLanguage();
+  const { width, fontScale } = useWindowDimensions();
+  const compact = width <= 360 || fontScale >= 1.2;
+  const canDisplayTotal = !loading && valuationComplete && totalUsdt !== null;
   const displayAmount = hidden
     ? '******'
-    : loading
-      ? '--'
-      : formatAssetNumber(totalUsdt, 2);
-  const approxUsd = hidden ? '******' : loading ? '--' : formatAssetNumber(totalUsdt, 2);
+    : canDisplayTotal
+    ? formatAssetNumber(totalUsdt, 2)
+    : '--';
   const Icon = hidden ? EyeOff : Eye;
+  const StatusIcon = !isLoggedIn
+    ? LogIn
+    : canDisplayTotal && !stale
+    ? CircleCheck
+    : TriangleAlert;
+  const status = getSnapshotStatus(
+    {
+      canDisplayTotal,
+      isLoggedIn,
+      loading,
+      snapshotAvailable,
+      stale,
+      valuationComplete,
+    },
+    t,
+  );
 
   return (
     <View style={styles.card}>
-      <View style={styles.topRow}>
-        <View>
+      <View style={[styles.topRow, compact ? styles.topRowCompact : null]}>
+        <View style={styles.amountWrap}>
           <View style={styles.labelRow}>
-            <Text style={styles.label}>总资产估值</Text>
-            <Pressable
-              accessibilityLabel={hidden ? '显示资产' : '隐藏资产'}
-              accessibilityRole="button"
-              style={styles.eyeButton}
-              onPress={onToggleHidden}>
-              <Icon color={colors.textMuted} size={14} strokeWidth={2.2} />
-            </Pressable>
+            <Text style={styles.label}>{t('assets.totalValuation')}</Text>
+            {isLoggedIn ? (
+              <Pressable
+                accessibilityLabel={
+                  hidden ? t('assets.show') : t('assets.hide')
+                }
+                accessibilityRole="button"
+                android_ripple={{
+                  color: 'rgba(212, 175, 55, 0.12)',
+                  borderless: true,
+                }}
+                style={({ pressed }) => [
+                  styles.eyeButton,
+                  pressed ? styles.pressed : null,
+                ]}
+                onPress={onToggleHidden}
+              >
+                <Icon color={colors.textMuted} size={14} strokeWidth={2.2} />
+              </Pressable>
+            ) : null}
           </View>
-          <Text style={styles.amount}>{displayAmount} USDT</Text>
-          <Text style={styles.usd}>≈ {approxUsd} USD</Text>
+          <Text maxFontSizeMultiplier={1.2} style={styles.amount}>
+            {displayAmount} USDT
+          </Text>
         </View>
-        <View style={styles.chartWrap}>
-          <Svg width="96" height="64" viewBox="0 0 96 64">
-            <Path
-              d="M8 44 L20 44 L20 36 L29 36 L29 41 L40 41 L40 30 L52 30 L52 35 L63 35 L63 25 L76 25 L76 18 L88 18"
-              fill="none"
-              stroke={colors.gold}
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth="3"
-            />
-            <Path
-              d="M8 54 C22 48 32 52 44 43 C58 32 70 36 88 24"
-              fill="none"
-              stroke="rgba(25,195,125,0.68)"
-              strokeLinecap="round"
-              strokeWidth="2"
-            />
-            <Circle cx="88" cy="18" fill={colors.gold} r="3" />
-          </Svg>
+        <View
+          style={[styles.statusWrap, compact ? styles.statusWrapCompact : null]}
+        >
+          <StatusIcon
+            color={
+              !isLoggedIn
+                ? colors.textMuted
+                : canDisplayTotal && !stale
+                ? colors.green
+                : colors.gold
+            }
+            size={22}
+            strokeWidth={2}
+          />
+          <Text
+            numberOfLines={1}
+            style={[
+              styles.statusTitle,
+              compact ? styles.statusTextCompact : null,
+            ]}
+          >
+            {status}
+          </Text>
+          <Text
+            numberOfLines={1}
+            style={[
+              styles.statusTime,
+              compact ? styles.statusTextCompact : null,
+            ]}
+          >
+            {!isLoggedIn
+              ? t('assets.notLoggedIn')
+              : fetchedAt
+              ? t('assets.updatedAt', { time: formatSnapshotTime(fetchedAt) })
+              : t('assets.noUpdateTime')}
+          </Text>
         </View>
       </View>
       <View style={styles.footerRow}>
         <View style={styles.metric}>
-          <Text style={styles.metricLabel}>计价单位</Text>
+          <Text style={styles.metricLabel}>{t('assets.pricingUnit')}</Text>
           <Text style={styles.metricValue}>USDT</Text>
         </View>
         <View style={styles.metric}>
-          <Text style={styles.metricLabel}>资产视图</Text>
-          <Text style={styles.metricValue}>总览</Text>
+          <Text style={styles.metricLabel}>{t('assets.assetView')}</Text>
+          <Text style={styles.metricValue}>
+            {!isLoggedIn
+              ? t('assets.loginToDisplay')
+              : !snapshotAvailable
+              ? t('assets.dataPending')
+              : valuationComplete
+              ? t('assets.completeValuation')
+              : t('assets.incompleteValuation')}
+          </Text>
         </View>
       </View>
     </View>
@@ -80,13 +159,49 @@ function AssetOverviewCard({
 
 export default React.memo(AssetOverviewCard);
 
+function getSnapshotStatus(
+  {
+    canDisplayTotal,
+    isLoggedIn,
+    loading,
+    snapshotAvailable,
+    stale,
+    valuationComplete,
+  }: {
+    canDisplayTotal: boolean;
+    isLoggedIn: boolean;
+    loading: boolean;
+    snapshotAvailable: boolean;
+    stale: boolean;
+    valuationComplete: boolean;
+  },
+  t: Translator,
+) {
+  if (!isLoggedIn) return t('assets.loginToDisplay');
+  if (loading) return t('assets.reading');
+  if (stale) return t('assets.dataPending');
+  if (!snapshotAvailable) return t('assets.noData');
+  if (!valuationComplete) return t('assets.missingMarket');
+  if (!canDisplayTotal) return t('assets.noData');
+  return t('assets.completeValuation');
+}
+
+function formatSnapshotTime(value: number) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '--';
+  const hours = String(date.getHours()).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  return `${hours}:${minutes}`;
+}
+
 const styles = StyleSheet.create({
+  pressed: { opacity: 0.68, transform: [{ scale: 0.94 }] },
   card: {
-    borderRadius: 8,
+    borderRadius: 14,
     borderWidth: 1,
-    borderColor: 'rgba(214,168,50,0.24)',
+    borderColor: 'rgba(214,168,50,0.34)',
     backgroundColor: colors.card,
-    padding: 16,
+    padding: 18,
   },
   topRow: {
     minHeight: 92,
@@ -94,6 +209,16 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: 12,
+  },
+  topRowCompact: {
+    minHeight: 0,
+    flexDirection: 'column',
+    alignItems: 'stretch',
+    justifyContent: 'flex-start',
+  },
+  amountWrap: {
+    minWidth: 0,
+    flexShrink: 1,
   },
   labelRow: {
     flexDirection: 'row',
@@ -105,8 +230,8 @@ const styles = StyleSheet.create({
     fontSize: 12,
   },
   eyeButton: {
-    width: 24,
-    height: 24,
+    width: 44,
+    height: 44,
     alignItems: 'center',
     justifyContent: 'center',
   },
@@ -116,19 +241,38 @@ const styles = StyleSheet.create({
     color: colors.text,
     fontSize: 28,
   },
-  usd: {
-    ...typography.number,
-    marginTop: 5,
-    color: colors.textMuted,
-    fontSize: 12,
-  },
-  chartWrap: {
+  statusWrap: {
     width: 104,
     height: 72,
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: 8,
-    backgroundColor: colors.bgElevated,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.cardAlt,
+  },
+  statusWrapCompact: {
+    width: '100%',
+    height: 48,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-start',
+    gap: 8,
+    paddingHorizontal: 12,
+  },
+  statusTitle: {
+    ...typography.bold,
+    marginTop: 5,
+    color: colors.textMuted,
+    fontSize: 11,
+  },
+  statusTime: {
+    marginTop: 3,
+    color: colors.textSubtle,
+    fontSize: 9,
+  },
+  statusTextCompact: {
+    marginTop: 0,
   },
   footerRow: {
     marginTop: 12,
@@ -139,7 +283,7 @@ const styles = StyleSheet.create({
     flex: 1,
     minHeight: 44,
     justifyContent: 'center',
-    borderRadius: 8,
+    borderRadius: 10,
     backgroundColor: colors.cardAlt,
     paddingHorizontal: 10,
   },

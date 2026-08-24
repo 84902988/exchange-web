@@ -1,6 +1,14 @@
-import React from 'react';
-import {StyleSheet, Text, View} from 'react-native';
-import {ChevronRight} from 'lucide-react-native';
+import React, {type ReactElement, useCallback, useMemo} from 'react';
+import {
+  Platform,
+  type RefreshControlProps,
+  SectionList,
+  StyleSheet,
+  Text,
+  type StyleProp,
+  View,
+  type ViewStyle,
+} from 'react-native';
 import type {MarketInstrument} from '../../api/market';
 import {colors, typography} from '../../theme';
 import MarketRow from './MarketRow';
@@ -14,45 +22,121 @@ export type MarketSection = {
 type Props = {
   sections: MarketSection[];
   onRowPress?: (item: MarketInstrument) => void;
+  header?: ReactElement | null;
+  footer?: ReactElement | null;
+  refreshControl?: ReactElement<RefreshControlProps>;
+  contentContainerStyle?: StyleProp<ViewStyle>;
+  scrollIndicatorInsets?: {top?: number; left?: number; bottom?: number; right?: number};
+  style?: StyleProp<ViewStyle>;
 };
 
-export default function MarketSectionList({sections, onRowPress}: Props) {
+type VirtualMarketSection = {
+  key: string;
+  title: string;
+  data: MarketInstrument[];
+};
+
+export default function MarketSectionList({
+  sections,
+  onRowPress,
+  header,
+  footer,
+  refreshControl,
+  contentContainerStyle,
+  scrollIndicatorInsets,
+  style,
+}: Props) {
+  const virtualSections = useMemo<VirtualMarketSection[]>(
+    () =>
+      sections.map(section => ({
+        key: section.key,
+        title: section.title,
+        data: section.items,
+      })),
+    [sections],
+  );
+  const renderItem = useCallback(
+    ({
+      item,
+      index,
+      section,
+    }: {
+      item: MarketInstrument;
+      index: number;
+      section: VirtualMarketSection;
+    }) => (
+      <View
+        style={[
+          styles.rowFrame,
+          index === section.data.length - 1 ? styles.lastRowFrame : null,
+        ]}>
+        <MarketRow item={item} onPress={onRowPress} />
+      </View>
+    ),
+    [onRowPress],
+  );
+  const renderSectionHeader = useCallback(
+    ({section}: {section: VirtualMarketSection}) => (
+      <View style={styles.header}>
+        <Text style={styles.title}>{section.title}</Text>
+      </View>
+    ),
+    [],
+  );
+
   return (
-    <View style={styles.wrap}>
-      {sections.map(section => (
-        <View key={section.key} style={styles.section}>
-          <View style={styles.header}>
-            <Text style={styles.title}>{section.title}</Text>
-            <ChevronRight color={colors.marketMuted} size={16} strokeWidth={2.2} />
-          </View>
-          {section.items.map(item => (
-            <MarketRow key={item.id} item={item} onPress={onRowPress} />
-          ))}
-        </View>
-      ))}
-    </View>
+    <SectionList<MarketInstrument, VirtualMarketSection>
+      contentContainerStyle={contentContainerStyle}
+      initialNumToRender={12}
+      keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
+      keyboardShouldPersistTaps="handled"
+      keyExtractor={item => item.id}
+      ListFooterComponent={footer}
+      ListHeaderComponent={header}
+      maxToRenderPerBatch={12}
+      refreshControl={refreshControl}
+      removeClippedSubviews={Platform.OS === 'android'}
+      renderItem={renderItem}
+      renderSectionHeader={renderSectionHeader}
+      scrollIndicatorInsets={scrollIndicatorInsets}
+      sections={virtualSections}
+      showsVerticalScrollIndicator={false}
+      stickySectionHeadersEnabled={false}
+      style={style}
+      updateCellsBatchingPeriod={40}
+      windowSize={7}
+    />
   );
 }
 
 const styles = StyleSheet.create({
-  wrap: {
-    gap: 12,
-  },
-  section: {
-    borderRadius: 8,
-    backgroundColor: colors.marketCard,
-    borderWidth: 1,
-    borderColor: colors.marketLine,
-    paddingHorizontal: 10,
-    paddingTop: 10,
-    overflow: 'hidden',
-  },
   header: {
-    height: 28,
+    height: 40,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    marginBottom: 2,
+    marginTop: 12,
+    backgroundColor: colors.marketCard,
+    borderWidth: 1,
+    borderBottomWidth: 0,
+    borderColor: colors.marketLine,
+    borderTopLeftRadius: 8,
+    borderTopRightRadius: 8,
+    paddingHorizontal: 10,
+  },
+  rowFrame: {
+    backgroundColor: colors.marketCard,
+    borderLeftWidth: 1,
+    borderRightWidth: 1,
+    borderColor: colors.marketLine,
+    paddingHorizontal: 10,
+  },
+  lastRowFrame: {
+    borderBottomWidth: 1,
+    borderBottomLeftRadius: 8,
+    borderBottomRightRadius: 8,
+    marginBottom: 0,
+    overflow: 'hidden',
   },
   title: {
     ...typography.medium,

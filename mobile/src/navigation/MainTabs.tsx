@@ -1,7 +1,6 @@
 import React from 'react';
-import {Pressable, StyleSheet, View} from 'react-native';
+import {StyleSheet, useWindowDimensions, View} from 'react-native';
 import {
-  type BottomTabBarButtonProps,
   createBottomTabNavigator,
   type BottomTabNavigationOptions,
 } from '@react-navigation/bottom-tabs';
@@ -13,14 +12,17 @@ import {
   Wallet,
   type LucideIcon,
 } from 'lucide-react-native';
-import {useSafeAreaInsets} from 'react-native-safe-area-context';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import HomeScreen from '../screens/home/HomeScreen';
 import MarketsScreen from '../screens/markets/MarketsScreen';
 import TradeScreen from '../screens/trade/TradeScreen';
 import ContractScreen from '../screens/contract/ContractScreen';
 import AssetsScreen from '../screens/assets/AssetsScreen';
-import type {MainTabParamList} from './types';
-import {colors, layout, typography} from '../theme';
+import ResponsiveTabBarButton from '../components/navigation/ResponsiveTabBarButton';
+import {resolveResponsiveLayout} from '../constants/responsiveLayout';
+import type { MainTabParamList } from './types';
+import {useLanguage} from '../i18n';
+import { colors, layout, typography } from '../theme';
 
 const Tab = createBottomTabNavigator<MainTabParamList>();
 const TAB_ICON_SIZE = 22;
@@ -45,98 +47,95 @@ function TabIcon({
   );
 }
 
-function TabBarButton({
-  accessibilityLabel,
-  accessibilityState,
-  children,
-  onLongPress,
-  onPress,
-  style,
-  testID,
-}: BottomTabBarButtonProps) {
-  return (
-    <Pressable
-      accessibilityLabel={accessibilityLabel}
-      accessibilityRole="button"
-      accessibilityState={accessibilityState}
-      android_ripple={{color: 'transparent'}}
-      onLongPress={onLongPress}
-      onPress={onPress}
-      style={style}
-      testID={testID}>
-      {children}
-    </Pressable>
-  );
-}
-
-const homeOptions: BottomTabNavigationOptions = {
-  tabBarLabel: '首页',
-  tabBarIcon: ({color, focused}) => (
+const homeOptions = (label: string): BottomTabNavigationOptions => ({
+  tabBarLabel: label,
+  tabBarIcon: ({ color, focused }) => (
     <TabIcon Icon={Home} color={color} focused={focused} />
   ),
-};
-const marketsOptions: BottomTabNavigationOptions = {
-  tabBarLabel: '行情',
-  tabBarIcon: ({color, focused}) => (
+});
+const marketsOptions = (label: string): BottomTabNavigationOptions => ({
+  tabBarLabel: label,
+  tabBarIcon: ({ color, focused }) => (
     <TabIcon Icon={ChartLine} color={color} focused={focused} />
   ),
-};
-const tradeOptions: BottomTabNavigationOptions = {
-  tabBarLabel: '交易',
-  tabBarIcon: ({color, focused}) => (
+});
+const tradeOptions = (label: string): BottomTabNavigationOptions => ({
+  tabBarLabel: label,
+  tabBarIcon: ({ color, focused }) => (
     <TabIcon Icon={ArrowLeftRight} color={color} focused={focused} />
   ),
-};
-const contractOptions: BottomTabNavigationOptions = {
-  tabBarLabel: '合约',
-  tabBarIcon: ({color, focused}) => (
+});
+const contractOptions = (label: string): BottomTabNavigationOptions => ({
+  tabBarLabel: label,
+  tabBarIcon: ({ color, focused }) => (
     <TabIcon Icon={ChartCandlestick} color={color} focused={focused} />
   ),
-};
-const assetsOptions: BottomTabNavigationOptions = {
-  tabBarLabel: '资产',
-  tabBarIcon: ({color, focused}) => (
+});
+const assetsOptions = (label: string): BottomTabNavigationOptions => ({
+  tabBarLabel: label,
+  tabBarIcon: ({ color, focused }) => (
     <TabIcon Icon={Wallet} color={color} focused={focused} />
   ),
-};
+});
 
 export default function MainTabs() {
   const insets = useSafeAreaInsets();
+  const {fontScale, height, width} = useWindowDimensions();
+  const {t} = useLanguage();
   const bottomPadding = Math.max(insets.bottom, layout.tabBarMinBottomInset);
+  const responsive = resolveResponsiveLayout(width, height, fontScale);
 
   return (
     <Tab.Navigator
+      detachInactiveScreens
       screenOptions={{
+        animation: 'none',
+        freezeOnBlur: false,
         headerShown: false,
+        lazy: true,
         tabBarActiveTintColor: colors.tabActive,
         tabBarInactiveTintColor: colors.tabInactive,
         tabBarActiveBackgroundColor: 'transparent',
         tabBarInactiveBackgroundColor: 'transparent',
-        tabBarButton: TabBarButton,
+        tabBarButton: ResponsiveTabBarButton,
         tabBarStyle: [
           styles.tabBar,
           {
             height: layout.tabBarBaseHeight + bottomPadding,
             paddingBottom: bottomPadding,
+            paddingHorizontal: responsive.tabBarHorizontalInset,
           },
         ],
         tabBarItemStyle: styles.tabBarItem,
         tabBarIconStyle: styles.tabBarIcon,
         tabBarLabelStyle: styles.tabBarLabel,
-      }}>
-      <Tab.Screen name="Home" component={HomeScreen} options={homeOptions} />
+      }}
+    >
+      <Tab.Screen
+        name="Home"
+        component={HomeScreen}
+        options={homeOptions(t('nav.home'))}
+      />
       <Tab.Screen
         name="Markets"
         component={MarketsScreen}
-        options={marketsOptions}
+        options={marketsOptions(t('nav.markets'))}
       />
-      <Tab.Screen name="Trade" component={TradeScreen} options={tradeOptions} />
+      <Tab.Screen
+        name="Trade"
+        component={TradeScreen}
+        options={tradeOptions(t('nav.trade'))}
+      />
       <Tab.Screen
         name="Contract"
         component={ContractScreen}
-        options={contractOptions}
+        options={contractOptions(t('nav.contract'))}
       />
-      <Tab.Screen name="Assets" component={AssetsScreen} options={assetsOptions} />
+      <Tab.Screen
+        name="Assets"
+        component={AssetsScreen}
+        options={assetsOptions(t('nav.assets'))}
+      />
     </Tab.Navigator>
   );
 }

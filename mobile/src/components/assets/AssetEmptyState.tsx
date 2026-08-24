@@ -1,6 +1,6 @@
 import React from 'react';
-import {Pressable, StyleSheet, Text, View} from 'react-native';
-import {colors, typography} from '../../theme';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { colors, typography } from '../../theme';
 
 type Props = {
   title: string;
@@ -18,9 +18,20 @@ function AssetEmptyState({
   return (
     <View style={styles.wrap}>
       <Text style={styles.title}>{title}</Text>
-      {description ? <Text style={styles.description}>{description}</Text> : null}
+      {description ? (
+        <Text style={styles.description}>{description}</Text>
+      ) : null}
       {actionLabel && onActionPress ? (
-        <Pressable style={styles.action} onPress={onActionPress}>
+        <Pressable
+          accessibilityLabel={actionLabel}
+          accessibilityRole="button"
+          android_ripple={{ color: 'rgba(212, 175, 55, 0.12)' }}
+          style={({ pressed }) => [
+            styles.action,
+            pressed ? styles.pressed : null,
+          ]}
+          onPress={onActionPress}
+        >
           <Text style={styles.actionText}>{actionLabel}</Text>
         </Pressable>
       ) : null}
@@ -31,6 +42,7 @@ function AssetEmptyState({
 export default React.memo(AssetEmptyState);
 
 const styles = StyleSheet.create({
+  pressed: { opacity: 0.76, transform: [{ scale: 0.98 }] },
   wrap: {
     minHeight: 116,
     alignItems: 'center',
@@ -55,7 +67,7 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   action: {
-    height: 32,
+    minHeight: 44,
     minWidth: 92,
     alignItems: 'center',
     justifyContent: 'center',
@@ -66,7 +78,7 @@ const styles = StyleSheet.create({
   },
   actionText: {
     ...typography.bold,
-    color: colors.white,
+    color: colors.black,
     fontSize: 12,
   },
 });

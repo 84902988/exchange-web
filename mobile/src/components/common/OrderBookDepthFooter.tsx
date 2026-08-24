@@ -23,19 +23,50 @@ function OrderBookDepthFooter({asks, bids}: Props) {
     <View style={styles.footer}>
       {hasData ? (
         <View style={styles.ratioRow}>
-          <Text style={[styles.ratioText, styles.bidText]}>B {bidRatio}%</Text>
+          <Text
+            maxFontSizeMultiplier={1}
+            numberOfLines={1}
+            style={[styles.ratioText, styles.bidText]}>
+            B {bidRatio}%
+          </Text>
           <View style={styles.ratioTrack}>
             <View style={[styles.ratioFill, styles.bidFill, {flex: bidTotal}]} />
             <View style={[styles.ratioFill, styles.askFill, {flex: askTotal}]} />
           </View>
-          <Text style={[styles.ratioText, styles.askText]}>{askRatio}% S</Text>
+          <Text
+            maxFontSizeMultiplier={1}
+            numberOfLines={1}
+            style={[styles.ratioText, styles.askText]}>
+            {askRatio}% S
+          </Text>
         </View>
       ) : null}
     </View>
   );
 }
 
-export default React.memo(OrderBookDepthFooter);
+export default React.memo(OrderBookDepthFooter, areDepthPropsEqual);
+
+function areDepthPropsEqual(previous: Props, next: Props) {
+  return (
+    areLevelsEqual(previous.asks, next.asks) &&
+    areLevelsEqual(previous.bids, next.bids)
+  );
+}
+
+function areLevelsEqual(
+  previous: OrderBookDepthLevel[],
+  next: OrderBookDepthLevel[],
+) {
+  return (
+    previous.length === next.length &&
+    previous.every(
+      (level, index) =>
+        level.price === next[index]?.price &&
+        level.amount === next[index]?.amount,
+    )
+  );
+}
 
 function safeAmount(value: number) {
   return Number.isFinite(value) && value > 0 ? value : 0;

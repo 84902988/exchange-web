@@ -1,72 +1,130 @@
 import React from 'react';
-import {Pressable, StyleSheet, Text, View} from 'react-native';
-import {BarChart3, ChevronDown, MoreHorizontal} from 'lucide-react-native';
-import {formatContractNumber, formatContractPercent} from '../../api/contract';
-import {colors, typography} from '../../theme';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { BarChart3, ChevronDown, MoreHorizontal } from 'lucide-react-native';
+import {
+  formatContractPercent,
+} from '../../api/contract';
+import { useLanguage } from '../../i18n';
+import { colors, typography } from '../../theme';
+import { formatFixedPrice } from '../../utils/format';
+import MarketLogo from '../markets/MarketLogo';
 
 type Props = {
+  baseAsset: string;
+  logoUrl?: string | null;
   symbolLabel: string;
   lastPrice: number | null;
   markPrice: number | null;
   changePercent: number | null;
   pricePrecision: number;
   marketStatus?: string | null;
-  fundingRateText?: string;
+  onSymbolPress: () => void;
   onOpenChart: () => void;
   onOpenMore: () => void;
 };
 
 function ContractSymbolHeader({
+  baseAsset,
+  logoUrl,
   symbolLabel,
   lastPrice,
   markPrice,
   changePercent,
   pricePrecision,
   marketStatus,
-  fundingRateText = '资金费率 --',
+  onSymbolPress,
   onOpenChart,
   onOpenMore,
 }: Props) {
+  const { t } = useLanguage();
   const up = (changePercent || 0) >= 0;
-  const statusText = marketStatus || '合约行情';
+  const statusText = marketStatus || t('trading.contractMarket');
 
   return (
-    <View style={styles.header}>
-      <View style={styles.symbolBlock}>
-        <View style={styles.symbolRow}>
-          <Text style={styles.symbol}>{symbolLabel}</Text>
-          <ChevronDown color={colors.textMuted} size={14} strokeWidth={2.2} />
+    <View testID="contract-symbol-header" style={styles.header}>
+      <Pressable
+        accessibilityLabel={t('trading.selectContractSymbolA11y')}
+        accessibilityRole="button"
+        android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
+        style={({ pressed }) => [
+          styles.symbolBlock,
+          pressed ? styles.pressed : null,
+        ]}
+        onPress={onSymbolPress}
+      >
+        <MarketLogo
+          label={baseAsset}
+          logoUrl={logoUrl}
+          positive={up}
+          size={28}
+        />
+        <View style={styles.symbolTextBlock}>
+          <View style={styles.symbolRow}>
+            <Text ellipsizeMode="tail" numberOfLines={1} style={styles.symbol}>
+              {symbolLabel}
+            </Text>
+            <ChevronDown color={colors.textMuted} size={14} strokeWidth={2.2} />
+          </View>
+          <View testID="contract-symbol-meta-row" style={styles.metaRow}>
+            <Text
+              ellipsizeMode="tail"
+              numberOfLines={1}
+              style={[styles.change, up ? styles.up : styles.down]}
+            >
+              {formatContractPercent(changePercent)}
+            </Text>
+            <Text numberOfLines={1} style={styles.metaTextFixed}>
+              {t('trading.perpetual')}
+            </Text>
+            <Text
+              ellipsizeMode="tail"
+              numberOfLines={1}
+              style={styles.metaText}
+            >
+              {statusText}
+            </Text>
+          </View>
         </View>
-        <View style={styles.metaRow}>
-          <Text style={[styles.change, up ? styles.up : styles.down]}>
-            {formatContractPercent(changePercent)}
-          </Text>
-          <Text style={styles.metaText}>永续</Text>
-          <Text style={styles.metaText}>{statusText}</Text>
-          <Text style={styles.metaText}>{fundingRateText}</Text>
-        </View>
-      </View>
+      </Pressable>
       <View style={styles.priceBlock}>
         <Text style={[styles.price, up ? styles.up : styles.down]}>
-          {formatContractNumber(lastPrice, pricePrecision)}
+          {formatFixedPrice(lastPrice, pricePrecision)}
         </Text>
         <Text style={styles.markPrice}>
-          标记 {formatContractNumber(markPrice, pricePrecision)}
+          {t('trading.markPriceShort', {
+            price: formatFixedPrice(markPrice, pricePrecision),
+          })}
         </Text>
       </View>
       <View style={styles.actions}>
         <Pressable
-          accessibilityLabel="打开合约K线"
+          accessibilityLabel={t('trading.openContractChartA11y')}
           accessibilityRole="button"
-          style={styles.iconButton}
-          onPress={onOpenChart}>
+          android_ripple={{
+            color: 'rgba(212, 175, 55, 0.12)',
+            borderless: true,
+          }}
+          style={({ pressed }) => [
+            styles.iconButton,
+            pressed ? styles.pressed : null,
+          ]}
+          onPress={onOpenChart}
+        >
           <BarChart3 color={colors.text} size={16} strokeWidth={2.2} />
         </Pressable>
         <Pressable
-          accessibilityLabel="更多合约功能"
+          accessibilityLabel={t('trading.moreContractFunctionsA11y')}
           accessibilityRole="button"
-          style={styles.iconButton}
-          onPress={onOpenMore}>
+          android_ripple={{
+            color: 'rgba(212, 175, 55, 0.12)',
+            borderless: true,
+          }}
+          style={({ pressed }) => [
+            styles.iconButton,
+            pressed ? styles.pressed : null,
+          ]}
+          onPress={onOpenMore}
+        >
           <MoreHorizontal color={colors.text} size={18} strokeWidth={2.2} />
         </Pressable>
       </View>
@@ -77,8 +135,9 @@ function ContractSymbolHeader({
 export default React.memo(ContractSymbolHeader);
 
 const styles = StyleSheet.create({
+  pressed: { opacity: 0.72, transform: [{ scale: 0.97 }] },
   header: {
-    minHeight: 48,
+    height: 56,
     flexDirection: 'row',
     alignItems: 'center',
     borderBottomWidth: 1,
@@ -88,31 +147,50 @@ const styles = StyleSheet.create({
   symbolBlock: {
     flex: 1,
     minWidth: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+  },
+  symbolTextBlock: {
+    flex: 1,
+    minWidth: 0,
   },
   symbolRow: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 2,
+    overflow: 'hidden',
   },
   symbol: {
     ...typography.semibold,
+    flexShrink: 1,
     color: colors.text,
     fontSize: 15,
   },
   metaRow: {
     marginTop: 3,
+    height: 12,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 5,
-    flexWrap: 'wrap',
+    flexWrap: 'nowrap',
+    overflow: 'hidden',
   },
   metaText: {
+    flexShrink: 1,
+    color: colors.textSubtle,
+    fontSize: 9,
+    lineHeight: 12,
+  },
+  metaTextFixed: {
+    flexShrink: 0,
     color: colors.textSubtle,
     fontSize: 9,
     lineHeight: 12,
   },
   change: {
     ...typography.number,
+    flexShrink: 0,
     fontSize: 10,
     fontWeight: '600',
     lineHeight: 12,
@@ -143,8 +221,8 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   iconButton: {
-    width: 28,
-    height: 28,
+    width: 44,
+    height: 44,
     alignItems: 'center',
     justifyContent: 'center',
     borderRadius: 6,

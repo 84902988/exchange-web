@@ -9,14 +9,34 @@ import React, {
   type ReactNode,
 } from 'react';
 import {
+  ApiClientError,
   getMe,
   login as apiLogin,
+  logout as apiLogout,
   register as apiRegister,
-  setApiAuthToken,
+  requireAuthenticatedUser,
+  setApiAuthLifecycleHandlers,
+  setApiAuthTokens,
+  type ApiAuthTokenState,
   type MeOut,
   type RegisterIn,
   type TokenOut,
 } from '../api';
+import {
+  clearAuthTokensForLogout,
+  LEGACY_ACCESS_TOKEN_KEY,
+  LEGACY_REFRESH_TOKEN_KEY,
+  readOrMigrateAuthTokens,
+  readSecureAuthTokens,
+  writeSecureAuthTokens,
+} from '../services/secureAuthTokenStorage';
+import {
+  clearSecureUserSnapshot,
+  LEGACY_USER_SNAPSHOT_KEY,
+  readOrMigrateSecureUserSnapshot,
+  writeSecureUserSnapshot,
+} from '../services/secureUserSnapshotStorage';
+import {clearPendingUserTransferIntentForLogout} from '../services/pendingUserTransferIntent';
 
 type AuthContextValue = {
   isLoggedIn: boolean;
@@ -24,55 +44,101 @@ type AuthContextValue = {
   loading: boolean;
   error: string | null;
   restoreSession: () => Promise<void>;
-  login: (account: string, password: string) => Promise<void>;
-  register: (payload: RegisterIn) => Promise<boolean>;
+  refreshUser: () => Promise<MeOut>;
+  login: (
+    account: string,
+    password: string,
+    captcha?: {captchaId: string; captchaCode: string},
+  ) => Promise<void>;
+  register: (payload: RegisterIn) => Promise<void>;
   logout: () => Promise<void>;
 };
 
-const ACCESS_TOKEN_KEY = 'access_token';
-const REFRESH_TOKEN_KEY = 'refresh_token';
-const USER_KEY = 'userInfo';
-
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
+let authStorageTail: Promise<void> = Promise.resolve();
 
-function hasToken(payload: {access_token?: string}): payload is TokenOut {
-  return Boolean(payload.access_token);
+function enqueueAuthStorageOperation<T>(operation: () => Promise<T>) {
+  const result = authStorageTail.catch(() => undefined).then(operation);
+  authStorageTail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
+function hasTokenPair(
+  payload: TokenOut,
+): payload is TokenOut & {access_token: string; refresh_token: string} {
+  return Boolean(payload.access_token?.trim() && payload.refresh_token?.trim());
+}
+
+async function persistTokenStorage(tokens: ApiAuthTokenState) {
+  await enqueueAuthStorageOperation(() =>
+    writeSecureAuthTokens({
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+    }),
+  );
+}
+
+async function persistApiTokenState(tokens: ApiAuthTokenState) {
+  await persistTokenStorage(tokens);
+  setApiAuthTokens(tokens);
 }
 
 async function persistTokens(tokens: TokenOut) {
-  if (tokens.access_token) {
-    await AsyncStorage.setItem(ACCESS_TOKEN_KEY, tokens.access_token);
-    setApiAuthToken(tokens.access_token);
-  }
-  if (tokens.refresh_token) {
-    await AsyncStorage.setItem(REFRESH_TOKEN_KEY, tokens.refresh_token);
-  }
+  await persistApiTokenState({
+    accessToken: tokens.access_token?.trim() || null,
+    refreshToken: tokens.refresh_token?.trim() || null,
+  });
 }
 
 async function persistUser(user: MeOut | null) {
-  if (!user) {
-    await AsyncStorage.removeItem(USER_KEY);
-    return;
-  }
-  await AsyncStorage.setItem(USER_KEY, JSON.stringify(user));
+  await enqueueAuthStorageOperation(async () => {
+    if (!user) {
+      await Promise.all([
+        clearSecureUserSnapshot(),
+        AsyncStorage.removeItem(LEGACY_USER_SNAPSHOT_KEY),
+      ]);
+      return;
+    }
+    await writeSecureUserSnapshot(user);
+  });
 }
 
 async function clearAuthStorage() {
-  setApiAuthToken(null);
-  await Promise.all([
-    AsyncStorage.removeItem(ACCESS_TOKEN_KEY),
-    AsyncStorage.removeItem(REFRESH_TOKEN_KEY),
-    AsyncStorage.removeItem(USER_KEY),
-  ]);
+  setApiAuthTokens(null);
+  await enqueueAuthStorageOperation(() =>
+    Promise.all([
+      clearAuthTokensForLogout(),
+      clearPendingUserTransferIntentForLogout(),
+      clearSecureUserSnapshot(),
+      AsyncStorage.removeMany([
+        LEGACY_ACCESS_TOKEN_KEY,
+        LEGACY_REFRESH_TOKEN_KEY,
+        LEGACY_USER_SNAPSHOT_KEY,
+      ]),
+    ]).then(() => undefined),
+  );
 }
 
-function readCachedUser(value: string | null) {
+function readCachedUser(value: unknown) {
   if (!value) return null;
   try {
-    return JSON.parse(value) as MeOut;
+    return requireAuthenticatedUser(value);
   } catch {
     return null;
   }
+}
+
+export function shouldClearSessionForError(error: unknown) {
+  if (!(error instanceof ApiClientError)) return false;
+  const code = error.code.toUpperCase();
+  return (
+    error.status === 401 ||
+    (error.status === 403 && code === 'USER_DISABLED') ||
+    code === 'INVALID_ME_RESPONSE'
+  );
 }
 
 export function AuthProvider({children}: {children: ReactNode}) {
@@ -84,7 +150,7 @@ export function AuthProvider({children}: {children: ReactNode}) {
     try {
       await clearAuthStorage();
     } catch {
-      setApiAuthToken(null);
+      setApiAuthTokens(null);
     }
     setUser(null);
     setError(message);
@@ -96,32 +162,76 @@ export function AuthProvider({children}: {children: ReactNode}) {
     setError(null);
 
     try {
-      const [accessToken, cachedUser] = await Promise.all([
-        AsyncStorage.getItem(ACCESS_TOKEN_KEY),
-        AsyncStorage.getItem(USER_KEY),
-      ]);
+      const [tokens, cachedUser] =
+        await enqueueAuthStorageOperation(() =>
+          Promise.all([
+            readOrMigrateAuthTokens(),
+            readOrMigrateSecureUserSnapshot(),
+          ]),
+        );
+      const {accessToken, refreshToken} = tokens;
 
-      if (!accessToken) {
+      if (!accessToken && !refreshToken) {
         await finishLoggedOut();
         return;
       }
 
-      setApiAuthToken(accessToken);
+      setApiAuthTokens({accessToken, refreshToken});
       const parsedUser = readCachedUser(cachedUser);
       if (parsedUser) {
         setUser(parsedUser);
+      } else if (cachedUser) {
+        await persistUser(null);
       }
 
-      const currentUser = await getMe();
+      const currentUser = requireAuthenticatedUser(await getMe());
       setUser(currentUser);
       await persistUser(currentUser);
       setLoading(false);
     } catch (requestError) {
-      await finishLoggedOut(
-        requestError instanceof Error ? requestError.message : null,
-      );
+      const message =
+        requestError instanceof Error
+          ? requestError.message
+          : '登录状态检查失败，请稍后重试';
+      if (shouldClearSessionForError(requestError)) {
+        await finishLoggedOut(message);
+        return;
+      }
+      setError(message);
+      setLoading(false);
     }
   }, [finishLoggedOut]);
+
+  const refreshUser = useCallback(async () => {
+    try {
+      const currentUser = requireAuthenticatedUser(await getMe());
+      setUser(currentUser);
+      await persistUser(currentUser);
+      setError(null);
+      return currentUser;
+    } catch (requestError) {
+      const message =
+        requestError instanceof Error
+          ? requestError.message
+          : '账户资料刷新失败，请稍后重试';
+      if (shouldClearSessionForError(requestError)) {
+        await finishLoggedOut(message);
+      } else {
+        setError(message);
+      }
+      throw requestError;
+    }
+  }, [finishLoggedOut]);
+
+  useEffect(
+    () =>
+      setApiAuthLifecycleHandlers({
+        onAuthExpired: sessionError =>
+          finishLoggedOut(sessionError.message),
+        onTokensRefreshed: persistTokenStorage,
+      }),
+    [finishLoggedOut],
+  );
 
   useEffect(() => {
     restoreSession().catch(restoreError => {
@@ -130,28 +240,54 @@ export function AuthProvider({children}: {children: ReactNode}) {
     });
   }, [restoreSession]);
 
-  const login = useCallback(async (account: string, password: string) => {
+  const login = useCallback(async (
+    account: string,
+    password: string,
+    captcha?: {captchaId: string; captchaCode: string},
+  ) => {
     setLoading(true);
     setError(null);
+    let tokensPersisted = false;
     try {
+      const captchaId = captcha?.captchaId.trim() || '';
+      const captchaCode = captcha?.captchaCode.trim().toUpperCase() || '';
+      if (
+        captcha &&
+        (!/^[A-Za-z0-9_-]{20,128}$/.test(captchaId) ||
+          !/^[A-HJ-NP-Z2-9]{5}$/.test(captchaCode))
+      ) {
+        throw new ApiClientError(
+          '图形验证码信息无效，未发送登录请求',
+          'INVALID_CAPTCHA_INPUT',
+        );
+      }
       await clearAuthStorage();
       const tokens = await apiLogin({
         account: account.trim(),
         password,
+        ...(captcha
+          ? {captcha_id: captchaId, captcha_code: captchaCode}
+          : {}),
         remember_me: true,
       });
-      if (!hasToken(tokens)) {
-        throw new Error('登录成功但未返回 access_token，移动端暂无法保存登录态');
+      if (!hasTokenPair(tokens)) {
+        throw new Error('登录成功但未返回完整令牌，移动端暂无法保存登录态');
       }
       await persistTokens(tokens);
-      const currentUser = await getMe();
+      tokensPersisted = true;
+      const currentUser = requireAuthenticatedUser(await getMe());
       setUser(currentUser);
       await persistUser(currentUser);
       setLoading(false);
     } catch (requestError) {
       const message =
         requestError instanceof Error ? requestError.message : '登录失败，请稍后重试';
-      await finishLoggedOut(message);
+      if (!tokensPersisted || shouldClearSessionForError(requestError)) {
+        await finishLoggedOut(message);
+      } else {
+        setError(message);
+        setLoading(false);
+      }
       throw requestError;
     }
   }, [finishLoggedOut]);
@@ -159,30 +295,50 @@ export function AuthProvider({children}: {children: ReactNode}) {
   const register = useCallback(async (payload: RegisterIn) => {
     setLoading(true);
     setError(null);
+    let tokensPersisted = false;
     try {
+      await clearAuthStorage();
       const result = await apiRegister(payload);
-      if ('access_token' in result && result.access_token) {
-        await persistTokens(result);
-        const currentUser = await getMe();
-        setUser(currentUser);
-        await persistUser(currentUser);
-        setLoading(false);
-        return true;
+      if (!hasTokenPair(result)) {
+        throw new ApiClientError(
+          '注册响应缺少完整令牌，未建立登录态',
+          'INVALID_REGISTER_RESPONSE',
+        );
       }
+      await persistTokens(result);
+      tokensPersisted = true;
+      const currentUser = requireAuthenticatedUser(await getMe());
+      setUser(currentUser);
+      await persistUser(currentUser);
       setLoading(false);
-      return false;
     } catch (requestError) {
       const message =
         requestError instanceof Error ? requestError.message : '注册失败，请稍后重试';
-      setError(message);
-      setLoading(false);
+      if (!tokensPersisted || shouldClearSessionForError(requestError)) {
+        await finishLoggedOut(message);
+      } else {
+        setError(message);
+        setLoading(false);
+      }
       throw requestError;
     }
-  }, []);
+  }, [finishLoggedOut]);
 
   const logout = useCallback(async () => {
     setLoading(true);
+    let refreshToken: string | null = null;
+    try {
+      const tokens = await enqueueAuthStorageOperation(readSecureAuthTokens);
+      refreshToken = tokens.refreshToken;
+    } catch {
+      // A missing local snapshot must not block logout.
+    }
     await finishLoggedOut();
+    try {
+      await apiLogout(refreshToken ? {refresh_token: refreshToken} : {});
+    } catch {
+      // Local cleanup remains authoritative if remote revocation is unavailable.
+    }
   }, [finishLoggedOut]);
 
   const value = useMemo<AuthContextValue>(
@@ -192,11 +348,12 @@ export function AuthProvider({children}: {children: ReactNode}) {
       loading,
       error,
       restoreSession,
+      refreshUser,
       login,
       register,
       logout,
     }),
-    [error, loading, login, logout, register, restoreSession, user],
+    [error, loading, login, logout, refreshUser, register, restoreSession, user],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

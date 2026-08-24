@@ -1,23 +1,27 @@
 import React from 'react';
-import {Pressable, StyleSheet, Text, View} from 'react-native';
-import {Crown, Handshake, Landmark, UserPlus} from 'lucide-react-native';
-import type {LucideIcon} from 'lucide-react-native';
-import {colors, typography} from '../../theme';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
+import type { LucideIcon } from 'lucide-react-native';
+import { colors, typography } from '../../theme';
+import { useLanguage } from '../../i18n';
 
-type QuickEntry = {
+export type QuickEntryItem = {
+  id: string;
   title: string;
-  description: string;
+  description?: string;
   Icon: LucideIcon;
+  onPress: () => void;
 };
 
-const entries: QuickEntry[] = [
-  {title: '邀请好友', description: '好友奖励', Icon: UserPlus},
-  {title: '代理', description: '团队权益', Icon: Handshake},
-  {title: 'VIP', description: '等级权益', Icon: Crown},
-  {title: '委员会', description: '治理入口', Icon: Landmark},
-];
+type Props = {
+  entries?: readonly QuickEntryItem[];
+};
 
-export default function QuickEntryRow() {
+export default function QuickEntryRow({ entries = [] }: Props) {
+  const { t } = useLanguage();
+  if (entries.length === 0) {
+    return null;
+  }
+
   return (
     <View style={styles.row}>
       {entries.map(item => {
@@ -25,19 +29,31 @@ export default function QuickEntryRow() {
 
         return (
           <Pressable
-            accessibilityLabel={`${item.title}, ${item.description}`}
+            accessibilityLabel={
+              item.description
+                ? `${item.title}${t('common.a11ySeparator')}${item.description}`
+                : item.title
+            }
             accessibilityRole="button"
-            key={item.title}
-            style={styles.item}>
+            android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
+            key={item.id}
+            onPress={item.onPress}
+            style={({ pressed }) => [
+              styles.item,
+              pressed ? styles.pressed : null,
+            ]}
+          >
             <View style={styles.icon}>
               <Icon color={colors.gold} size={20} strokeWidth={2.2} />
             </View>
             <Text style={styles.label} numberOfLines={1}>
               {item.title}
             </Text>
-            <Text style={styles.desc} numberOfLines={1}>
-              {item.description}
-            </Text>
+            {item.description ? (
+              <Text style={styles.desc} numberOfLines={1}>
+                {item.description}
+              </Text>
+            ) : null}
           </Pressable>
         );
       })}
@@ -46,6 +62,7 @@ export default function QuickEntryRow() {
 }
 
 const styles = StyleSheet.create({
+  pressed: { opacity: 0.78, transform: [{ scale: 0.985 }] },
   row: {
     marginTop: 16,
     flexDirection: 'row',

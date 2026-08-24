@@ -1,39 +1,57 @@
 import React from 'react';
 import {StyleSheet, Text, View} from 'react-native';
 import {formatAssetNumber} from '../../api/assets';
+import {useLanguage} from '../../i18n';
 import {colors, typography} from '../../theme';
 
 export type AssetDistributionItem = {
   key: string;
   label: string;
-  value: number;
+  value: number | null;
   color: string;
 };
 
 type Props = {
   items: AssetDistributionItem[];
   hidden?: boolean;
+  valuationComplete?: boolean;
 };
 
-function AssetAccountDistribution({items, hidden = false}: Props) {
-  const total = items.reduce((sum, item) => sum + item.value, 0);
+function AssetAccountDistribution({
+  items,
+  hidden = false,
+  valuationComplete = true,
+}: Props) {
+  const {t} = useLanguage();
+  const segments = getAssetDistributionSegments(
+    items,
+    valuationComplete,
+  );
 
   return (
     <View style={styles.card}>
       <View style={styles.header}>
-        <Text style={styles.title}>账户分布</Text>
-        <Text style={styles.meta}>USDT 估值</Text>
+        <Text style={styles.title}>{t('assets.distribution')}</Text>
+        <Text style={styles.meta}>
+          {valuationComplete
+            ? t('assets.usdtValuation')
+            : t('assets.incompleteValuation')}
+        </Text>
       </View>
       <View style={styles.bar}>
-        {items.map(item => {
-          const flex = total > 0 ? Math.max(item.value, total * 0.06) : 1;
-          return (
+        {segments.length > 0 ? (
+          segments.map(item => (
             <View
               key={item.key}
-              style={[styles.segment, {backgroundColor: item.color, flex}]}
+              style={[
+                styles.segment,
+                {backgroundColor: item.color, flex: item.value},
+              ]}
             />
-          );
-        })}
+          ))
+        ) : (
+          <View style={[styles.segment, styles.incompleteSegment]} />
+        )}
       </View>
       <View style={styles.list}>
         {items.map(item => (
@@ -43,7 +61,11 @@ function AssetAccountDistribution({items, hidden = false}: Props) {
               <Text style={styles.name}>{item.label}</Text>
             </View>
             <Text style={styles.value}>
-              {hidden ? '******' : `${formatAssetNumber(item.value, 2)} USDT`}
+              {hidden
+                ? '******'
+                : item.value === null
+                  ? '-- USDT'
+                  : `${formatAssetNumber(item.value, 2)} USDT`}
             </Text>
           </View>
         ))}
@@ -53,6 +75,19 @@ function AssetAccountDistribution({items, hidden = false}: Props) {
 }
 
 export default React.memo(AssetAccountDistribution);
+
+export function getAssetDistributionSegments(
+  items: AssetDistributionItem[],
+  valuationComplete: boolean,
+) {
+  if (!valuationComplete) return [];
+  return items.filter(
+    item =>
+      typeof item.value === 'number' &&
+      Number.isFinite(item.value) &&
+      item.value > 0,
+  ) as Array<AssetDistributionItem & {value: number}>;
+}
 
 const styles = StyleSheet.create({
   card: {
@@ -87,6 +122,10 @@ const styles = StyleSheet.create({
   },
   segment: {
     height: 9,
+  },
+  incompleteSegment: {
+    flex: 1,
+    backgroundColor: colors.line,
   },
   list: {
     marginTop: 10,

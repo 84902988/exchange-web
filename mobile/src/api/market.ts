@@ -1,8 +1,27 @@
-import {apiClient} from './client';
+import { apiClient } from './client';
+import { formatFixedPrice } from '../utils/format';
+import {
+  getFreshExpiringEntry,
+  getOrCreateInFlightRequest,
+  setBoundedExpiringEntry,
+} from '../utils/boundedExpiringMap';
 
 const MARKET_PUBLIC_CACHE_TTL_MS = 5000;
-const publicMarketCache = new Map<string, {expiresAt: number; payload: unknown}>();
-let mobileMarketsCache: {items: MarketInstrument[]; updatedAt: number} | null = null;
+const MARKET_PUBLIC_CACHE_MAX_ENTRIES = 24;
+// Keep the last public catalog visible while a focus refresh is in flight.
+// Trading screens never use this cache as execution authority, and both Home
+// and Markets discard it immediately when the refresh itself fails.
+export const MOBILE_MARKETS_MAX_STALE_MS = 2 * 60_000;
+const publicMarketCache = new Map<
+  string,
+  { expiresAt: number; payload: unknown }
+>();
+const publicMarketRequests = new Map<string, Promise<unknown>>();
+let mobileMarketsCache: {
+  items: MarketInstrument[];
+  updatedAt: number;
+} | null = null;
+let mobileMarketsRequest: Promise<MarketInstrument[]> | null = null;
 
 export type MarketCategoryKey =
   | 'overview'
@@ -21,8 +40,13 @@ export type MarketInstrument = {
   price: number | null;
   changePercent: number | null;
   pricePrecision: number;
-  source: 'api' | 'fallback';
+  logoUrl?: string | null;
+  source: 'api';
   overviewRank?: number;
+  tradable?: boolean;
+  tradeMarket?: 'spot' | 'contract' | null;
+  tradeSymbol?: string | null;
+  tradeStatus?: 'ENABLED' | 'MARKET_DATA_ONLY' | 'UNSUPPORTED';
 };
 
 type MarketPairPayload = {
@@ -49,227 +73,23 @@ type MobileMarketOverviewPayload = {
 
 async function getCachedPublic<T>(url: string): Promise<T> {
   const now = Date.now();
-  const cached = publicMarketCache.get(url);
-  if (cached && cached.expiresAt > now) {
+  const cached = getFreshExpiringEntry(publicMarketCache, url, now);
+  if (cached) {
     return cached.payload as T;
   }
-  const payload = await apiClient.get<T>(url);
-  publicMarketCache.set(url, {
-    expiresAt: now + MARKET_PUBLIC_CACHE_TTL_MS,
-    payload,
-  });
-  return payload;
+  return getOrCreateInFlightRequest(publicMarketRequests, url, async () => {
+    const payload = await apiClient.get<T>(url);
+    const settledAt = Date.now();
+    setBoundedExpiringEntry(
+      publicMarketCache,
+      url,
+      { expiresAt: settledAt + MARKET_PUBLIC_CACHE_TTL_MS, payload },
+      MARKET_PUBLIC_CACHE_MAX_ENTRIES,
+      settledAt,
+    );
+    return payload;
+  }) as Promise<T>;
 }
-
-const REQUIRED_OVERVIEW_SYMBOLS = [
-  'BTCUSDT',
-  'RCBUSDT',
-  'NAS100',
-  'XAUUSD',
-  'ETHUSDT',
-  'EURUSD',
-];
-
-export const MARKET_FALLBACK_ITEMS: MarketInstrument[] = [
-  {
-    id: 'fallback-BTCUSDT',
-    symbol: 'BTCUSDT',
-    displaySymbol: 'BTC',
-    name: 'Bitcoin',
-    category: 'crypto',
-    price: 65001.81,
-    changePercent: -1.06,
-    pricePrecision: 2,
-    source: 'fallback',
-  },
-  {
-    id: 'fallback-RCBUSDT',
-    symbol: 'RCBUSDT',
-    displaySymbol: 'RCB',
-    name: 'Platform Token',
-    category: 'crypto',
-    price: 1.8146,
-    changePercent: -0.86,
-    pricePrecision: 4,
-    source: 'fallback',
-  },
-  {
-    id: 'fallback-ETHUSDT',
-    symbol: 'ETHUSDT',
-    displaySymbol: 'ETH',
-    name: 'Ethereum',
-    category: 'crypto',
-    price: 3482.25,
-    changePercent: 0.72,
-    pricePrecision: 2,
-    source: 'fallback',
-  },
-  {
-    id: 'fallback-SPXC',
-    symbol: 'SPXC',
-    displaySymbol: 'SPXC',
-    name: 'SpaceX',
-    category: 'stock',
-    price: 190.09,
-    changePercent: -9.33,
-    pricePrecision: 2,
-    source: 'fallback',
-  },
-  {
-    id: 'fallback-MU',
-    symbol: 'MU',
-    displaySymbol: 'MU',
-    name: '美光科技',
-    category: 'stock',
-    price: 1039.85,
-    changePercent: -1.84,
-    pricePrecision: 2,
-    source: 'fallback',
-  },
-  {
-    id: 'fallback-NVDA',
-    symbol: 'NVDA',
-    displaySymbol: 'NVDA',
-    name: '英伟达',
-    category: 'stock',
-    price: 206.86,
-    changePercent: -1.37,
-    pricePrecision: 2,
-    source: 'fallback',
-  },
-  {
-    id: 'fallback-SNDK',
-    symbol: 'SNDK',
-    displaySymbol: 'SNDK',
-    name: '闪迪',
-    category: 'stock',
-    price: 1975.16,
-    changePercent: -3.9,
-    pricePrecision: 2,
-    source: 'fallback',
-  },
-  {
-    id: 'fallback-TSLA',
-    symbol: 'TSLA',
-    displaySymbol: 'TSLA',
-    name: '特斯拉',
-    category: 'stock',
-    price: 398.1,
-    changePercent: -2.25,
-    pricePrecision: 2,
-    source: 'fallback',
-  },
-  {
-    id: 'fallback-SPYX',
-    symbol: 'SPYX',
-    displaySymbol: 'SPYX',
-    name: '链上标普 100',
-    category: 'onchain',
-    price: 752.4,
-    changePercent: -0.55,
-    pricePrecision: 2,
-    source: 'fallback',
-  },
-  {
-    id: 'fallback-COAI',
-    symbol: 'COAI',
-    displaySymbol: 'COAI',
-    name: 'AI 链上资产',
-    category: 'onchain',
-    price: 0.3485,
-    changePercent: 5.71,
-    pricePrecision: 4,
-    source: 'fallback',
-  },
-  {
-    id: 'fallback-AGT',
-    symbol: 'AGT',
-    displaySymbol: 'AGT',
-    name: 'Agri Token',
-    category: 'onchain',
-    price: 0.02737,
-    changePercent: 102.07,
-    pricePrecision: 5,
-    source: 'fallback',
-  },
-  {
-    id: 'fallback-CLO',
-    symbol: 'CLO',
-    displaySymbol: 'CLO',
-    name: 'Cloud Token',
-    category: 'onchain',
-    price: 0.1833,
-    changePercent: 20.96,
-    pricePrecision: 4,
-    source: 'fallback',
-  },
-  {
-    id: 'fallback-TRIA',
-    symbol: 'TRIA',
-    displaySymbol: 'TRIA',
-    name: 'Trias',
-    category: 'onchain',
-    price: 0.03067,
-    changePercent: 4.79,
-    pricePrecision: 5,
-    source: 'fallback',
-  },
-  {
-    id: 'fallback-XAUUSD',
-    symbol: 'XAUUSD',
-    displaySymbol: 'XAUUSD',
-    name: 'Gold US Dollar',
-    category: 'cfd',
-    price: 4350.05,
-    changePercent: 0.39,
-    pricePrecision: 2,
-    source: 'fallback',
-  },
-  {
-    id: 'fallback-XAGUSD',
-    symbol: 'XAGUSD',
-    displaySymbol: 'XAGUSD',
-    name: 'Silver US Dollar',
-    category: 'cfd',
-    price: 70.514,
-    changePercent: 0.63,
-    pricePrecision: 3,
-    source: 'fallback',
-  },
-  {
-    id: 'fallback-NAS100',
-    symbol: 'NAS100',
-    displaySymbol: 'NAS100',
-    name: '纳斯达克 100',
-    category: 'cfd',
-    price: 30154.88,
-    changePercent: 0.53,
-    pricePrecision: 2,
-    source: 'fallback',
-  },
-  {
-    id: 'fallback-USOUSD',
-    symbol: 'USOUSD',
-    displaySymbol: 'USOUSD',
-    name: 'WTI Crude Oil Cash',
-    category: 'cfd',
-    price: 77.499,
-    changePercent: 1.29,
-    pricePrecision: 3,
-    source: 'fallback',
-  },
-  {
-    id: 'fallback-EURUSD',
-    symbol: 'EURUSD',
-    displaySymbol: 'EURUSD',
-    name: 'Euro vs US Dollar',
-    category: 'cfd',
-    price: 1.1592,
-    changePercent: -0.14,
-    pricePrecision: 4,
-    source: 'fallback',
-  },
-];
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -280,6 +100,13 @@ function normalizeSymbol(value: unknown) {
     .trim()
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, '');
+}
+
+function normalizeTradeSymbol(value: unknown) {
+  return String(value || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9_-]/g, '');
 }
 
 function readString(row: Record<string, unknown>, keys: string[]) {
@@ -297,7 +124,22 @@ function readString(row: Record<string, unknown>, keys: string[]) {
 
 function readNumber(row: Record<string, unknown>, keys: string[]) {
   for (const key of keys) {
-    const value = Number(row[key]);
+    const raw = row[key];
+    let value: number;
+    if (typeof raw === 'number') {
+      value = raw;
+    } else if (typeof raw === 'string') {
+      const normalized = raw.trim();
+      if (
+        !normalized ||
+        !/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(normalized)
+      ) {
+        continue;
+      }
+      value = Number(normalized);
+    } else {
+      continue;
+    }
     if (Number.isFinite(value)) {
       return value;
     }
@@ -306,70 +148,37 @@ function readNumber(row: Record<string, unknown>, keys: string[]) {
 }
 
 function readPrecision(row: Record<string, unknown>, price: number | null) {
-  const symbol = normalizeSymbol(
-    row.symbol || row.ticker_symbol || row.source_symbol || row.external_symbol,
-  );
-  const precision = readNumber(row, ['price_precision', 'pricePrecision']);
+  const precision = readNumber(row, [
+    'display_price_precision',
+    'displayPricePrecision',
+    'price_precision',
+    'pricePrecision',
+  ]);
   if (precision !== null && precision >= 0 && precision <= 8) {
-    const apiPrecision = Math.trunc(precision);
-    if (['RCBUSDT', 'BON2USDT', 'CREG2USDT'].includes(symbol)) {
-      return Math.min(apiPrecision, 4);
-    }
-    if (symbol.includes('EURUSD') || symbol.includes('FX')) {
-      return Math.min(apiPrecision, 5);
-    }
-    if (
-      symbol.includes('BTC') ||
-      symbol.includes('ETH') ||
-      symbol.includes('NAS100') ||
-      symbol.includes('XAUUSD')
-    ) {
-      return Math.min(apiPrecision, 2);
-    }
-    return Math.min(apiPrecision, 4);
-  }
-  if (['RCBUSDT', 'BON2USDT', 'CREG2USDT'].includes(symbol)) return 4;
-  if (symbol.includes('EURUSD') || symbol.includes('FX')) return 5;
-  if (
-    symbol.includes('BTC') ||
-    symbol.includes('ETH') ||
-    symbol.includes('NAS100') ||
-    symbol.includes('XAUUSD')
-  ) {
-    return 2;
+    return Math.trunc(precision);
   }
   if (price !== null && Math.abs(price) < 1) return 5;
   if (price !== null && Math.abs(price) < 10) return 4;
   return 2;
 }
 
-function readRows(payload: unknown) {
+function readRows(payload: unknown, endpoint: string): unknown[] {
   if (Array.isArray(payload)) return payload;
-  if (!isRecord(payload)) return [];
+  if (!isRecord(payload)) {
+    throw new Error(`${endpoint} returned an invalid market payload`);
+  }
   if (Array.isArray(payload.items)) return payload.items;
   if (Array.isArray(payload.data)) return payload.data;
   if (Array.isArray(payload.rows)) return payload.rows;
-  return [];
-}
-
-function getKnownName(symbol: string) {
-  const map: Record<string, string> = {
-    BTCUSDT: 'Bitcoin',
-    RCBUSDT: 'Platform Token',
-    ETHUSDT: 'Ethereum',
-    NAS100: '纳斯达克 100',
-    XAUUSD: 'Gold US Dollar',
-    XAGUSD: 'Silver US Dollar',
-    EURUSD: 'Euro vs US Dollar',
-    USOUSD: 'WTI Crude Oil Cash',
-    NVDA: '英伟达',
-    TSLA: '特斯拉',
-  };
-  return map[symbol] || '';
+  throw new Error(`${endpoint} returned an invalid market row container`);
 }
 
 function getDisplaySymbol(row: Record<string, unknown>, symbol: string) {
-  const display = readString(row, ['display_symbol', 'displaySymbol', 'base_asset']);
+  const display = readString(row, [
+    'display_symbol',
+    'displaySymbol',
+    'base_asset',
+  ]);
   if (display) return display.replace('/USDT', '').replace('USDT', '');
   if (symbol.endsWith('USDT')) return symbol.slice(0, -4);
   return symbol;
@@ -393,7 +202,12 @@ function getCategory(row: Record<string, unknown>, symbol: string) {
   if (category === 'STOCKS') return 'stock';
   if (category === 'SPOT') return 'crypto';
   if (category === 'CONTRACT_CFD') return 'cfd';
-  if (category === 'ONCHAIN') return 'onchain';
+  // The mobile overview currently labels RWA spot pairs as ONCHAIN even
+  // though they are enabled in the authoritative spot catalog. The app has
+  // no separate on-chain trading surface, so keep these real spot products
+  // discoverable under Crypto and resolve the final route against /market/pairs
+  // when the user opens one.
+  if (category === 'ONCHAIN') return 'crypto';
   if (
     category.includes('STOCK') ||
     subCategory.includes('STOCK') ||
@@ -447,9 +261,42 @@ function mapInstrument(row: unknown): MarketInstrument | null {
       'name_zh',
       'label',
       'external_symbol',
-    ]) ||
-    getKnownName(symbol) ||
-    displaySymbol;
+    ]) || displaySymbol;
+  const hasTradeRouteMetadata = [
+    'tradable',
+    'trade_market',
+    'tradeMarket',
+    'trade_symbol',
+    'tradeSymbol',
+    'trade_status',
+    'tradeStatus',
+  ].some(key => Object.prototype.hasOwnProperty.call(row, key));
+  const rawTradeMarket = readString(row, [
+    'trade_market',
+    'tradeMarket',
+  ]).toLowerCase();
+  const tradeMarket =
+    rawTradeMarket === 'spot' || rawTradeMarket === 'contract'
+      ? rawTradeMarket
+      : null;
+  const tradeSymbol =
+    normalizeTradeSymbol(row.trade_symbol ?? row.tradeSymbol) || null;
+  const rawTradeStatus = readString(row, [
+    'trade_status',
+    'tradeStatus',
+  ]).toUpperCase();
+  const tradeStatus = (
+    ['ENABLED', 'MARKET_DATA_ONLY', 'UNSUPPORTED'].includes(rawTradeStatus)
+      ? rawTradeStatus
+      : row.tradable === true
+      ? 'ENABLED'
+      : 'UNSUPPORTED'
+  ) as MarketInstrument['tradeStatus'];
+  const hasEnabledTradeRoute =
+    row.tradable === true &&
+    tradeMarket !== null &&
+    tradeSymbol !== null &&
+    tradeStatus === 'ENABLED';
 
   return {
     id: `api-${symbol}`,
@@ -460,47 +307,112 @@ function mapInstrument(row: unknown): MarketInstrument | null {
     price,
     changePercent,
     pricePrecision: readPrecision(row, price),
+    logoUrl:
+      readString(row, [
+        'spot_logo_url',
+        'spotLogoUrl',
+        'base_asset_logo_url',
+        'baseAssetLogoUrl',
+        'logo_url',
+        'logoUrl',
+        'icon_url',
+        'iconUrl',
+      ]) || null,
     source: 'api',
     overviewRank:
       readNumber(row, ['overview_rank', 'overviewRank']) ?? undefined,
+    ...(hasTradeRouteMetadata
+      ? {
+          tradable: hasEnabledTradeRoute,
+          tradeMarket,
+          tradeSymbol: hasEnabledTradeRoute ? tradeSymbol : null,
+          tradeStatus: hasEnabledTradeRoute
+            ? 'ENABLED'
+            : tradeStatus === 'ENABLED'
+            ? 'UNSUPPORTED'
+            : tradeStatus,
+        }
+      : {}),
   };
 }
 
+function mergeMarketLogoMetadata(items: MarketInstrument[], payload: unknown) {
+  const logoBySymbol = new Map<string, string>();
+  for (const row of readRows(payload, 'Spot market logo catalog')) {
+    if (!isRecord(row)) continue;
+    const symbol = normalizeSymbol(row.symbol);
+    const logoUrl = readString(row, [
+      'spot_logo_url',
+      'spotLogoUrl',
+      'base_asset_logo_url',
+      'baseAssetLogoUrl',
+      'logo_url',
+      'logoUrl',
+      'icon_url',
+      'iconUrl',
+    ]);
+    if (symbol && logoUrl) logoBySymbol.set(symbol, logoUrl);
+  }
+  if (logoBySymbol.size === 0) return items;
+  return items.map(item => ({
+    ...item,
+    logoUrl: item.logoUrl || logoBySymbol.get(item.symbol) || null,
+  }));
+}
+
 function mergeRows(pairs: unknown[], tickers: unknown[]) {
-  const bySymbol = new Map<string, MarketInstrument>();
+  const bySymbol = new Map<string, Record<string, unknown>>();
 
-  for (const row of pairs) {
-    const mapped = mapInstrument(row);
-    if (mapped) bySymbol.set(mapped.symbol, mapped);
+  for (const row of [...pairs, ...tickers]) {
+    if (!isRecord(row)) continue;
+    const symbol = normalizeSymbol(
+      readString(row, [
+        'symbol',
+        'ticker_symbol',
+        'source_symbol',
+        'external_symbol',
+      ]),
+    );
+    if (!symbol) continue;
+    bySymbol.set(symbol, {
+      ...bySymbol.get(symbol),
+      ...row,
+      symbol,
+    });
   }
 
-  for (const row of tickers) {
-    const mapped = mapInstrument(row);
-    if (!mapped) continue;
-    const existing = bySymbol.get(mapped.symbol);
-    bySymbol.set(mapped.symbol, existing ? {...existing, ...mapped} : mapped);
+  const items = Array.from(bySymbol.values())
+    .map(mapInstrument)
+    .filter((item): item is MarketInstrument => item !== null)
+    .filter(isVisibleTradingCatalogItem);
+  if (pairs.length + tickers.length > 0 && items.length === 0) {
+    throw new Error('Legacy market APIs returned no valid instruments');
   }
-
-  return Array.from(bySymbol.values());
+  return items;
 }
 
 function readMobileOverviewRows(payload: unknown) {
-  if (!isRecord(payload)) return [];
-  const rows: unknown[] = [];
-  if (Array.isArray(payload.overview_cards)) {
-    rows.push(
-      ...payload.overview_cards.map((item, index) =>
-        isRecord(item) ? {...item, overview_rank: index} : item,
-      ),
-    );
+  if (!isRecord(payload)) {
+    throw new Error('Mobile market overview returned an invalid payload');
   }
-  const sections = payload.sections;
-  if (Array.isArray(sections)) {
-    for (const section of sections) {
-      if (isRecord(section) && Array.isArray(section.items)) {
-        rows.push(...section.items);
-      }
+  if (
+    !Array.isArray(payload.overview_cards) ||
+    !Array.isArray(payload.sections)
+  ) {
+    throw new Error('Mobile market overview returned an invalid row container');
+  }
+
+  const rows: unknown[] = [];
+  rows.push(
+    ...payload.overview_cards.map((item, index) =>
+      isRecord(item) ? { ...item, overview_rank: index } : item,
+    ),
+  );
+  for (const section of payload.sections) {
+    if (!isRecord(section) || !Array.isArray(section.items)) {
+      throw new Error('Mobile market overview returned an invalid section');
     }
+    rows.push(...section.items);
   }
   return rows;
 }
@@ -512,47 +424,55 @@ function mapMobileOverview(payload: unknown) {
   const bySymbol = new Map<string, MarketInstrument>();
   for (const row of rows) {
     const mapped = mapInstrument(row);
-    if (mapped) bySymbol.set(mapped.symbol, mapped);
-  }
-  return Array.from(bySymbol.values());
-}
-
-function withRequiredOverviewRows(items: MarketInstrument[]) {
-  const bySymbol = new Map(items.map(item => [item.symbol, item]));
-
-  // TODO: remove fallback catalog rows once backend exposes the full mobile
-  // markets catalog for stocks, CFD and on-chain assets.
-  for (const symbol of REQUIRED_OVERVIEW_SYMBOLS) {
-    if (!bySymbol.has(symbol)) {
-      const fallback = MARKET_FALLBACK_ITEMS.find(item => item.symbol === symbol);
-      if (fallback) bySymbol.set(symbol, fallback);
+    if (mapped && isVisibleTradingCatalogItem(mapped)) {
+      const existing = bySymbol.get(mapped.symbol);
+      bySymbol.set(mapped.symbol, {
+        ...mapped,
+        overviewRank: mapped.overviewRank ?? existing?.overviewRank,
+      });
     }
   }
-
-  return Array.from(bySymbol.values());
+  const items = Array.from(bySymbol.values());
+  if (rows.length > 0 && items.length === 0) {
+    throw new Error('Mobile market overview returned no valid instruments');
+  }
+  return items;
 }
 
-export function getOverviewMarkets(items: MarketInstrument[]) {
-  const ranked = items
-    .filter(item => typeof item.overviewRank === 'number')
-    .sort((a, b) => (a.overviewRank || 0) - (b.overviewRank || 0));
-  if (ranked.length > 0) {
-    return ranked.slice(0, 6);
-  }
-
-  const bySymbol = new Map(items.map(item => [item.symbol, item]));
-  return REQUIRED_OVERVIEW_SYMBOLS.map(symbol => bySymbol.get(symbol)).filter(
-    (item): item is MarketInstrument => Boolean(item),
+function isVisibleTradingCatalogItem(item: MarketInstrument) {
+  if (item.category !== 'cfd') return true;
+  return (
+    item.tradable === true &&
+    item.tradeMarket === 'contract' &&
+    Boolean(item.tradeSymbol)
   );
 }
 
+export function getOverviewMarkets(
+  items: MarketInstrument[],
+  preferredSymbols: readonly string[] = [],
+) {
+  const ranked = items
+    .filter(item => typeof item.overviewRank === 'number')
+    .sort((a, b) => (a.overviewRank || 0) - (b.overviewRank || 0));
+  const bySymbol = new Map(items.map(item => [item.symbol, item]));
+  const ordered: MarketInstrument[] = [];
+  const seenIds = new Set<string>();
+  const append = (item: MarketInstrument | undefined) => {
+    if (!item || seenIds.has(item.id)) return;
+    ordered.push(item);
+    seenIds.add(item.id);
+  };
+  preferredSymbols.forEach(symbol =>
+    append(bySymbol.get(normalizeSymbol(symbol))),
+  );
+  ranked.forEach(append);
+  items.forEach(append);
+  return ordered.slice(0, 6);
+}
+
 export function formatMarketPrice(item: MarketInstrument) {
-  if (item.price === null) return '--';
-  const formatted = item.price.toLocaleString('en-US', {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: item.pricePrecision,
-  });
-  return formatted.replace(/(\.\d*?[1-9])0+$/, '$1').replace(/\.0+$/, '');
+  return formatFixedPrice(item.price, item.pricePrecision);
 }
 
 export function formatMarketPercent(value: number | null) {
@@ -562,15 +482,27 @@ export function formatMarketPercent(value: number | null) {
 }
 
 export function getCachedMobileMarkets() {
-  return mobileMarketsCache?.items ?? [];
+  if (!mobileMarketsCache) {
+    return [];
+  }
+  if (Date.now() - mobileMarketsCache.updatedAt > MOBILE_MARKETS_MAX_STALE_MS) {
+    mobileMarketsCache = null;
+    return [];
+  }
+  return mobileMarketsCache.items;
 }
 
 async function fetchMobileMarketsLegacy() {
   const [pairPayload, tickerPayload] = await Promise.all([
-    getCachedPublic<MarketPairPayload>('/market/pairs?market_type=all&page_size=100'),
+    getCachedPublic<MarketPairPayload>(
+      '/market/pairs?market_type=all&page_size=100',
+    ),
     getCachedPublic<unknown[]>('/market/tickers'),
   ]);
-  return mergeRows(readRows(pairPayload), readRows(tickerPayload));
+  return mergeRows(
+    readRows(pairPayload, 'Market pairs API'),
+    readRows(tickerPayload, 'Market tickers API'),
+  );
 }
 
 export async function fetchMobileMarkets() {
@@ -582,33 +514,61 @@ export async function fetchMobileMarkets() {
     return mobileMarketsCache.items;
   }
 
-  let rows: MarketInstrument[] = [];
-  let usedOverviewSnapshot = false;
-  let usedLegacyMarkets = false;
+  if (mobileMarketsRequest) return mobileMarketsRequest;
+
+  mobileMarketsRequest = (async () => {
+    let overviewError: unknown = null;
+    try {
+      const overviewPayload =
+        await getCachedPublic<MobileMarketOverviewPayload>(
+          '/market/mobile/overview',
+        );
+      const overviewRows = mapMobileOverview(overviewPayload);
+      if (overviewRows.length > 0) {
+        let enrichedRows = overviewRows;
+        try {
+          const pairPayload = await getCachedPublic<MarketPairPayload>(
+            '/market/pairs?market_type=spot&page_size=100',
+          );
+          enrichedRows = mergeMarketLogoMetadata(overviewRows, pairPayload);
+        } catch {
+          // Product logos are presentation metadata. A missing or malformed
+          // logo catalog must not hide otherwise valid market rows.
+        }
+        mobileMarketsCache = {
+          items: enrichedRows,
+          updatedAt: Date.now(),
+        };
+        return enrichedRows;
+      }
+    } catch (error) {
+      overviewError = error;
+    }
+
+    const legacyRows = await fetchMobileMarketsLegacy();
+    if (overviewError && legacyRows.length === 0) {
+      throw new Error(
+        'Market catalog is unavailable because the primary response was invalid',
+      );
+    }
+
+    mobileMarketsCache = { items: legacyRows, updatedAt: Date.now() };
+    return legacyRows;
+  })();
 
   try {
-    const overviewPayload = await getCachedPublic<MobileMarketOverviewPayload>(
-      '/market/mobile/overview',
-    );
-    rows = mapMobileOverview(overviewPayload);
-    usedOverviewSnapshot = rows.length > 0;
-
-    if (!usedOverviewSnapshot) {
-      rows = await fetchMobileMarketsLegacy();
-      usedLegacyMarkets = rows.length > 0;
-    }
-  } catch {
-    rows = await fetchMobileMarketsLegacy();
-    usedLegacyMarkets = rows.length > 0;
+    return await mobileMarketsRequest;
+  } catch (error) {
+    mobileMarketsCache = null;
+    throw error;
+  } finally {
+    mobileMarketsRequest = null;
   }
+}
 
-  // TODO: remove fallback catalog rows once the backend mobile snapshot is
-  // reliable and the legacy public market endpoints always return the full
-  // mobile catalog. These rows are only for unavailable/empty API responses.
-  const items =
-    usedOverviewSnapshot || usedLegacyMarkets
-      ? rows
-      : withRequiredOverviewRows(rows);
-  mobileMarketsCache = {items, updatedAt: Date.now()};
-  return items;
+export function __resetMobileMarketCacheForTests() {
+  publicMarketCache.clear();
+  publicMarketRequests.clear();
+  mobileMarketsCache = null;
+  mobileMarketsRequest = null;
 }

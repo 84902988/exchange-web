@@ -1,7 +1,15 @@
 import React from 'react';
-import {Pressable, StyleSheet, Text, TextInput, View} from 'react-native';
-import {formatSpotNumber} from '../../api/spot';
-import {colors, typography} from '../../theme';
+import {
+  Pressable,
+  StyleSheet,
+  Text,
+  useWindowDimensions,
+  View,
+} from 'react-native';
+import { formatSpotNumber } from '../../api/spot';
+import { useLanguage } from '../../i18n';
+import { colors, typography } from '../../theme';
+import TradingNumericInput from '../common/TradingNumericInput';
 
 export type TradeSide = 'BUY' | 'SELL';
 export type TradeOrderType = 'LIMIT' | 'MARKET';
@@ -16,6 +24,15 @@ type Props = {
   baseAsset: string;
   isLoggedIn: boolean;
   lastPrice: number | null;
+  submitting: boolean;
+  submitDisabled: boolean;
+  feedbackText: string;
+  feedbackTone: 'error' | 'success' | null;
+  pendingIntentReviewVisible?: boolean;
+  pendingIntentReviewBusy?: boolean;
+  pendingIntentReviewLabel?: string;
+  estimatedFeeLabel: string;
+  estimatedFeeText: string;
   onSideChange: (side: TradeSide) => void;
   onOrderTypeChange: (type: TradeOrderType) => void;
   onPriceChange: (price: string) => void;
@@ -24,6 +41,7 @@ type Props = {
   onBboPress: () => void;
   onLoginPress: () => void;
   onSubmitPress: () => void;
+  onPendingIntentReviewPress?: () => void;
 };
 
 const percentSteps = [25, 50, 75, 100];
@@ -38,6 +56,15 @@ function TradeOrderForm({
   baseAsset,
   isLoggedIn,
   lastPrice,
+  submitting,
+  submitDisabled,
+  feedbackText,
+  feedbackTone,
+  pendingIntentReviewVisible = false,
+  pendingIntentReviewBusy = false,
+  pendingIntentReviewLabel,
+  estimatedFeeLabel,
+  estimatedFeeText,
   onSideChange,
   onOrderTypeChange,
   onPriceChange,
@@ -46,42 +73,104 @@ function TradeOrderForm({
   onBboPress,
   onLoginPress,
   onSubmitPress,
+  onPendingIntentReviewPress,
 }: Props) {
+  const { t } = useLanguage();
+  const { width: screenWidth } = useWindowDimensions();
+  const compactFields = screenWidth < 360;
   const buy = side === 'BUY';
-  const submitText = isLoggedIn ? `${buy ? '买入' : '卖出'} ${baseAsset}` : '登录';
+  const submitText = isLoggedIn
+    ? submitting
+      ? t('trading.submitPending')
+      : `${t(buy ? 'trading.buy' : 'trading.sell')} ${baseAsset}`
+    : t('trading.login');
   const submitStyle = !isLoggedIn
     ? styles.loginButton
     : buy
-      ? styles.buyButton
-      : styles.sellButton;
+    ? styles.buyButton
+    : styles.sellButton;
   const tradeValue = getTradeValue(price, amount, orderType, lastPrice);
+  const tradeDisabled = isLoggedIn && submitting;
+  const reviewLabel = pendingIntentReviewLabel || t('trading.reviewOrder');
+  const visibleFeedback =
+    feedbackText || (!isLoggedIn ? t('trading.loginToTrade') : '');
 
   return (
     <View style={styles.card}>
       <View style={styles.topSection}>
         <View style={styles.sideTabs}>
           <Pressable
-            style={[styles.sideTab, buy ? styles.buyActive : null]}
-            onPress={() => onSideChange('BUY')}>
-            <Text style={[styles.sideText, buy ? styles.activeText : null]}>买入</Text>
+            accessibilityRole="tab"
+            accessibilityState={{ selected: buy, disabled: submitting }}
+            android_ripple={{ color: 'rgba(25, 195, 125, 0.12)' }}
+            disabled={submitting}
+            hitSlop={{ top: 5, bottom: 5 }}
+            style={({ pressed }) => [
+              styles.sideTab,
+              buy ? styles.buyActive : null,
+              pressed ? styles.pressed : null,
+            ]}
+            onPress={() => onSideChange('BUY')}
+          >
+            <Text style={[styles.sideText, buy ? styles.activeText : null]}>
+              {t('trading.buy')}
+            </Text>
           </Pressable>
           <Pressable
-            style={[styles.sideTab, !buy ? styles.sellActive : null]}
-            onPress={() => onSideChange('SELL')}>
-            <Text style={[styles.sideText, !buy ? styles.activeText : null]}>卖出</Text>
+            accessibilityRole="tab"
+            accessibilityState={{ selected: !buy, disabled: submitting }}
+            android_ripple={{ color: 'rgba(240, 90, 90, 0.12)' }}
+            disabled={submitting}
+            hitSlop={{ top: 5, bottom: 5 }}
+            style={({ pressed }) => [
+              styles.sideTab,
+              !buy ? styles.sellActive : null,
+              pressed ? styles.pressed : null,
+            ]}
+            onPress={() => onSideChange('SELL')}
+          >
+            <Text style={[styles.sideText, !buy ? styles.activeText : null]}>
+              {t('trading.sell')}
+            </Text>
           </Pressable>
         </View>
 
         <View style={styles.typeTabs}>
           <Pressable
-            style={[styles.typeTab, orderType === 'LIMIT' ? styles.typeActive : null]}
-            onPress={() => onOrderTypeChange('LIMIT')}>
-            <Text style={styles.typeText}>限价</Text>
+            accessibilityRole="tab"
+            accessibilityState={{
+              selected: orderType === 'LIMIT',
+              disabled: submitting,
+            }}
+            android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
+            disabled={submitting}
+            hitSlop={{ top: 8, bottom: 8 }}
+            style={({ pressed }) => [
+              styles.typeTab,
+              orderType === 'LIMIT' ? styles.typeActive : null,
+              pressed ? styles.pressed : null,
+            ]}
+            onPress={() => onOrderTypeChange('LIMIT')}
+          >
+            <Text style={styles.typeText}>{t('trading.limit')}</Text>
           </Pressable>
           <Pressable
-            style={[styles.typeTab, orderType === 'MARKET' ? styles.typeActive : null]}
-            onPress={() => onOrderTypeChange('MARKET')}>
-            <Text style={styles.typeText}>市价</Text>
+            accessibilityRole="tab"
+            accessibilityState={{
+              selected: orderType === 'MARKET',
+              disabled: submitting,
+            }}
+            android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
+            disabled={submitting}
+            hitSlop={{ top: 8, bottom: 8 }}
+            style={({ pressed }) => [
+              styles.typeTab,
+              orderType === 'MARKET' ? styles.typeActive : null,
+              pressed ? styles.pressed : null,
+            ]}
+            onPress={() => onOrderTypeChange('MARKET')}
+          >
+            <Text style={styles.typeText}>{t('trading.market')}</Text>
           </Pressable>
         </View>
       </View>
@@ -89,16 +178,18 @@ function TradeOrderForm({
       <View style={styles.inputSection}>
         <Field
           actionLabel={orderType === 'LIMIT' ? 'BBO' : undefined}
-          editable={orderType === 'LIMIT'}
-          helperText={orderType === 'LIMIT' ? '以当前最优价填入' : undefined}
-          label="价格"
+          compact={compactFields}
+          editable={orderType === 'LIMIT' && !submitting}
+          label={t('trading.price')}
           suffix={quoteAsset}
-          value={orderType === 'MARKET' ? '按市场最优价' : price}
+          value={orderType === 'MARKET' ? t('trading.marketBestPrice') : price}
           onActionPress={onBboPress}
           onChangeText={onPriceChange}
         />
         <Field
-          label="数量"
+          compact={compactFields}
+          editable={!submitting}
+          label={t('trading.quantity')}
           suffix={baseAsset}
           value={amount}
           onChangeText={onAmountChange}
@@ -108,30 +199,100 @@ function TradeOrderForm({
       <View style={styles.percentRow}>
         {percentSteps.map(step => (
           <Pressable
+            accessibilityLabel={t('trading.useAvailablePercentA11y', {
+              percent: step,
+            })}
+            accessibilityRole="button"
+            accessibilityState={{ disabled: submitting }}
+            android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
+            disabled={submitting}
+            hitSlop={{ top: 9, bottom: 9 }}
             key={step}
-            style={styles.percent}
-            onPress={() => onPercentPress(step)}>
-            <Text style={styles.percentText}>{step}%</Text>
+            style={({ pressed }) => [
+              styles.percent,
+              pressed ? styles.pressed : null,
+            ]}
+            onPress={() => onPercentPress(step)}
+          >
+            <Text
+              maxFontSizeMultiplier={compactFields ? 1 : 1.15}
+              numberOfLines={1}
+              style={[
+                styles.percentText,
+                compactFields ? styles.percentTextCompact : null,
+              ]}
+            >
+              {step}%
+            </Text>
           </Pressable>
         ))}
       </View>
 
-      <View style={styles.metrics}>
-        <Metric label="交易额" value={`${tradeValue} ${quoteAsset}`} />
-        <Metric label="可用" value={availableText} />
-        <Metric label="预计手续费" value={`-- ${quoteAsset}`} />
+      <View style={styles.metrics} testID="trade-order-form-metrics">
+        <Metric
+          label={t('trading.tradeValue')}
+          value={`${tradeValue} ${quoteAsset}`}
+        />
+        <Metric label={t('trading.available')} value={availableText} />
+        <Metric label={estimatedFeeLabel} value={estimatedFeeText} />
       </View>
 
       <View style={styles.bottomSection}>
-        <Text style={styles.loginHint}>
-          {isLoggedIn
-            ? '真实下单提交将在下一步接入'
-            : '登录后可交易，当前仍可查看行情和盘口'}
-        </Text>
+        <View
+          style={styles.feedbackRow}
+          testID="trade-order-form-feedback-slot"
+        >
+          {visibleFeedback ? (
+            <Text
+              numberOfLines={2}
+              style={[
+                styles.loginHint,
+                feedbackTone === 'error' ? styles.errorText : null,
+                feedbackTone === 'success' ? styles.successText : null,
+              ]}
+            >
+              {visibleFeedback}
+            </Text>
+          ) : (
+            <View style={styles.feedbackSpacer} />
+          )}
+          {pendingIntentReviewVisible && onPendingIntentReviewPress ? (
+            <Pressable
+              accessibilityLabel={reviewLabel}
+              accessibilityRole="button"
+              android_ripple={{ color: 'rgba(212, 175, 55, 0.12)' }}
+              disabled={pendingIntentReviewBusy}
+              hitSlop={{ top: 7, bottom: 7, left: 4, right: 4 }}
+              style={({ pressed }) => [
+                styles.reviewButton,
+                pressed ? styles.pressed : null,
+              ]}
+              onPress={onPendingIntentReviewPress}
+            >
+              <Text numberOfLines={1} style={styles.reviewButtonText}>
+                {pendingIntentReviewBusy
+                  ? t('trading.processing')
+                  : reviewLabel}
+              </Text>
+            </Pressable>
+          ) : null}
+        </View>
 
         <Pressable
-          style={[styles.submit, submitStyle]}
-          onPress={isLoggedIn ? onSubmitPress : onLoginPress}>
+          accessibilityHint={submitDisabled ? visibleFeedback : undefined}
+          accessibilityLabel={submitText}
+          accessibilityRole="button"
+          accessibilityState={{ busy: submitting, disabled: tradeDisabled }}
+          android_ripple={{ color: 'rgba(0, 0, 0, 0.14)' }}
+          disabled={tradeDisabled}
+          style={({ pressed }) => [
+            styles.submit,
+            submitStyle,
+            tradeDisabled ? styles.submitDisabled : null,
+            pressed ? styles.submitPressed : null,
+          ]}
+          onPress={isLoggedIn ? onSubmitPress : onLoginPress}
+        >
           <Text style={styles.submitText}>{submitText}</Text>
         </Pressable>
       </View>
@@ -141,11 +302,11 @@ function TradeOrderForm({
 
 export default React.memo(TradeOrderForm);
 
-function Metric({label, value}: {label: string; value: string}) {
+function Metric({ label, value }: { label: string; value: string }) {
   return (
     <View style={styles.metaRow}>
-      <Text style={styles.metaLabel}>{label}</Text>
-      <Text style={styles.metaValue}>{value}</Text>
+      <Text numberOfLines={1} style={styles.metaLabel}>{label}</Text>
+      <Text numberOfLines={1} style={styles.metaValue}>{value}</Text>
     </View>
   );
 }
@@ -156,6 +317,7 @@ function Field({
   suffix,
   value,
   actionLabel,
+  compact = false,
   helperText,
   onActionPress,
   onChangeText,
@@ -165,27 +327,48 @@ function Field({
   suffix: string;
   value: string;
   actionLabel?: string;
+  compact?: boolean;
   helperText?: string;
   onActionPress?: () => void;
   onChangeText: (value: string) => void;
 }) {
+  const { t } = useLanguage();
   return (
     <View style={styles.fieldWrap}>
       <View style={styles.field}>
-        <Text style={styles.fieldLabel}>{label}</Text>
-        <TextInput
-          editable={editable}
-          keyboardType="decimal-pad"
-          placeholder="0"
-          placeholderTextColor={colors.textSubtle}
-          selectTextOnFocus={editable}
-          style={styles.input}
-          value={value}
-          onChangeText={onChangeText}
-        />
-        <Text style={styles.suffix}>{suffix}</Text>
+        <View style={styles.fieldMain}>
+          <Text style={styles.fieldLabel}>
+            {compact ? `${label}(${suffix})` : label}
+          </Text>
+          <TradingNumericInput
+            accessibilityLabel={label}
+            accessibilityState={{ disabled: !editable }}
+            editable={editable}
+            maxFontSizeMultiplier={compact ? 1.1 : 1.3}
+            placeholder="0"
+            placeholderTextColor={colors.textSubtle}
+            selectTextOnFocus={editable}
+            style={styles.input}
+            value={value}
+            onChangeText={onChangeText}
+          />
+        </View>
+        {!compact ? <Text style={styles.suffix}>{suffix}</Text> : null}
         {actionLabel ? (
-          <Pressable style={styles.inlineAction} onPress={onActionPress}>
+          <Pressable
+            accessibilityHint={helperText}
+            accessibilityLabel={t('trading.fillBestPriceA11y')}
+            accessibilityRole="button"
+            accessibilityState={{ disabled: !editable }}
+            android_ripple={{ color: 'rgba(212, 175, 55, 0.12)' }}
+            disabled={!editable}
+            hitSlop={{ top: 9, bottom: 9 }}
+            style={({ pressed }) => [
+              styles.inlineAction,
+              pressed ? styles.pressed : null,
+            ]}
+            onPress={onActionPress}
+          >
             <Text style={styles.inlineActionText}>{actionLabel}</Text>
           </Pressable>
         ) : null}
@@ -201,7 +384,8 @@ function getTradeValue(
   orderType: TradeOrderType,
   lastPrice: number | null,
 ) {
-  const priceNumber = orderType === 'MARKET' ? lastPrice : Number(price.replace(/,/g, ''));
+  const priceNumber =
+    orderType === 'MARKET' ? lastPrice : Number(price.replace(/,/g, ''));
   const amountNumber = Number(amount);
   if (
     priceNumber === null ||
@@ -214,32 +398,34 @@ function getTradeValue(
 }
 
 const styles = StyleSheet.create({
+  pressed: { opacity: 0.72, transform: [{ scale: 0.98 }] },
+  submitPressed: { opacity: 0.86, transform: [{ scale: 0.992 }] },
   card: {
     flex: 1,
     height: '100%',
     minWidth: 0,
     justifyContent: 'space-between',
-    borderRadius: 6,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: colors.line,
     backgroundColor: colors.card,
-    padding: 8,
+    padding: 10,
   },
   topSection: {
-    minHeight: 70,
+    minHeight: 78,
   },
   sideTabs: {
     flexDirection: 'row',
-    borderRadius: 6,
+    borderRadius: 8,
     backgroundColor: colors.cardAlt,
-    padding: 2,
+    padding: 3,
   },
   sideTab: {
     flex: 1,
-    height: 29,
+    height: 34,
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: 5,
+    borderRadius: 7,
   },
   buyActive: {
     backgroundColor: colors.green,
@@ -250,7 +436,7 @@ const styles = StyleSheet.create({
   sideText: {
     ...typography.bold,
     color: colors.textMuted,
-    fontSize: 12,
+    fontSize: 13,
   },
   activeText: {
     color: colors.white,
@@ -261,61 +447,71 @@ const styles = StyleSheet.create({
     marginTop: 8,
   },
   typeTab: {
-    height: 26,
+    flex: 1,
+    height: 29,
+    alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: 10,
-    borderRadius: 5,
+    borderRadius: 7,
+    borderWidth: 1,
+    borderColor: colors.line,
     backgroundColor: colors.cardAlt,
   },
   typeActive: {
     backgroundColor: colors.primarySoft,
+    borderColor: 'rgba(214,168,50,0.52)',
   },
   typeText: {
     ...typography.medium,
     color: colors.text,
-    fontSize: 11,
+    fontSize: 12,
   },
   fieldWrap: {
     marginTop: 0,
   },
   inputSection: {
-    gap: 8,
+    gap: 10,
   },
   field: {
-    minHeight: 39,
+    minHeight: 50,
     flexDirection: 'row',
     alignItems: 'center',
-    borderRadius: 6,
+    borderRadius: 8,
     borderWidth: 1,
     borderColor: colors.line,
     backgroundColor: colors.bgElevated,
-    paddingHorizontal: 8,
+    paddingHorizontal: 9,
+  },
+  fieldMain: {
+    flex: 1,
+    minWidth: 0,
+    justifyContent: 'center',
   },
   fieldLabel: {
     color: colors.textSubtle,
-    fontSize: 10,
-    width: 30,
+    fontSize: 9,
+    lineHeight: 12,
   },
   input: {
     ...typography.number,
     flex: 1,
     minWidth: 0,
     color: colors.text,
-    fontSize: 12,
+    fontSize: 14,
+    lineHeight: 18,
     paddingVertical: 0,
   },
   suffix: {
-    marginLeft: 6,
+    marginLeft: 5,
     color: colors.textMuted,
     fontSize: 10,
   },
   inlineAction: {
-    width: 40,
-    height: 24,
+    width: 38,
+    height: 27,
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: 5,
-    marginLeft: 9,
+    borderRadius: 7,
+    marginLeft: 6,
     backgroundColor: colors.primarySoft,
     borderWidth: 1,
     borderColor: 'rgba(214,168,50,0.42)',
@@ -323,7 +519,7 @@ const styles = StyleSheet.create({
   inlineActionText: {
     ...typography.bold,
     color: colors.primary,
-    fontSize: 10,
+    fontSize: 11,
   },
   fieldHelp: {
     marginTop: 3,
@@ -336,24 +532,27 @@ const styles = StyleSheet.create({
   },
   percent: {
     flex: 1,
-    height: 23,
+    height: 27,
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: 5,
+    borderRadius: 7,
     backgroundColor: colors.cardAlt,
   },
   percentText: {
     ...typography.number,
     color: colors.textMuted,
-    fontSize: 10,
+    fontSize: 11,
     fontWeight: '700',
   },
+  percentTextCompact: {
+    fontSize: 9,
+  },
   metrics: {
-    minHeight: 74,
+    height: 76,
     justifyContent: 'center',
   },
   metaRow: {
-    minHeight: 21,
+    height: 23,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
@@ -361,31 +560,61 @@ const styles = StyleSheet.create({
   },
   metaLabel: {
     color: colors.textSubtle,
-    fontSize: 10,
+    fontSize: 11,
   },
   metaValue: {
     ...typography.number,
     flexShrink: 1,
     color: colors.textMuted,
-    fontSize: 10,
+    fontSize: 11,
     fontWeight: '700',
     textAlign: 'right',
   },
   loginHint: {
+    flex: 1,
     color: colors.textSubtle,
-    fontSize: 10,
-    lineHeight: 13,
+    fontSize: 11,
+    lineHeight: 15,
+  },
+  errorText: {
+    color: colors.red,
+  },
+  successText: {
+    color: colors.green,
   },
   bottomSection: {
-    minHeight: 61,
+    height: 84,
     justifyContent: 'flex-end',
   },
+  feedbackRow: {
+    height: 32,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  feedbackSpacer: {
+    flex: 1,
+  },
+  reviewButton: {
+    minHeight: 30,
+    paddingHorizontal: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.gold,
+    borderRadius: 8,
+  },
+  reviewButtonText: {
+    ...typography.bold,
+    color: colors.gold,
+    fontSize: 10,
+  },
   submit: {
-    height: 40,
+    height: 44,
     marginTop: 8,
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: 7,
+    borderRadius: 9,
   },
   loginButton: {
     backgroundColor: colors.green,
@@ -399,6 +628,9 @@ const styles = StyleSheet.create({
   submitText: {
     ...typography.bold,
     color: colors.white,
-    fontSize: 13,
+    fontSize: 14,
+  },
+  submitDisabled: {
+    opacity: 0.48,
   },
 });

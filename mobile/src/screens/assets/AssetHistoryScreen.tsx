@@ -1,7 +1,17 @@
-import React, {useCallback, useEffect, useMemo, useState} from 'react';
-import {StyleSheet, Text, View} from 'react-native';
-import {useNavigation} from '@react-navigation/native';
-import type {NativeStackNavigationProp} from '@react-navigation/native-stack';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import { FlatList, Platform, StyleSheet, Text, View } from 'react-native';
+import {
+  useNavigation,
+  useRoute,
+  type RouteProp,
+} from '@react-navigation/native';
+import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import AppScreen from '../../components/common/AppScreen';
 import PrimaryButton from '../../components/common/PrimaryButton';
 import {
@@ -14,47 +24,138 @@ import {
   SelectChips,
   StateCard,
   formatAmount,
-  toChineseError,
 } from '../../components/assets/action/ActionPrimitives';
-import type {RootStackParamList} from '../../navigation/types';
+import {
+  createTranslator,
+  useLanguage,
+  type TranslationKey,
+  type Translator,
+} from '../../i18n';
+import type { RootStackParamList } from '../../navigation/types';
 import {
   fetchAssetBalanceLogs,
   type AssetBalanceLogItem,
 } from '../../api/assets';
-import {useAuth} from '../../store/authStore';
-import {colors, typography} from '../../theme';
+import { useAuth } from '../../store/authStore';
+import { colors, typography } from '../../theme';
+import {
+  isPositiveDecimalText,
+  normalizeNonNegativeDecimalText,
+} from '../../utils/decimalText';
 
 type RootNavigation = NativeStackNavigationProp<RootStackParamList>;
-type FilterKey = 'all' | 'deposit' | 'withdraw' | 'transfer' | 'trade' | 'yield';
+export type AssetHistoryFilterKey =
+  | 'all'
+  | 'deposit'
+  | 'withdraw'
+  | 'userTransfer'
+  | 'transfer'
+  | 'trade'
+  | 'tradeFee'
+  | 'dividend'
+  | 'bdCommission'
+  | 'inviteReward';
 
 const pageSize = 20;
-const filters: Array<{value: FilterKey; label: string; serverBizType?: string}> = [
-  {value: 'all', label: '全部'},
-  {value: 'deposit', label: '充值', serverBizType: 'DEPOSIT'},
-  {value: 'withdraw', label: '提现', serverBizType: 'WITHDRAW'},
-  {value: 'transfer', label: '划转', serverBizType: 'TRANSFER'},
-  {value: 'trade', label: '交易', serverBizType: 'TRADE'},
-  {value: 'yield', label: '收益'},
+export const ASSET_HISTORY_FILTERS: Array<{
+  value: AssetHistoryFilterKey;
+  label: string;
+  labelKey: TranslationKey;
+  serverBizType?: string;
+}> = [
+  { value: 'all', label: '全部', labelKey: 'history.filter.all' },
+  {
+    value: 'deposit',
+    label: '充值',
+    labelKey: 'history.filter.deposit',
+    serverBizType: 'DEPOSIT',
+  },
+  {
+    value: 'withdraw',
+    label: '提现',
+    labelKey: 'history.filter.withdraw',
+    serverBizType: 'WITHDRAW_SUCCESS',
+  },
+  {
+    value: 'userTransfer',
+    label: '站内转账',
+    labelKey: 'history.filter.userTransfer',
+    serverBizType: 'USER_TRANSFER',
+  },
+  {
+    value: 'transfer',
+    label: '账户划转',
+    labelKey: 'history.filter.transfer',
+    serverBizType: 'TRANSFER',
+  },
+  {
+    value: 'trade',
+    label: '交易',
+    labelKey: 'history.filter.trade',
+    serverBizType: 'TRADE',
+  },
+  {
+    value: 'tradeFee',
+    label: '手续费',
+    labelKey: 'history.filter.tradeFee',
+    serverBizType: 'TRADE_FEE',
+  },
+  {
+    value: 'dividend',
+    label: '分红',
+    labelKey: 'history.filter.dividend',
+    serverBizType: 'DIVIDEND',
+  },
+  {
+    value: 'bdCommission',
+    label: 'BD佣金',
+    labelKey: 'history.filter.bdCommission',
+    serverBizType: 'BD_COMMISSION_CREDIT',
+  },
+  {
+    value: 'inviteReward',
+    label: '邀请奖励',
+    labelKey: 'history.filter.inviteReward',
+    serverBizType: 'USER_INVITE_COMMISSION_CREDIT',
+  },
 ];
 
 export default function AssetHistoryScreen() {
+  const { t } = useLanguage();
   const navigation = useNavigation<RootNavigation>();
-  const {isLoggedIn} = useAuth();
+  const route = useRoute<RouteProp<RootStackParamList, 'AssetHistory'>>();
+  const { isLoggedIn } = useAuth();
   const [items, setItems] = useState<AssetBalanceLogItem[]>([]);
-  const [filter, setFilter] = useState<FilterKey>('all');
+  const [filter, setFilter] = useState<AssetHistoryFilterKey>(
+    route.params?.initialFilter ?? 'all',
+  );
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState('');
+  const requestGenerationRef = useRef(0);
+  const loadingMoreRef = useRef(false);
+  const tRef = useRef(t);
 
-  const selectedFilter = filters.find(item => item.value === filter) ?? filters[0];
+  useEffect(() => {
+    tRef.current = t;
+  }, [t]);
+
+  const selectedFilter =
+    ASSET_HISTORY_FILTERS.find(item => item.value === filter) ??
+    ASSET_HISTORY_FILTERS[0];
   const hasMore = items.length < total;
 
   const loadPage = useCallback(
     async (nextPage: number, append: boolean) => {
       if (!isLoggedIn) return;
+      if (append && loadingMoreRef.current) return;
+      const generation = append
+        ? requestGenerationRef.current
+        : ++requestGenerationRef.current;
       if (append) {
+        loadingMoreRef.current = true;
         setLoadingMore(true);
       } else {
         setLoading(true);
@@ -64,19 +165,26 @@ export default function AssetHistoryScreen() {
         const response = await fetchAssetBalanceLogs(nextPage, pageSize, {
           bizType: selectedFilter.serverBizType,
         });
-        const nextItems = applyClientFilter(response.items, filter);
-        setItems(current => (append ? [...current, ...nextItems] : nextItems));
+        if (generation !== requestGenerationRef.current) return;
+        setItems(current =>
+          append ? mergeHistoryItems(current, response.items) : response.items,
+        );
         setPage(response.page);
         setTotal(response.total);
       } catch (requestError) {
-        if (!append) setItems([]);
-        setError(toChineseError(requestError, '资金流水加载失败，请稍后重试'));
+        if (generation !== requestGenerationRef.current) return;
+        setError(
+          getHistoryError(requestError, tRef.current('history.loadFailed')),
+        );
       } finally {
-        setLoading(false);
-        setLoadingMore(false);
+        if (generation === requestGenerationRef.current) {
+          setLoading(false);
+          setLoadingMore(false);
+        }
+        if (append) loadingMoreRef.current = false;
       }
     },
-    [filter, isLoggedIn, selectedFilter.serverBizType],
+    [isLoggedIn, selectedFilter.serverBizType],
   );
 
   useEffect(() => {
@@ -84,88 +192,139 @@ export default function AssetHistoryScreen() {
       setItems([]);
       setTotal(0);
       setError('');
+      requestGenerationRef.current += 1;
       return;
     }
     loadPage(1, false).catch(() => undefined);
+    return () => {
+      requestGenerationRef.current += 1;
+      loadingMoreRef.current = false;
+    };
   }, [isLoggedIn, loadPage]);
 
   const filterOptions = useMemo(
-    () => filters.map(item => ({value: item.value, label: item.label})),
-    [],
+    () =>
+      ASSET_HISTORY_FILTERS.map(item => ({
+        value: item.value,
+        label: t(item.labelKey),
+      })),
+    [t],
   );
 
   return (
-    <AppScreen>
-      <ActionHeader
-        title="资金流水"
-        subtitle="充值、提现、划转、交易和收益记录"
-        onBack={() => navigation.goBack()}
-        right={<RefreshButton disabled={loading} onPress={() => loadPage(1, false)} />}
-      />
-
-      {!isLoggedIn ? (
-        <AuthRequiredCard onLoginPress={() => navigation.navigate('Auth', {screen: 'Login'})} />
-      ) : (
-        <>
-          <ActionCard>
-            <SelectChips
-              label="筛选"
-              value={filter}
-              options={filterOptions}
-              onChange={value => {
-                setFilter(value as FilterKey);
-                setItems([]);
-                setTotal(0);
-              }}
+    <AppScreen scroll={false} contentStyle={styles.screen}>
+      <FlatList
+        contentContainerStyle={styles.listContent}
+        data={isLoggedIn && !loading ? items : []}
+        initialNumToRender={8}
+        keyExtractor={item => `${item.id}:${item.createdAt}`}
+        keyboardDismissMode={Platform.OS === 'ios' ? 'interactive' : 'on-drag'}
+        keyboardShouldPersistTaps="handled"
+        maxToRenderPerBatch={8}
+        removeClippedSubviews={Platform.OS === 'android'}
+        renderItem={({ item }) => <HistoryItem item={item} />}
+        showsVerticalScrollIndicator={false}
+        updateCellsBatchingPeriod={40}
+        windowSize={7}
+        ListHeaderComponent={
+          <>
+            <ActionHeader
+              title={t('history.title')}
+              subtitle={t('history.subtitle')}
+              backAccessibilityLabel={t('common.back')}
+              onBack={() => navigation.goBack()}
+              right={
+                <RefreshButton
+                  accessibilityLabel={t('history.refreshA11y')}
+                  disabled={loading}
+                  onPress={() => loadPage(1, false)}
+                />
+              }
             />
-            {error ? <InlineNotice tone="red">{error}</InlineNotice> : null}
-          </ActionCard>
-
-          {loading ? (
-            <StateCard title="正在加载资金流水" description="请稍候" />
-          ) : items.length === 0 ? (
-            <StateCard title="暂无资金流水" description="当前筛选条件下没有记录。" />
-          ) : (
-            <ActionCard>
-              <View style={styles.listHeader}>
-                <Text style={styles.cardTitle}>记录</Text>
-                <Text style={styles.totalText}>共 {total} 条</Text>
-              </View>
-              {items.map(item => (
-                <HistoryItem key={`${item.id}:${item.createdAt}`} item={item} />
-              ))}
-              {hasMore ? (
-                <View style={styles.loadMore}>
-                  <PrimaryButton
-                    title={loadingMore ? '加载中...' : '加载更多'}
-                    variant="secondary"
-                    disabled={loadingMore}
-                    onPress={() => loadPage(page + 1, true)}
+            {!isLoggedIn ? (
+              <AuthRequiredCard
+                actionTitle={t('history.goLogin')}
+                description={t('history.loginDescription')}
+                title={t('history.loginTitle')}
+                onLoginPress={() =>
+                  navigation.navigate('Auth', { screen: 'Login' })
+                }
+              />
+            ) : (
+              <>
+                <ActionCard>
+                  <SelectChips
+                    label={t('history.filter')}
+                    value={filter}
+                    options={filterOptions}
+                    onChange={value => {
+                      setFilter(value as AssetHistoryFilterKey);
+                      setItems([]);
+                      setTotal(0);
+                    }}
                   />
-                </View>
-              ) : null}
-            </ActionCard>
-          )}
-        </>
-      )}
+                  {error ? (
+                    <InlineNotice tone="red">{error}</InlineNotice>
+                  ) : null}
+                </ActionCard>
+                {loading ? (
+                  <StateCard
+                    title={t('history.loading')}
+                    description={t('common.pleaseWait')}
+                  />
+                ) : items.length === 0 ? (
+                  <StateCard
+                    title={t('history.empty')}
+                    description={t('history.emptyDescription')}
+                  />
+                ) : (
+                  <View style={styles.listHeader}>
+                    <Text style={styles.cardTitle}>{t('history.records')}</Text>
+                    <Text style={styles.totalText}>
+                      {t('history.total', { count: total })}
+                    </Text>
+                  </View>
+                )}
+              </>
+            )}
+          </>
+        }
+        ListFooterComponent={
+          isLoggedIn && !loading && items.length > 0 && hasMore ? (
+            <View style={styles.loadMore}>
+              <PrimaryButton
+                title={
+                  loadingMore ? t('history.loadingMore') : t('history.loadMore')
+                }
+                variant="secondary"
+                disabled={loadingMore}
+                onPress={() => loadPage(page + 1, true)}
+              />
+            </View>
+          ) : null
+        }
+      />
     </AppScreen>
   );
 }
 
-function HistoryItem({item}: {item: AssetBalanceLogItem}) {
-  const amount = Number(item.changeAmount);
-  const positive = Number.isFinite(amount) && amount > 0;
-  const negative = Number.isFinite(amount) && amount < 0;
-  const amountText = Number.isFinite(amount)
-    ? `${positive ? '+' : ''}${formatAmount(amount)}`
-    : item.changeAmount || '--';
+function HistoryItem({ item }: { item: AssetBalanceLogItem }) {
+  const { t } = useLanguage();
+  const rawAmount = item.changeAmount.trim();
+  const negative = rawAmount.startsWith('-');
+  const unsignedAmount = rawAmount.replace(/^[+-]/, '');
+  const amountValid = normalizeNonNegativeDecimalText(unsignedAmount) !== null;
+  const positive = !negative && isPositiveDecimalText(unsignedAmount);
+  const amountText = amountValid
+    ? `${positive ? '+' : ''}${formatAmount(item.changeAmount)}`
+    : '--';
   return (
     <View style={styles.item}>
       <View style={styles.itemTop}>
         <View style={styles.itemTitleWrap}>
-          <Text style={styles.itemType}>{mapLogType(item.bizType)}</Text>
+          <Text style={styles.itemType}>{mapLogType(item.bizType, t)}</Text>
           <Text style={styles.itemMeta}>
-            {item.coinSymbol || '--'} · {item.accountKey || '--'}
+            {item.coinSymbol || '--'} · {mapAccountLabel(item.accountKey, t)}
           </Text>
         </View>
         <Text
@@ -173,52 +332,192 @@ function HistoryItem({item}: {item: AssetBalanceLogItem}) {
             styles.amount,
             positive ? styles.amountPositive : null,
             negative ? styles.amountNegative : null,
-          ]}>
+          ]}
+        >
           {amountText} {item.coinSymbol || ''}
         </Text>
       </View>
-      <InfoRow label="时间" value={item.createdAt || '--'} />
-      <InfoRow label="账户 / chain_key" value={item.accountKey || '--'} />
-      <InfoRow label="备注" value={item.remark || '--'} />
+      <InfoRow label={t('history.time')} value={item.createdAt || '--'} />
+      <InfoRow
+        label={t('history.account')}
+        value={mapAccountLabel(item.accountKey, t)}
+      />
+      <InfoRow
+        label={t('history.remark')}
+        value={formatAssetLogRemark(item.remark, item.bizType, t)}
+      />
     </View>
   );
 }
 
-function applyClientFilter(items: AssetBalanceLogItem[], filter: FilterKey) {
-  if (filter === 'all') return items;
-  return items.filter(item => {
-    const type = item.bizType.toUpperCase();
-    if (filter === 'transfer') return type.includes('TRANSFER');
-    if (filter === 'yield') {
-      return (
-        type.includes('DIVIDEND') ||
-        type.includes('COMMISSION') ||
-        type.includes('REWARD') ||
-        type.includes('INVITE')
-      );
-    }
-    if (filter === 'deposit') return type.includes('DEPOSIT');
-    if (filter === 'withdraw') return type.includes('WITHDRAW');
-    if (filter === 'trade') return type.includes('TRADE') || type.includes('FEE');
-    return true;
-  });
+function mergeHistoryItems(
+  current: AssetBalanceLogItem[],
+  next: AssetBalanceLogItem[],
+) {
+  const byId = new Map(current.map(item => [item.id, item]));
+  next.forEach(item => byId.set(item.id, item));
+  return Array.from(byId.values());
 }
 
-function mapLogType(value: string) {
+const logTypeKeys: Record<string, TranslationKey> = {
+  FREEZE: 'history.type.freeze',
+  UNFREEZE: 'history.type.unfreeze',
+  TRANSFER_IN: 'history.type.transferIn',
+  TRANSFER_OUT: 'history.type.transferOut',
+  DEPOSIT: 'history.type.depositReceived',
+  CHAIN_DEPOSIT: 'history.type.depositReceived',
+  DEPOSIT_CONFIRM: 'history.type.depositReceived',
+  WITHDRAW: 'history.type.withdrawFreeze',
+  WITHDRAW_FREEZE: 'history.type.withdrawFreeze',
+  WITHDRAW_FEE_FREEZE: 'history.type.withdrawFeeFreeze',
+  WITHDRAW_SEND: 'history.type.withdrawSend',
+  WITHDRAW_SUCCESS: 'history.type.withdrawSuccess',
+  WITHDRAW_FEE_SUCCESS: 'history.type.withdrawFeeDeducted',
+  WITHDRAW_UNFREEZE: 'history.type.withdrawUnfreeze',
+  WITHDRAW_FEE_UNFREEZE: 'history.type.withdrawFeeUnfreeze',
+  WITHDRAW_CANCEL: 'history.type.withdrawCancel',
+  WITHDRAW_FEE_CANCEL: 'history.type.withdrawFeeCancel',
+  WITHDRAW_FAILED: 'history.type.withdrawFailed',
+  TRADE_BUY: 'history.type.spotBuy',
+  SPOT_BUY: 'history.type.spotBuy',
+  TRADE_SELL: 'history.type.spotSell',
+  SPOT_SELL: 'history.type.spotSell',
+  TRADE_FREEZE: 'history.type.tradeFreeze',
+  TRADE_UNFREEZE: 'history.type.tradeUnfreeze',
+  TRADE_FEE_DEBIT: 'history.type.tradeFeeDebit',
+  TRADE_FEE_CREDIT: 'history.type.tradeFeeCredit',
+  TRANSFER: 'history.type.accountTransfer',
+  USER_TRANSFER: 'history.type.userTransfer',
+  USER_TRANSFER_OUT: 'history.type.userTransferOut',
+  USER_TRANSFER_IN: 'history.type.userTransferIn',
+  ACCOUNT_TRANSFER: 'history.type.accountTransfer',
+  PLATFORM_ADJUST: 'history.type.accountAdjustment',
+  ADMIN_ADJUST: 'history.type.accountAdjustment',
+  MANUAL_ADJUST: 'history.type.accountAdjustment',
+  DIVIDEND_PAYOUT: 'history.type.dividendPaid',
+  BD_COMMISSION_PAYOUT: 'history.type.bdCommissionPaid',
+  USER_INVITE_COMMISSION_PAYOUT: 'history.type.inviteRewardPaid',
+  INVITE_REWARD: 'history.type.inviteReward',
+  STOCK_TOKEN_LOCK: 'history.type.stockTokenLock',
+  STOCK_TOKEN_RELEASE: 'history.type.stockTokenRelease',
+  STOCK_TOKEN_CONVERT: 'history.type.stockTokenConvert',
+  CONTRACT_TRANSFER_IN: 'history.type.contractTransferIn',
+  CONTRACT_TRANSFER_OUT: 'history.type.contractTransferOut',
+  CONTRACT_OPEN_MARGIN: 'history.type.contractOpenMargin',
+  CONTRACT_MARGIN_RELEASE: 'history.type.contractMarginRelease',
+  CONTRACT_REALIZED_PNL: 'history.type.contractRealizedPnl',
+  CONTRACT_LIQUIDATION: 'history.type.contractLiquidation',
+  LIQUIDATION_ZERO: 'history.type.liquidationZero',
+  CONTRACT_TRANSFER: 'history.type.transfer',
+  REALIZED_PNL: 'history.type.realizedPnl',
+  OPEN_MARGIN_FREEZE: 'history.type.openMarginFreeze',
+  OPEN_MARGIN_USED: 'history.type.openMarginUsed',
+  OPEN_FEE: 'history.type.openFee',
+  CLOSE_RELEASE: 'history.type.closeRelease',
+  CONTRACT_SPREAD_FEE: 'history.type.contractFee',
+  MATCHING_DIRTY_ORDER_RELEASE: 'history.type.abnormalRelease',
+  RCB_LOCK: 'history.type.rcbLock',
+  DIVIDEND_CREDIT: 'history.type.dividendCredit',
+  DIVIDEND_DEBIT: 'history.type.dividendDebit',
+  BD_COMMISSION_CREDIT: 'history.type.bdCredit',
+  BD_COMMISSION_DEBIT: 'history.type.bdDebit',
+  USER_INVITE_COMMISSION_CREDIT: 'history.type.inviteCredit',
+  USER_INVITE_COMMISSION_DEBIT: 'history.type.inviteDebit',
+};
+
+export function mapLogType(
+  value: string,
+  t: Translator = createTranslator('zh-CN'),
+) {
   const type = value.toUpperCase();
-  if (type.includes('DEPOSIT')) return '充值';
-  if (type.includes('WITHDRAW')) return '提现';
-  if (type.includes('TRANSFER')) return '划转';
-  if (type.includes('FEE')) return '手续费';
-  if (type.includes('TRADE')) return '交易';
-  if (type.includes('DIVIDEND')) return '分红';
-  if (type.includes('INVITE') || type.includes('REWARD')) return '邀请奖励';
-  if (type.includes('BD_COMMISSION')) return 'BD佣金';
-  if (type.includes('ADJUST')) return '调账';
-  return '其他';
+  const exactKey = logTypeKeys[type];
+  if (exactKey) return t(exactKey);
+  if (type.includes('DEPOSIT')) return t('history.type.deposit');
+  if (type.includes('WITHDRAW')) return t('history.type.withdraw');
+  if (type.includes('USER_TRANSFER')) return t('history.type.userTransfer');
+  if (type.includes('TRANSFER')) return t('history.type.transfer');
+  if (type.includes('FEE')) return t('history.type.fee');
+  if (type.includes('TRADE')) return t('history.type.trade');
+  if (type.includes('DIVIDEND')) return t('history.type.dividend');
+  if (type.includes('INVITE') || type.includes('REWARD')) {
+    return t('history.type.inviteReward');
+  }
+  if (type.includes('BD_COMMISSION')) return t('history.type.bdCommission');
+  if (type.includes('ADJUST')) return t('history.type.adjustment');
+  return t('history.type.other');
+}
+
+const remarkKeys: Record<string, TranslationKey> = {
+  'liquidation realized pnl': 'history.remark.liquidationPnl',
+  'liquidation margin release': 'history.remark.liquidationMarginRelease',
+  'liquidation position balance zeroed': 'history.remark.liquidationSettlement',
+  'contract close spread fee': 'history.remark.closeFee',
+  'contract open spread fee': 'history.remark.openFee',
+  'contract close margin release': 'history.remark.closeMarginRelease',
+  'close realized pnl': 'history.remark.closePnl',
+  'contract margin freeze': 'history.remark.contractMarginFreeze',
+  'contract margin release': 'history.remark.contractMarginRelease',
+  'open limit order margin frozen': 'history.remark.limitMarginFreeze',
+  'cancel contract limit order release frozen margin':
+    'history.remark.cancelMarginRelease',
+  'order created': 'history.remark.orderFreeze',
+  'order canceled': 'history.remark.orderCancel',
+  'order cancelled': 'history.remark.orderCancel',
+  'trade fee': 'history.remark.tradeFee',
+  'withdraw freeze': 'history.remark.withdrawFreeze',
+  'withdraw unfreeze': 'history.remark.withdrawUnfreeze',
+  'withdraw fee freeze': 'history.remark.withdrawFeeFreeze',
+  'deposit confirmed': 'history.remark.depositConfirmed',
+  'cancel unfreeze': 'history.remark.orderCancel',
+};
+
+export function formatAssetLogRemark(
+  rawRemark: string,
+  bizType: string,
+  t: Translator = createTranslator('zh-CN'),
+) {
+  const remark = rawRemark.trim();
+  if (!remark) return '--';
+  if (/[一-鿿]/.test(remark)) return remark;
+
+  const normalized = remark
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ')
+    .replace(/[;:,]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const exactKey = remarkKeys[normalized];
+  if (exactKey) return t(exactKey);
+  const prefix = Object.entries(remarkKeys).find(([key]) =>
+    normalized.startsWith(`${key} `),
+  );
+  if (prefix) return t(prefix[1]);
+
+  const typeLabel = mapLogType(bizType, t);
+  return typeLabel === t('history.type.other') ? '--' : typeLabel;
+}
+
+export function mapAccountLabel(
+  value: string,
+  t: Translator = createTranslator('zh-CN'),
+) {
+  const account = value.trim().toLowerCase();
+  if (account === 'funding') return t('assets.account.funding');
+  if (account === 'spot') return t('assets.account.spot');
+  if (account === 'contract') return t('assets.account.contract');
+  return t('assets.account.other');
+}
+
+function getHistoryError(error: unknown, fallback: string) {
+  if (error instanceof Error && /[一-鿿]/.test(error.message)) {
+    return error.message;
+  }
+  return fallback;
 }
 
 const styles = StyleSheet.create({
+  screen: { flex: 1 },
+  listContent: { paddingBottom: 16 },
   listHeader: {
     minHeight: 34,
     flexDirection: 'row',

@@ -1,10 +1,15 @@
 import React from 'react';
 import {Pressable, StyleSheet, View} from 'react-native';
-import type {LucideIcon} from 'lucide-react-native';
 import {colors} from '../../theme';
 
+type IconButtonIcon = React.ComponentType<{
+  color?: string;
+  size?: number;
+  strokeWidth?: number;
+}>;
+
 type Props = {
-  icon: LucideIcon;
+  icon: IconButtonIcon;
   accessibilityLabel: string;
   onPress?: () => void;
   badge?: boolean;
@@ -20,7 +25,9 @@ export default function IconButton({
     <Pressable
       accessibilityLabel={accessibilityLabel}
       accessibilityRole="button"
-      style={styles.button}
+      android_ripple={{color: colors.goldSoft, radius: 22}}
+      hitSlop={4}
+      style={({pressed}) => [styles.button, pressed ? styles.pressed : null]}
       onPress={onPress}>
       <Icon color={colors.text} size={21} strokeWidth={2.2} />
       {badge ? <View style={styles.badge} /> : null}
@@ -30,9 +37,9 @@ export default function IconButton({
 
 const styles = StyleSheet.create({
   button: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: colors.card,
@@ -49,5 +56,9 @@ const styles = StyleSheet.create({
     backgroundColor: colors.primary,
     borderWidth: 1,
     borderColor: colors.card,
+  },
+  pressed: {
+    opacity: 0.82,
+    transform: [{scale: 0.94}],
   },
 });

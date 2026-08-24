@@ -1,7 +1,13 @@
-import React, {useCallback, useEffect, useMemo, useState} from 'react';
-import {StyleSheet, Text, View} from 'react-native';
-import {useNavigation} from '@react-navigation/native';
-import type {NativeStackNavigationProp} from '@react-navigation/native-stack';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import { StyleSheet, Text, View } from 'react-native';
+import { useNavigation } from '@react-navigation/native';
+import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import AppScreen from '../../components/common/AppScreen';
 import PrimaryButton from '../../components/common/PrimaryButton';
 import {
@@ -19,7 +25,7 @@ import {
   maskMiddle,
   toChineseError,
 } from '../../components/assets/action/ActionPrimitives';
-import type {RootStackParamList} from '../../navigation/types';
+import type { RootStackParamList } from '../../navigation/types';
 import {
   confirmWithdraw,
   createWithdrawDraft,
@@ -32,26 +38,36 @@ import {
   type WithdrawCreateResponse,
   type WithdrawFeeEstimate,
 } from '../../api/assets';
-import {useAuth} from '../../store/authStore';
-import {colors, typography} from '../../theme';
+import { useAuth } from '../../store/authStore';
+import { useLanguage, type Translator } from '../../i18n';
+import { colors, typography } from '../../theme';
+import {
+  compareNonNegativeDecimalText,
+  isPositiveDecimalText,
+} from '../../utils/decimalText';
 
 type RootNavigation = NativeStackNavigationProp<RootStackParamList>;
 type Step = 'form' | 'verify' | 'done';
 
 export default function WithdrawScreen() {
   const navigation = useNavigation<RootNavigation>();
-  const {isLoggedIn} = useAuth();
+  const { isLoggedIn } = useAuth();
+  const { t } = useLanguage();
+  const tRef = useRef(t);
+  tRef.current = t;
   const [options, setOptions] = useState<AssetChainOption[]>([]);
   const [balances, setBalances] = useState<AssetAccountBalance[]>([]);
   const [defaultSymbol, setDefaultSymbol] = useState<string | null>(null);
   const [coin, setCoin] = useState('');
   const [network, setNetwork] = useState('');
   const [address, setAddress] = useState('');
-  const [memo, setMemo] = useState('');
   const [amount, setAmount] = useState('');
   const [code, setCode] = useState('');
   const [draft, setDraft] = useState<WithdrawCreateResponse | null>(null);
   const [fee, setFee] = useState<WithdrawFeeEstimate | null>(null);
+  const [feeFingerprint, setFeeFingerprint] = useState<string | null>(null);
+  const [feeError, setFeeError] = useState('');
+  const [feeRequestNonce, setFeeRequestNonce] = useState(0);
   const [step, setStep] = useState<Step>('form');
   const [loading, setLoading] = useState(false);
   const [feeLoading, setFeeLoading] = useState(false);
@@ -61,36 +77,84 @@ export default function WithdrawScreen() {
   const [cooldown, setCooldown] = useState(0);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
+  const mountedRef = useRef(true);
+  const dataControllerRef = useRef<AbortController | null>(null);
+  const dataGenerationRef = useRef(0);
+  const dataLoadLockRef = useRef(false);
+  const draftSubmitLockRef = useRef(false);
+  const codeSendLockRef = useRef(false);
+  const confirmLockRef = useRef(false);
 
   const loadData = useCallback(async () => {
-    if (!isLoggedIn) return;
+    if (!isLoggedIn || !mountedRef.current || dataLoadLockRef.current) return;
+    dataLoadLockRef.current = true;
+    const generation = ++dataGenerationRef.current;
+    const controller = new AbortController();
+    dataControllerRef.current?.abort();
+    dataControllerRef.current = controller;
     setLoading(true);
     setError('');
     try {
       const [optionResult, balanceRows] = await Promise.all([
-        fetchWithdrawOptions(),
-        fetchAssetAccountBalances(),
+        fetchWithdrawOptions({ signal: controller.signal }),
+        fetchAssetAccountBalances({ signal: controller.signal }),
       ]);
+      if (
+        !mountedRef.current ||
+        controller.signal.aborted ||
+        generation !== dataGenerationRef.current
+      ) {
+        return;
+      }
       setOptions(optionResult.items.filter(isWithdrawOptionEnabled));
       setDefaultSymbol(optionResult.defaultAssetSymbol ?? null);
       setBalances(balanceRows);
     } catch (requestError) {
+      if (
+        !mountedRef.current ||
+        controller.signal.aborted ||
+        generation !== dataGenerationRef.current
+      ) {
+        return;
+      }
       setOptions([]);
       setBalances([]);
-      setError(toChineseError(requestError, '提现配置加载失败，请稍后重试'));
+      setError(
+        toChineseError(
+          requestError,
+          tRef.current('withdraw.loadFailed'),
+          tRef.current,
+        ),
+      );
     } finally {
-      setLoading(false);
+      if (generation === dataGenerationRef.current) {
+        dataLoadLockRef.current = false;
+        if (dataControllerRef.current === controller) {
+          dataControllerRef.current = null;
+        }
+        if (mountedRef.current && !controller.signal.aborted) {
+          setLoading(false);
+        }
+      }
     }
   }, [isLoggedIn]);
 
   useEffect(() => {
+    mountedRef.current = true;
     if (!isLoggedIn) {
       setOptions([]);
       setBalances([]);
       setError('');
-      return;
+      return undefined;
     }
     loadData().catch(() => undefined);
+    return () => {
+      mountedRef.current = false;
+      dataGenerationRef.current += 1;
+      dataLoadLockRef.current = false;
+      dataControllerRef.current?.abort();
+      dataControllerRef.current = null;
+    };
   }, [isLoggedIn, loadData]);
 
   useEffect(() => {
@@ -102,17 +166,19 @@ export default function WithdrawScreen() {
   }, [cooldown]);
 
   const coinOptions = useMemo(() => {
-    const map = new Map<string, {label: string; sort: number}>();
+    const map = new Map<string, { label: string; sort: number }>();
     options.forEach(item => {
       if (!item.coinSymbol || map.has(item.coinSymbol)) return;
       map.set(item.coinSymbol, {
-        label: item.coinName ? `${item.coinSymbol} ${item.coinName}` : item.coinSymbol,
+        label: item.coinName
+          ? `${item.coinSymbol} ${item.coinName}`
+          : item.coinSymbol,
         sort: item.withdrawSortOrder ?? 100,
       });
     });
     return Array.from(map.entries())
       .sort((a, b) => a[1].sort - b[1].sort || a[0].localeCompare(b[0]))
-      .map(([value, meta]) => ({value, label: meta.label}));
+      .map(([value, meta]) => ({ value, label: meta.label }));
   }, [options]);
 
   const selectedCoin = useMemo(() => {
@@ -130,7 +196,9 @@ export default function WithdrawScreen() {
         .sort(
           (a, b) =>
             (a.withdrawSortOrder ?? 100) - (b.withdrawSortOrder ?? 100) ||
-            (a.chainName || a.chainKey).localeCompare(b.chainName || b.chainKey),
+            (a.chainName || a.chainKey).localeCompare(
+              b.chainName || b.chainKey,
+            ),
         ),
     [options, selectedCoin],
   );
@@ -141,7 +209,8 @@ export default function WithdrawScreen() {
   }, [network, networkOptions]);
 
   const selectedOption = useMemo(
-    () => networkOptions.find(item => item.chainKey === selectedNetwork) ?? null,
+    () =>
+      networkOptions.find(item => item.chainKey === selectedNetwork) ?? null,
     [networkOptions, selectedNetwork],
   );
 
@@ -151,45 +220,94 @@ export default function WithdrawScreen() {
         item.accountKey.toLowerCase() === 'funding' &&
         item.symbol.toUpperCase() === selectedCoin,
     );
-    return row?.available ?? 0;
+    const available = row?.available ?? 0;
+    return {
+      text:
+        row?.availableText ??
+        (Number.isFinite(available) ? String(available) : '0'),
+    };
   }, [balances, selectedCoin]);
 
-  const memoVisible = Boolean(selectedOption?.memoRequired || selectedOption?.memoLabel);
-  const amountNumber = Number(amount);
-  const amountValid = Number.isFinite(amountNumber) && amountNumber > 0;
+  const amountValid = isPositiveDecimalText(amount);
+  const amountExceedsBalance =
+    compareNonNegativeDecimalText(amount, fundingBalance.text) === 1;
+  const currentFeeFingerprint = buildWithdrawFeeFingerprint({
+    address,
+    amount,
+    network: selectedNetwork,
+    symbol: selectedCoin,
+  });
+  const feeReady = isWithdrawFeeReady(
+    fee,
+    feeFingerprint,
+    currentFeeFingerprint,
+  );
   const submitDisabled =
     submitting ||
+    feeLoading ||
+    !feeReady ||
+    Boolean(feeError) ||
     !selectedCoin ||
     !selectedNetwork ||
     !address.trim() ||
     !amountValid ||
-    amountNumber > fundingBalance;
+    amountExceedsBalance;
 
   useEffect(() => {
     setFee(null);
-    if (!isLoggedIn || !selectedCoin || !selectedNetwork || !amountValid) return;
+    setFeeFingerprint(null);
+    setFeeError('');
+    setFeeLoading(false);
+    if (!isLoggedIn || !selectedCoin || !selectedNetwork || !amountValid)
+      return;
     let alive = true;
+    const controller = new AbortController();
     setFeeLoading(true);
     const timer = setTimeout(async () => {
       try {
-        const result = await fetchWithdrawFee({
-          symbol: selectedCoin,
-          network: selectedNetwork,
-          amount,
-          toAddress: address.trim() || undefined,
-        });
-        if (alive) setFee(result);
-      } catch {
-        if (alive) setFee(null);
+        const result = await fetchWithdrawFee(
+          {
+            symbol: selectedCoin,
+            network: selectedNetwork,
+            amount,
+            toAddress: address.trim() || undefined,
+          },
+          { signal: controller.signal },
+        );
+        if (alive) {
+          setFee(result);
+          setFeeFingerprint(currentFeeFingerprint);
+        }
+      } catch (requestError) {
+        if (alive) {
+          setFee(null);
+          setFeeError(
+            toChineseError(
+              requestError,
+              tRef.current('withdraw.feeFailed'),
+              tRef.current,
+            ),
+          );
+        }
       } finally {
         if (alive) setFeeLoading(false);
       }
     }, 450);
     return () => {
       alive = false;
+      controller.abort();
       clearTimeout(timer);
     };
-  }, [address, amount, amountValid, isLoggedIn, selectedCoin, selectedNetwork]);
+  }, [
+    address,
+    amount,
+    amountValid,
+    feeRequestNonce,
+    currentFeeFingerprint,
+    isLoggedIn,
+    selectedCoin,
+    selectedNetwork,
+  ]);
 
   const resetFlow = useCallback(() => {
     setStep('form');
@@ -206,7 +324,6 @@ export default function WithdrawScreen() {
       setNetwork('');
       setAmount('');
       setAddress('');
-      setMemo('');
       resetFlow();
     },
     [resetFlow],
@@ -216,40 +333,53 @@ export default function WithdrawScreen() {
     (nextNetwork: string) => {
       setNetwork(nextNetwork);
       setAddress('');
-      setMemo('');
       resetFlow();
     },
     [resetFlow],
   );
 
   const submitDraft = useCallback(async () => {
+    if (draftSubmitLockRef.current) return;
     setError('');
     setMessage('');
     if (!selectedCoin) {
-      setError('请选择提现币种');
+      setError(tRef.current('withdraw.selectCoin'));
       return;
     }
     if (!selectedNetwork) {
-      setError('请选择提现网络');
+      setError(tRef.current('withdraw.selectNetwork'));
       return;
     }
     if (!address.trim()) {
-      setError('请输入提现地址');
+      setError(tRef.current('withdraw.enterAddress'));
       return;
     }
     if (!amountValid) {
-      setError('请输入正确的提现数量');
+      setError(tRef.current('withdraw.invalidAmount'));
       return;
     }
-    if (amountNumber > fundingBalance) {
-      setError('资金账户可用余额不足');
+    if (amountExceedsBalance) {
+      setError(tRef.current('withdraw.insufficientFunding'));
       return;
     }
-    if (selectedOption?.minWithdraw && amountNumber < Number(selectedOption.minWithdraw)) {
-      setError(`最小提现数量为 ${selectedOption.minWithdraw} ${selectedCoin}`);
+    if (
+      selectedOption?.minWithdraw &&
+      compareNonNegativeDecimalText(amount, selectedOption.minWithdraw) === -1
+    ) {
+      setError(
+        tRef.current('withdraw.minimumAmount', {
+          amount: formatAmount(selectedOption.minWithdraw),
+          symbol: selectedCoin,
+        }),
+      );
+      return;
+    }
+    if (!feeReady || feeError) {
+      setError(tRef.current('withdraw.requireFee'));
       return;
     }
 
+    draftSubmitLockRef.current = true;
     setSubmitting(true);
     try {
       const result = await createWithdrawDraft({
@@ -258,99 +388,184 @@ export default function WithdrawScreen() {
         toAddress: address,
         amount,
       });
+      if (!mountedRef.current) return;
       setDraft(result);
-      if (result.needManualReview || result.status.toUpperCase() === 'REVIEWING') {
+      if (
+        result.needManualReview ||
+        result.status.toUpperCase() === 'REVIEWING'
+      ) {
         setStep('done');
-        setMessage('提现申请已提交审核，请在资金流水或提现记录中查看进度。');
+        setMessage(tRef.current('withdraw.reviewSubmitted'));
       } else {
         setStep('verify');
-        setMessage('提现申请已创建，请点击发送邮箱验证码后完成确认。');
+        setMessage(tRef.current('withdraw.verifyCreated'));
       }
     } catch (requestError) {
-      setError(toChineseError(requestError, '提现提交失败，请稍后重试'));
+      if (mountedRef.current) {
+        setError(
+          toChineseError(
+            requestError,
+            tRef.current('withdraw.submitFailed'),
+            tRef.current,
+          ),
+        );
+      }
     } finally {
-      setSubmitting(false);
+      draftSubmitLockRef.current = false;
+      if (mountedRef.current) setSubmitting(false);
     }
   }, [
     address,
     amount,
-    amountNumber,
     amountValid,
-    fundingBalance,
+    amountExceedsBalance,
+    feeError,
+    feeReady,
     selectedCoin,
     selectedNetwork,
     selectedOption?.minWithdraw,
   ]);
 
   const sendCode = useCallback(async () => {
-    if (!draft?.withdrawId || cooldown > 0) return;
+    if (codeSendLockRef.current || cooldown > 0) return;
+    if (!draft?.withdrawId) {
+      setError(tRef.current('withdraw.missingId'));
+      return;
+    }
+    codeSendLockRef.current = true;
     setCodeSending(true);
     setError('');
     try {
       await sendWithdrawCode(draft.withdrawId);
-      setCooldown(60);
-      setMessage('验证码已发送，请查看注册邮箱。');
+      if (mountedRef.current) {
+        setCooldown(60);
+        setMessage(tRef.current('withdraw.codeSent'));
+      }
     } catch (requestError) {
-      setError(toChineseError(requestError, '验证码发送失败，请稍后重试'));
+      if (mountedRef.current) {
+        setError(
+          toChineseError(
+            requestError,
+            tRef.current('withdraw.codeFailed'),
+            tRef.current,
+          ),
+        );
+      }
     } finally {
-      setCodeSending(false);
+      codeSendLockRef.current = false;
+      if (mountedRef.current) setCodeSending(false);
     }
   }, [cooldown, draft?.withdrawId]);
 
   const confirm = useCallback(async () => {
-    if (!draft?.withdrawId) return;
-    if (!code.trim()) {
-      setError('请输入邮箱验证码');
+    if (confirmLockRef.current) return;
+    if (!draft?.withdrawId) {
+      setError(tRef.current('withdraw.missingId'));
       return;
     }
+    if (!code.trim()) {
+      setError(tRef.current('withdraw.enterCode'));
+      return;
+    }
+    confirmLockRef.current = true;
     setConfirming(true);
     setError('');
     try {
-      const result = await confirmWithdraw({withdrawId: draft.withdrawId, code});
+      const result = await confirmWithdraw({
+        withdrawId: draft.withdrawId,
+        code,
+      });
+      if (!mountedRef.current) return;
       setStep('done');
       setDraft(current =>
         current
           ? {
               ...current,
               status: result.status,
-              feeEstimate: result.feeFinal || current.feeEstimate,
-              feeCoin: result.feeCoin || current.feeCoin,
+              feeEstimate: result.feeFinal,
+              feeCoin: result.feeCoin,
               receiveAmount: result.receiveAmount || current.receiveAmount,
             }
           : current,
       );
-      setMessage(`提现已提交，当前状态：${mapWithdrawStatus(result.status)}`);
+      setMessage(
+        tRef.current('withdraw.submittedResult', {
+          status: mapWithdrawStatus(result.status, tRef.current),
+        }),
+      );
       await loadData();
     } catch (requestError) {
-      setError(toChineseError(requestError, '提现确认失败，请稍后重试'));
+      if (mountedRef.current) {
+        setError(
+          toChineseError(
+            requestError,
+            tRef.current('withdraw.confirmFailed'),
+            tRef.current,
+          ),
+        );
+      }
     } finally {
-      setConfirming(false);
+      confirmLockRef.current = false;
+      if (mountedRef.current) setConfirming(false);
     }
   }, [code, draft?.withdrawId, loadData]);
 
   return (
     <AppScreen>
       <ActionHeader
-        title="提现"
-        subtitle="复用后端审核与邮箱验证码流程"
+        title={t('withdraw.title')}
+        subtitle={t('withdraw.subtitle')}
         onBack={() => navigation.goBack()}
         right={<RefreshButton disabled={loading} onPress={loadData} />}
       />
 
+      <ActionCard>
+        <SelectChips
+          label={t('withdraw.method')}
+          value="onchain"
+          options={[
+            { value: 'onchain', label: t('withdraw.method.onchain') },
+            { value: 'internal', label: t('withdraw.method.internal') },
+          ]}
+          onChange={value => {
+            if (value === 'internal') navigation.navigate('AssetUserTransfer');
+          }}
+        />
+      </ActionCard>
+
       {!isLoggedIn ? (
-        <AuthRequiredCard onLoginPress={() => navigation.navigate('Auth', {screen: 'Login'})} />
+        <AuthRequiredCard
+          onLoginPress={() => navigation.navigate('Auth', { screen: 'Login' })}
+        />
       ) : loading ? (
-        <StateCard title="正在加载提现配置" description="请稍候" />
+        <StateCard
+          title={t('withdraw.loadingConfig')}
+          description={t('assetAction.loading')}
+        />
       ) : error && options.length === 0 ? (
-        <StateCard title="加载失败" description={error} actionTitle="重试" onActionPress={loadData} />
+        <StateCard
+          title={t('assetAction.loadFailed')}
+          description={error}
+          actionTitle={t('assetAction.retry')}
+          onActionPress={loadData}
+        />
       ) : coinOptions.length === 0 ? (
-        <StateCard title="暂无可提现网络" description="后台当前没有开启可提现的币种或网络。" />
+        <StateCard
+          title={t('withdraw.noNetworks')}
+          description={t('withdraw.noNetworksDescription')}
+        />
       ) : (
         <>
           <ActionCard>
-            <SelectChips label="币种" value={selectedCoin} options={coinOptions} onChange={changeCoin} />
             <SelectChips
-              label="网络"
+              label={t('assetAction.coin')}
+              value={selectedCoin}
+              options={coinOptions}
+              onChange={changeCoin}
+              searchable
+            />
+            <SelectChips
+              label={t('assetAction.network')}
               value={selectedNetwork}
               options={networkOptions.map(item => ({
                 value: item.chainKey,
@@ -358,77 +573,101 @@ export default function WithdrawScreen() {
                 meta: item.chainId ? String(item.chainId) : undefined,
               }))}
               onChange={changeNetwork}
+              searchable
             />
             <ActionTextField
-              label="提现地址"
+              label={t('withdraw.address')}
+              maxLength={256}
               value={address}
               onChangeText={value => {
                 setAddress(value);
                 resetFlow();
               }}
-              placeholder="请输入外部收款地址"
+              placeholder={t('withdraw.addressPlaceholder')}
             />
-            {memoVisible ? (
-              <ActionTextField
-                label={selectedOption?.memoLabel || 'Memo/Tag'}
-                value={memo}
-                onChangeText={setMemo}
-                placeholder="请输入 Memo/Tag"
-              />
-            ) : null}
             <ActionTextField
-              label="数量"
+              label={t('assetAction.amount')}
+              maxLength={85}
               value={amount}
               keyboardType="decimal-pad"
               onChangeText={value => {
                 setAmount(value.replace(/[^0-9.]/g, ''));
                 resetFlow();
               }}
-              placeholder="请输入提现数量"
+              placeholder={t('withdraw.amountPlaceholder')}
               right={
                 <SmallTextButton
-                  title="全部"
+                  title={t('assetAction.all')}
                   onPress={() => {
-                    setAmount(fundingBalance > 0 ? String(fundingBalance) : '');
+                    setAmount(
+                      isPositiveDecimalText(fundingBalance.text)
+                        ? fundingBalance.text
+                        : '',
+                    );
                     resetFlow();
                   }}
                 />
               }
             />
             <View style={styles.infoBlock}>
-              <InfoRow label="资金账户可用" value={`${formatAmount(fundingBalance)} ${selectedCoin}`} />
               <InfoRow
-                label="手续费"
-                value={
-                  feeLoading
-                    ? '计算中...'
-                    : fee?.fee
-                      ? `${formatAmount(fee.fee)} ${fee.feeCoin || 'USDT'}`
-                      : selectedOption?.withdrawFee
-                        ? `${selectedOption.withdrawFee} USDT`
-                        : '--'
-                }
+                label={t('withdraw.fundingAvailable')}
+                value={`${formatAmount(fundingBalance.text)} ${selectedCoin}`}
               />
               <InfoRow
-                label="最小提现"
+                label={t('assetAction.fee')}
                 value={
-                  selectedOption?.minWithdraw
-                    ? `${selectedOption.minWithdraw} ${selectedCoin}`
+                  feeLoading
+                    ? t('withdraw.calculating')
+                    : fee
+                    ? `${formatAmount(fee.fee)} ${fee.feeCoin}`
                     : '--'
                 }
               />
-              <InfoRow label="最大提现" value={`${formatAmount(fundingBalance)} ${selectedCoin}`} />
+              <InfoRow
+                label={t('withdraw.minAmount')}
+                value={
+                  selectedOption?.minWithdraw
+                    ? `${formatAmount(
+                        selectedOption.minWithdraw,
+                      )} ${selectedCoin}`
+                    : '--'
+                }
+              />
+              <InfoRow
+                label={t('withdraw.maxAmount')}
+                value={`${formatAmount(fundingBalance.text)} ${selectedCoin}`}
+              />
             </View>
-            {selectedOption?.riskTip ? <InlineNotice>{selectedOption.riskTip}</InlineNotice> : null}
-            {amountNumber > fundingBalance ? (
-              <InlineNotice tone="red">资金账户可用余额不足</InlineNotice>
+            {selectedOption?.riskTip ? (
+              <InlineNotice>{selectedOption.riskTip}</InlineNotice>
+            ) : null}
+            {feeError ? (
+              <View style={styles.feeError}>
+                <InlineNotice tone="red">{feeError}</InlineNotice>
+                <SmallTextButton
+                  title={t('withdraw.recalculateFee')}
+                  onPress={() => setFeeRequestNonce(current => current + 1)}
+                />
+              </View>
+            ) : null}
+            {amountExceedsBalance ? (
+              <InlineNotice tone="red">
+                {t('withdraw.insufficientFunding')}
+              </InlineNotice>
             ) : null}
             {error ? <InlineNotice tone="red">{error}</InlineNotice> : null}
-            {message ? <InlineNotice tone="green">{message}</InlineNotice> : null}
+            {message ? (
+              <InlineNotice tone="green">{message}</InlineNotice>
+            ) : null}
             {step === 'form' ? (
               <View style={styles.buttonWrap}>
                 <PrimaryButton
-                  title={submitting ? '提交中...' : '提交提现申请'}
+                  title={
+                    submitting
+                      ? t('withdraw.submitting')
+                      : t('withdraw.submitRequest')
+                  }
                   disabled={submitDisabled}
                   onPress={submitDraft}
                 />
@@ -438,54 +677,76 @@ export default function WithdrawScreen() {
 
           {draft ? (
             <ActionCard>
-              <Text style={styles.cardTitle}>提现申请</Text>
-              <InfoRow label="单号" value={String(draft.withdrawId)} />
-              <InfoRow label="状态" value={mapWithdrawStatus(draft.status)} tone="gold" />
-              <InfoRow label="币种" value={draft.symbol || selectedCoin} />
-              <InfoRow label="网络" value={draft.chainKey || selectedNetwork} />
-              <InfoRow label="地址" value={maskMiddle(draft.toAddress || address)} mono />
-              <InfoRow label="数量" value={`${draft.amount || amount} ${draft.symbol || selectedCoin}`} />
+              <Text style={styles.cardTitle}>{t('withdraw.requestTitle')}</Text>
               <InfoRow
-                label="手续费"
-                value={
-                  draft.feeEstimate
-                    ? `${draft.feeEstimate} ${draft.feeCoin || 'USDT'}`
-                    : '--'
-                }
+                label={t('withdraw.orderNo')}
+                value={String(draft.withdrawId)}
               />
-              {draft.riskReason ? <InlineNotice>{draft.riskReason}</InlineNotice> : null}
+              <InfoRow
+                label={t('assetAction.status')}
+                value={mapWithdrawStatus(draft.status, t)}
+                tone="gold"
+              />
+              <InfoRow label={t('assetAction.coin')} value={draft.symbol} />
+              <InfoRow
+                label={t('assetAction.network')}
+                value={draft.chainKey}
+              />
+              <InfoRow
+                label={t('assetAction.address')}
+                value={maskMiddle(draft.toAddress)}
+                mono
+              />
+              <InfoRow
+                label={t('assetAction.amount')}
+                value={`${draft.amount} ${draft.symbol}`}
+              />
+              <InfoRow
+                label={t('assetAction.fee')}
+                value={`${draft.feeEstimate} ${draft.feeCoin}`}
+              />
+              {draft.needManualReview ? (
+                <InlineNotice>{t('withdraw.manualReviewNotice')}</InlineNotice>
+              ) : null}
             </ActionCard>
           ) : null}
 
           {step === 'verify' && draft ? (
             <ActionCard>
-              <Text style={styles.cardTitle}>邮箱验证</Text>
-              <Text style={styles.desc}>
-                获取验证码必须由你手动点击触发，验证码通过后后端会冻结余额并进入后续处理。
+              <Text style={styles.cardTitle}>
+                {t('withdraw.emailVerification')}
               </Text>
+              <Text style={styles.desc}>{t('withdraw.emailDescription')}</Text>
               <View style={styles.codeRow}>
                 <PrimaryButton
                   title={
                     cooldown > 0
-                      ? `${cooldown}s 后重发`
+                      ? t('withdraw.resendAfter', { seconds: cooldown })
                       : codeSending
-                        ? '发送中...'
-                        : '发送验证码'
+                      ? t('withdraw.sending')
+                      : t('withdraw.sendCode')
                   }
                   disabled={codeSending || cooldown > 0}
                   onPress={sendCode}
                 />
               </View>
               <ActionTextField
-                label="邮箱验证码"
+                label={t('withdraw.emailCode')}
+                maxLength={6}
                 value={code}
-                onChangeText={value => setCode(value.replace(/\D/g, '').slice(0, 6))}
+                onChangeText={value =>
+                  setCode(value.replace(/\D/g, '').slice(0, 6))
+                }
                 keyboardType="number-pad"
-                placeholder="请输入验证码"
+                placeholder={t('withdraw.codePlaceholder')}
               />
               <View style={styles.buttonWrap}>
                 <PrimaryButton
-                  title={confirming ? '确认中...' : '确认提交'}
+                  title={
+                    confirming
+                      ? t('withdraw.confirming')
+                      : t('withdraw.confirmSubmit')
+                  }
                   disabled={confirming || !code.trim()}
                   onPress={confirm}
                 />
@@ -495,18 +756,22 @@ export default function WithdrawScreen() {
 
           {step === 'done' && draft ? (
             <ActionCard>
-              <Text style={styles.cardTitle}>当前结果</Text>
+              <Text style={styles.cardTitle}>
+                {t('withdraw.currentResult')}
+              </Text>
               <Text style={styles.resultText}>
-                {message || `当前状态：${mapWithdrawStatus(draft.status)}`}
+                {message ||
+                  t('withdraw.currentStatus', {
+                    status: mapWithdrawStatus(draft.status, t),
+                  })}
               </Text>
               <View style={styles.buttonWrap}>
                 <PrimaryButton
-                  title="继续提现"
+                  title={t('withdraw.continue')}
                   variant="secondary"
                   onPress={() => {
                     setAmount('');
                     setAddress('');
-                    setMemo('');
                     resetFlow();
                   }}
                 />
@@ -519,31 +784,79 @@ export default function WithdrawScreen() {
   );
 }
 
-function isWithdrawOptionEnabled(item: AssetChainOption) {
+export function isWithdrawOptionEnabled(item: AssetChainOption) {
   return (
     item.enabled !== false &&
     item.assetEnabled !== false &&
     item.chainEnabled !== false &&
     item.assetChainEnabled !== false &&
-    item.withdrawEnabled !== false
+    item.withdrawEnabled !== false &&
+    item.memoRequired !== true
   );
 }
 
-function mapWithdrawStatus(status: string) {
+export function buildWithdrawFeeFingerprint({
+  address,
+  amount,
+  network,
+  symbol,
+}: {
+  address: string;
+  amount: string;
+  network: string;
+  symbol: string;
+}) {
+  return JSON.stringify([
+    symbol.trim().toUpperCase(),
+    network.trim().toLowerCase(),
+    amount.trim(),
+    address.trim(),
+  ]);
+}
+
+export function isWithdrawFeeReady(
+  fee: WithdrawFeeEstimate | null,
+  feeFingerprint: string | null,
+  currentFingerprint: string,
+) {
+  return Boolean(
+    fee && feeFingerprint && feeFingerprint === currentFingerprint,
+  );
+}
+
+function mapWithdrawStatus(status: string, t: Translator) {
   const normalized = status.toUpperCase();
-  if (normalized === 'REVIEWING') return '已提交审核';
-  if (normalized === 'VERIFYING') return '待邮箱验证';
-  if (normalized === 'FROZEN') return '已提交，待处理';
-  if (normalized === 'PROCESSING' || normalized === 'SENDING') return '处理中';
-  if (normalized === 'SENT' || normalized === 'SUCCESS') return '已完成';
-  if (normalized === 'FAILED') return '失败';
-  if (normalized === 'CANCELED' || normalized === 'CANCELLED') return '已取消';
-  return status || '--';
+  if (normalized === 'REVIEWING') {
+    return t('withdraw.status.reviewing');
+  }
+  if (normalized === 'VERIFYING') {
+    return t('withdraw.status.verifying');
+  }
+  if (normalized === 'FROZEN') {
+    return t('withdraw.status.frozen');
+  }
+  if (normalized === 'PROCESSING' || normalized === 'SENDING') {
+    return t('withdraw.status.processing');
+  }
+  if (normalized === 'SENT' || normalized === 'SUCCESS') {
+    return t('withdraw.status.completed');
+  }
+  if (normalized === 'FAILED') {
+    return t('withdraw.status.failed');
+  }
+  if (normalized === 'CANCELED' || normalized === 'CANCELLED') {
+    return t('withdraw.status.canceled');
+  }
+  return t('withdraw.status.updating');
 }
 
 const styles = StyleSheet.create({
   infoBlock: {
     marginTop: 12,
+  },
+  feeError: {
+    alignItems: 'flex-start',
+    gap: 6,
   },
   buttonWrap: {
     marginTop: 14,

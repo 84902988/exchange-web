@@ -1,7 +1,20 @@
-import React from 'react';
-import {Pressable, StyleSheet, Text, TextInput, View} from 'react-native';
-import {formatContractNumber, type ContractOrderType} from '../../api/contract';
-import {colors, typography} from '../../theme';
+import React, { useState } from 'react';
+import {
+  Pressable,
+  StyleSheet,
+  Text,
+  useWindowDimensions,
+  View,
+} from 'react-native';
+import { ChevronDown } from 'lucide-react-native';
+import {
+  formatContractNumber,
+  type ContractOrderType,
+} from '../../api/contract';
+import { useLanguage } from '../../i18n';
+import { colors, typography } from '../../theme';
+import TradingNumericInput from '../common/TradingNumericInput';
+import ContractLeverageSelectorSheet from './ContractLeverageSelectorSheet';
 
 export type ContractActionMode = 'OPEN' | 'CLOSE';
 export type ContractDirection = 'LONG' | 'SHORT';
@@ -13,22 +26,34 @@ type Props = {
   price: string;
   quantity: string;
   leverage: number;
+  maxLeverage: number | null;
   availableMargin: number | null;
   equity: number | null;
   lastPrice: number | null;
   markPrice: number | null;
   spreadFeePrice: number | null | undefined;
   pricePrecision: number;
+  baseAsset: string;
+  quoteAsset: string;
   isLoggedIn: boolean;
+  submitting: boolean;
+  submitDisabled: boolean;
+  feedbackText: string;
+  feedbackTone: 'error' | 'success' | null;
+  pendingIntentReviewVisible?: boolean;
+  pendingIntentReviewBusy?: boolean;
+  pendingIntentReviewLabel?: string;
   onActionModeChange: (mode: ContractActionMode) => void;
   onDirectionChange: (direction: ContractDirection) => void;
   onOrderTypeChange: (type: ContractOrderType) => void;
   onPriceChange: (price: string) => void;
   onQuantityChange: (quantity: string) => void;
+  onLeverageChange: (leverage: number) => void;
   onPercentPress: (percent: number) => void;
   onBboPress: () => void;
   onLoginPress: () => void;
   onSubmitPress: () => void;
+  onPendingIntentReviewPress?: () => void;
 };
 
 const percentSteps = [25, 50, 75, 100];
@@ -40,26 +65,49 @@ function ContractOrderForm({
   price,
   quantity,
   leverage,
+  maxLeverage,
   availableMargin,
   equity,
   lastPrice,
   markPrice,
   spreadFeePrice,
   pricePrecision,
+  baseAsset,
+  quoteAsset,
   isLoggedIn,
+  submitting,
+  submitDisabled,
+  feedbackText,
+  feedbackTone,
+  pendingIntentReviewVisible = false,
+  pendingIntentReviewBusy = false,
+  pendingIntentReviewLabel,
   onActionModeChange,
   onDirectionChange,
   onOrderTypeChange,
   onPriceChange,
   onQuantityChange,
+  onLeverageChange,
   onPercentPress,
   onBboPress,
   onLoginPress,
   onSubmitPress,
+  onPendingIntentReviewPress,
 }: Props) {
+  const { t } = useLanguage();
+  const { fontScale, width: windowWidth } = useWindowDimensions();
+  const [leverageSelectorVisible, setLeverageSelectorVisible] = useState(false);
+  const compact = isCompactContractOrderForm(windowWidth, fontScale);
   const long = direction === 'LONG';
+  const buySelected = actionMode === 'OPEN' ? long : !long;
+  const buyDirection: ContractDirection =
+    actionMode === 'OPEN' ? 'LONG' : 'SHORT';
+  const sellDirection: ContractDirection =
+    actionMode === 'OPEN' ? 'SHORT' : 'LONG';
   const referencePrice =
-    orderType === 'MARKET' ? markPrice ?? lastPrice : Number(price.replace(/,/g, ''));
+    orderType === 'MARKET'
+      ? markPrice ?? lastPrice
+      : Number(price.replace(/,/g, ''));
   const quantityNumber = Number(quantity);
   const referenceValue = referencePrice ?? NaN;
   const notional =
@@ -67,143 +115,409 @@ function ContractOrderForm({
       ? referenceValue * quantityNumber
       : null;
   const estimatedMargin = notional === null ? null : notional / leverage;
-  const liquidationPrice = getEstimatedLiquidationPrice(
-    referencePrice,
-    direction,
-    leverage,
+  const estimatedSpreadCost = calculateContractSpreadCost(
+    spreadFeePrice,
+    quantityNumber,
   );
-  const actionLabel =
-    actionMode === 'OPEN'
-      ? long
-        ? '买入开多'
-        : '卖出开空'
-      : long
-        ? '平多'
-        : '平空';
-  const submitText = isLoggedIn ? actionLabel : '登录';
+  const actionLabel = buySelected
+    ? t('contract.buyOpenLong')
+    : t('contract.sellOpenShort');
+  const submitText = isLoggedIn
+    ? submitting
+      ? t('trading.submitPending')
+      : actionLabel
+    : t('trading.login');
+  const submitAccessibilityLabel = !isLoggedIn
+    ? t('trading.login')
+    : buySelected
+    ? t('contract.submitBuyOrderA11y')
+    : t('contract.submitSellOrderA11y');
   const submitStyle = !isLoggedIn
     ? styles.loginButton
-    : long
-      ? styles.longButton
-      : styles.shortButton;
+    : buySelected
+    ? styles.longButton
+    : styles.shortButton;
+  const tradeDisabled = isLoggedIn && (submitting || submitDisabled);
+  const leverageControlDisabled = submitting || maxLeverage === null;
+  const reviewLabel = pendingIntentReviewLabel || t('trading.reviewOrder');
 
   return (
-    <View style={styles.card}>
-      <View style={styles.topSection}>
-        <View style={styles.modeRow}>
-          <Tag label="逐仓" />
-          <Tag label={`${leverage}x`} active />
-          <Tag label="单向" />
+    <>
+      <View style={[styles.card, compact ? styles.cardCompact : null]}>
+        <View style={styles.topSection}>
+          <View style={styles.modeRow}>
+            <Tag label={t('contract.isolated')} />
+            <Pressable
+              accessibilityLabel={t('contract.currentLeverageA11y', {
+                leverage,
+              })}
+              accessibilityHint={
+                maxLeverage === null
+                  ? t('contract.rulesBeforeAdjust')
+                  : t('contract.leverageRange', { max: maxLeverage })
+              }
+              accessibilityRole="button"
+              accessibilityState={{ disabled: leverageControlDisabled }}
+              android_ripple={{ color: 'rgba(212, 175, 55, 0.12)' }}
+              accessibilityValue={{
+                min: 1,
+                max: maxLeverage ?? 1,
+                now: leverage,
+                text: t('contract.leverageValue', { leverage }),
+              }}
+              style={({ pressed }) => [
+                styles.leverageControl,
+                leverageControlDisabled ? styles.leverageControlDisabled : null,
+                pressed ? styles.pressed : null,
+              ]}
+              disabled={leverageControlDisabled}
+              hitSlop={{ top: 5, bottom: 5 }}
+              onPress={() => setLeverageSelectorVisible(true)}
+            >
+              <View style={styles.leverageValueWrap}>
+                <Text maxFontSizeMultiplier={1.15} style={styles.leverageValue}>
+                  {leverage}x
+                </Text>
+                <Text
+                  maxFontSizeMultiplier={1.15}
+                  numberOfLines={1}
+                  style={styles.leverageLimitText}
+                >
+                  {maxLeverage === null
+                    ? t('contract.loading')
+                    : `≤${maxLeverage}x`}
+                </Text>
+              </View>
+              <ChevronDown color={colors.gold} size={14} strokeWidth={2.2} />
+            </Pressable>
+            {compact ? null : <Tag label={t('contract.oneWay')} />}
+          </View>
+
+          <View style={styles.actionTabs}>
+            <Pressable
+              accessibilityRole="tab"
+              accessibilityState={{
+                disabled: submitting,
+                selected: actionMode === 'OPEN',
+              }}
+              android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
+              disabled={submitting}
+              hitSlop={{ top: 9, bottom: 9 }}
+              style={({ pressed }) => [
+                styles.actionTab,
+                actionMode === 'OPEN' ? styles.actionActive : null,
+                pressed ? styles.pressed : null,
+              ]}
+              onPress={() => onActionModeChange('OPEN')}
+            >
+              <Text maxFontSizeMultiplier={1.15} style={styles.actionText}>
+                {t('trading.action.open')}
+              </Text>
+            </Pressable>
+            <Pressable
+              accessibilityRole="tab"
+              accessibilityState={{
+                disabled: submitting,
+                selected: actionMode === 'CLOSE',
+              }}
+              android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
+              disabled={submitting}
+              hitSlop={{ top: 9, bottom: 9 }}
+              style={({ pressed }) => [
+                styles.actionTab,
+                actionMode === 'CLOSE' ? styles.actionActive : null,
+                pressed ? styles.pressed : null,
+              ]}
+              onPress={() => onActionModeChange('CLOSE')}
+            >
+              <Text maxFontSizeMultiplier={1.15} style={styles.actionText}>
+                {t('trading.action.close')}
+              </Text>
+            </Pressable>
+          </View>
+
+          <View style={styles.sideTabs}>
+            <Pressable
+              accessibilityLabel={t('contract.selectBuyOrderA11y')}
+              accessibilityRole="button"
+              accessibilityState={{
+                disabled: submitting,
+                selected: buySelected,
+              }}
+              android_ripple={{ color: 'rgba(25, 195, 125, 0.12)' }}
+              disabled={submitting}
+              hitSlop={{ top: 7, bottom: 7 }}
+              style={({ pressed }) => [
+                styles.sideTab,
+                buySelected ? styles.longActive : null,
+                pressed ? styles.pressed : null,
+              ]}
+              onPress={() => onDirectionChange(buyDirection)}
+            >
+              <Text
+                maxFontSizeMultiplier={1.15}
+                style={[
+                  styles.sideText,
+                  buySelected ? styles.activeSideText : null,
+                ]}
+              >
+                {t('contract.openLong')}
+              </Text>
+            </Pressable>
+            <Pressable
+              accessibilityLabel={t('contract.selectSellOrderA11y')}
+              accessibilityRole="button"
+              accessibilityState={{
+                disabled: submitting,
+                selected: !buySelected,
+              }}
+              android_ripple={{ color: 'rgba(240, 90, 90, 0.12)' }}
+              disabled={submitting}
+              hitSlop={{ top: 7, bottom: 7 }}
+              style={({ pressed }) => [
+                styles.sideTab,
+                !buySelected ? styles.shortActive : null,
+                pressed ? styles.pressed : null,
+              ]}
+              onPress={() => onDirectionChange(sellDirection)}
+            >
+              <Text
+                maxFontSizeMultiplier={1.15}
+                style={[
+                  styles.sideText,
+                  !buySelected ? styles.activeSideText : null,
+                ]}
+              >
+                {t('contract.openShort')}
+              </Text>
+            </Pressable>
+          </View>
+
+          <View style={styles.typeTabs}>
+            <Pressable
+              accessibilityRole="tab"
+              accessibilityState={{
+                disabled: submitting,
+                selected: orderType === 'LIMIT',
+              }}
+              android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
+              disabled={submitting}
+              hitSlop={{ top: 9, bottom: 9 }}
+              style={({ pressed }) => [
+                styles.typeTab,
+                orderType === 'LIMIT' ? styles.typeActive : null,
+                pressed ? styles.pressed : null,
+              ]}
+              onPress={() => onOrderTypeChange('LIMIT')}
+            >
+              <Text maxFontSizeMultiplier={1.15} style={styles.typeText}>
+                {t('trading.limit')}
+              </Text>
+            </Pressable>
+            <Pressable
+              accessibilityRole="tab"
+              accessibilityState={{
+                disabled: submitting,
+                selected: orderType === 'MARKET',
+              }}
+              android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
+              disabled={submitting}
+              hitSlop={{ top: 9, bottom: 9 }}
+              style={({ pressed }) => [
+                styles.typeTab,
+                orderType === 'MARKET' ? styles.typeActive : null,
+                pressed ? styles.pressed : null,
+              ]}
+              onPress={() => onOrderTypeChange('MARKET')}
+            >
+              <Text maxFontSizeMultiplier={1.15} style={styles.typeText}>
+                {t('trading.market')}
+              </Text>
+            </Pressable>
+          </View>
         </View>
 
-        <View style={styles.actionTabs}>
-          <Pressable
-            style={[styles.actionTab, actionMode === 'OPEN' ? styles.actionActive : null]}
-            onPress={() => onActionModeChange('OPEN')}>
-            <Text style={styles.actionText}>开仓</Text>
-          </Pressable>
-          <Pressable
-            style={[styles.actionTab, actionMode === 'CLOSE' ? styles.actionActive : null]}
-            onPress={() => onActionModeChange('CLOSE')}>
-            <Text style={styles.actionText}>平仓</Text>
-          </Pressable>
+        <View style={styles.inputSection}>
+          <Field
+            actionLabel={orderType === 'LIMIT' ? 'BBO' : undefined}
+            compact={compact}
+            editable={orderType === 'LIMIT' && !submitting}
+            helperText={
+              orderType === 'LIMIT' && !compact
+                ? t('contract.fillBestPriceHint')
+                : undefined
+            }
+            label={t('trading.price')}
+            suffix={compact ? '' : quoteAsset}
+            value={
+              orderType === 'MARKET' ? t('trading.marketBestPrice') : price
+            }
+            onActionPress={onBboPress}
+            onChangeText={onPriceChange}
+          />
+          <Field
+            compact={compact}
+            editable={!submitting}
+            label={t('trading.quantity')}
+            suffix={compact ? '' : baseAsset}
+            value={quantity}
+            onChangeText={onQuantityChange}
+          />
         </View>
 
-        <View style={styles.sideTabs}>
+        <View style={styles.percentRow}>
+          {percentSteps.map(step => (
+            <Pressable
+              accessibilityLabel={t('trading.usePercentA11y', {
+                percent: step,
+              })}
+              accessibilityRole="button"
+              accessibilityState={{ disabled: submitting }}
+              android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
+              disabled={submitting}
+              hitSlop={{ top: 11, bottom: 11 }}
+              key={step}
+              style={({ pressed }) => [
+                styles.percent,
+                pressed ? styles.pressed : null,
+              ]}
+              onPress={() => onPercentPress(step)}
+            >
+              <Text maxFontSizeMultiplier={1.15} style={styles.percentText}>
+                {step}%
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+
+        <View style={styles.metrics}>
+          <Metric
+            label={t('contract.accountEquity')}
+            value={`${formatContractNumber(equity, 2)} ${quoteAsset}`}
+          />
+          <Metric
+            label={t('contract.availableMargin')}
+            value={`${formatContractNumber(availableMargin, 2)} ${quoteAsset}`}
+          />
+          <Metric
+            label={t('contract.estimatedMargin')}
+            value={`${formatContractNumber(estimatedMargin, 2)} ${quoteAsset}`}
+          />
+          <Metric
+            label={t('contract.feeHint')}
+            value={`${formatContractNumber(
+              estimatedSpreadCost,
+              pricePrecision,
+            )} ${quoteAsset}`}
+          />
+        </View>
+
+        <View style={styles.bottomSection}>
+          <View style={styles.feedbackRow}>
+            <Text
+              numberOfLines={2}
+              maxFontSizeMultiplier={1.15}
+              style={[
+                styles.loginHint,
+                feedbackTone === 'error' ? styles.errorText : null,
+                feedbackTone === 'success' ? styles.successText : null,
+              ]}
+            >
+              {feedbackText ||
+                (isLoggedIn
+                  ? t('contract.riskCheck')
+                  : t('contract.loginMarketView'))}
+            </Text>
+            {pendingIntentReviewVisible && onPendingIntentReviewPress ? (
+              <Pressable
+                accessibilityRole="button"
+                accessibilityState={{
+                  busy: pendingIntentReviewBusy,
+                  disabled: pendingIntentReviewBusy,
+                }}
+                android_ripple={{ color: 'rgba(212, 175, 55, 0.12)' }}
+                disabled={pendingIntentReviewBusy}
+                hitSlop={{ top: 11, bottom: 11, left: 4, right: 4 }}
+                style={({ pressed }) => [
+                  styles.reviewButton,
+                  pressed ? styles.pressed : null,
+                ]}
+                onPress={onPendingIntentReviewPress}
+              >
+                <Text
+                  maxFontSizeMultiplier={1.15}
+                  style={styles.reviewButtonText}
+                >
+                  {pendingIntentReviewBusy
+                    ? t('contract.reviewing')
+                    : reviewLabel}
+                </Text>
+              </Pressable>
+            ) : null}
+          </View>
+
           <Pressable
-            style={[styles.sideTab, long ? styles.longActive : null]}
-            onPress={() => onDirectionChange('LONG')}>
-            <Text style={[styles.sideText, long ? styles.activeSideText : null]}>
-              {actionMode === 'OPEN' ? '开多' : '平多'}
+            accessibilityLabel={submitAccessibilityLabel}
+            accessibilityRole="button"
+            accessibilityState={{ busy: submitting, disabled: tradeDisabled }}
+            android_ripple={{ color: 'rgba(0, 0, 0, 0.14)' }}
+            disabled={tradeDisabled}
+            style={({ pressed }) => [
+              styles.submit,
+              submitStyle,
+              tradeDisabled ? styles.submitDisabled : null,
+              pressed ? styles.submitPressed : null,
+            ]}
+            onPress={isLoggedIn ? onSubmitPress : onLoginPress}
+          >
+            <Text maxFontSizeMultiplier={1.15} style={styles.submitText}>
+              {submitText}
             </Text>
           </Pressable>
-          <Pressable
-            style={[styles.sideTab, !long ? styles.shortActive : null]}
-            onPress={() => onDirectionChange('SHORT')}>
-            <Text style={[styles.sideText, !long ? styles.activeSideText : null]}>
-              {actionMode === 'OPEN' ? '开空' : '平空'}
-            </Text>
-          </Pressable>
-        </View>
-
-        <View style={styles.typeTabs}>
-          <Pressable
-            style={[styles.typeTab, orderType === 'LIMIT' ? styles.typeActive : null]}
-            onPress={() => onOrderTypeChange('LIMIT')}>
-            <Text style={styles.typeText}>限价</Text>
-          </Pressable>
-          <Pressable
-            style={[styles.typeTab, orderType === 'MARKET' ? styles.typeActive : null]}
-            onPress={() => onOrderTypeChange('MARKET')}>
-            <Text style={styles.typeText}>市价</Text>
-          </Pressable>
         </View>
       </View>
-
-      <View style={styles.inputSection}>
-      <Field
-        actionLabel={orderType === 'LIMIT' ? 'BBO' : undefined}
-        editable={orderType === 'LIMIT'}
-        helperText={orderType === 'LIMIT' ? '以当前最优价填入' : undefined}
-        label="价格"
-        suffix="USDT"
-        value={orderType === 'MARKET' ? '按市场最优价' : price}
-        onActionPress={onBboPress}
-        onChangeText={onPriceChange}
+      <ContractLeverageSelectorSheet
+        leverage={leverage}
+        maxLeverage={maxLeverage}
+        visible={leverageSelectorVisible}
+        onClose={() => setLeverageSelectorVisible(false)}
+        onSelect={nextLeverage => {
+          onLeverageChange(nextLeverage);
+          setLeverageSelectorVisible(false);
+        }}
       />
-      <Field
-        label="数量"
-        suffix="BTC"
-        value={quantity}
-        onChangeText={onQuantityChange}
-      />
-      </View>
-
-      <View style={styles.percentRow}>
-        {percentSteps.map(step => (
-          <Pressable
-            key={step}
-            style={styles.percent}
-            onPress={() => onPercentPress(step)}>
-            <Text style={styles.percentText}>{step}%</Text>
-          </Pressable>
-        ))}
-      </View>
-
-      <View style={styles.metrics}>
-        <Metric label="账户权益" value={`${formatContractNumber(equity, 2)} USDT`} />
-        <Metric label="可用保证金" value={`${formatContractNumber(availableMargin, 2)} USDT`} />
-        <Metric label="预计保证金" value={`${formatContractNumber(estimatedMargin, 2)} USDT`} />
-        <Metric
-          label="预估强平价"
-          value={formatContractNumber(liquidationPrice, pricePrecision)}
-        />
-        <Metric
-          label="点差/手续费提示"
-          value={`${formatContractNumber(spreadFeePrice, pricePrecision)} USDT`}
-        />
-      </View>
-
-      <View style={styles.bottomSection}>
-        <Text style={styles.loginHint}>
-          {isLoggedIn
-            ? '合约下单功能暂未开放'
-            : '登录后可交易，行情/K线可查看'}
-        </Text>
-
-        <Pressable
-          style={[styles.submit, submitStyle]}
-          onPress={isLoggedIn ? onSubmitPress : onLoginPress}>
-          <Text style={styles.submitText}>{submitText}</Text>
-        </Pressable>
-      </View>
-    </View>
+    </>
   );
 }
 
 export default React.memo(ContractOrderForm);
 
+export function isCompactContractOrderForm(
+  windowWidth: number,
+  fontScale: number,
+) {
+  return windowWidth < 360 || fontScale >= 1.2;
+}
+
+export function calculateContractSpreadCost(
+  singleSideSpreadFeePrice: number | null | undefined,
+  quantity: number,
+) {
+  if (
+    singleSideSpreadFeePrice === null ||
+    singleSideSpreadFeePrice === undefined ||
+    !Number.isFinite(singleSideSpreadFeePrice) ||
+    singleSideSpreadFeePrice <= 0 ||
+    !Number.isFinite(quantity) ||
+    quantity <= 0
+  ) {
+    return null;
+  }
+  return singleSideSpreadFeePrice * quantity;
+}
+
 function Field({
+  compact = false,
   editable = true,
   label,
   suffix,
@@ -213,6 +527,7 @@ function Field({
   onActionPress,
   onChangeText,
 }: {
+  compact?: boolean;
   editable?: boolean;
   label: string;
   suffix: string;
@@ -222,13 +537,21 @@ function Field({
   onActionPress?: () => void;
   onChangeText: (value: string) => void;
 }) {
+  const { t } = useLanguage();
   return (
     <View style={styles.fieldWrap}>
-      <View style={styles.field}>
-        <Text style={styles.fieldLabel}>{label}</Text>
-        <TextInput
+      <View style={[styles.field, compact ? styles.fieldCompact : null]}>
+        <Text
+          maxFontSizeMultiplier={1.15}
+          numberOfLines={1}
+          style={[styles.fieldLabel, compact ? styles.fieldLabelCompact : null]}
+        >
+          {label}
+        </Text>
+        <TradingNumericInput
+          accessibilityLabel={label}
           editable={editable}
-          keyboardType="decimal-pad"
+          maxFontSizeMultiplier={1.15}
           placeholder="0"
           placeholderTextColor={colors.textSubtle}
           selectTextOnFocus={editable}
@@ -236,9 +559,31 @@ function Field({
           value={value}
           onChangeText={onChangeText}
         />
-        <Text style={styles.suffix}>{suffix}</Text>
+        {suffix ? (
+          <Text maxFontSizeMultiplier={1.15} style={styles.suffix}>
+            {suffix}
+          </Text>
+        ) : null}
         {actionLabel ? (
-          <Pressable style={styles.inlineAction} onPress={onActionPress}>
+          <Pressable
+            accessibilityHint={helperText}
+            accessibilityLabel={
+              actionLabel === 'BBO'
+                ? t('trading.fillBestPriceA11y')
+                : actionLabel
+            }
+            accessibilityRole="button"
+            accessibilityState={{ disabled: !editable }}
+            android_ripple={{ color: 'rgba(212, 175, 55, 0.12)' }}
+            disabled={!editable}
+            hitSlop={{ top: 10, bottom: 10 }}
+            style={({ pressed }) => [
+              styles.inlineAction,
+              compact ? styles.inlineActionCompact : null,
+              pressed ? styles.pressed : null,
+            ]}
+            onPress={onActionPress}
+          >
             <Text style={styles.inlineActionText}>{actionLabel}</Text>
           </Pressable>
         ) : null}
@@ -248,54 +593,59 @@ function Field({
   );
 }
 
-function Metric({label, value}: {label: string; value: string}) {
+function Metric({ label, value }: { label: string; value: string }) {
   return (
     <View style={styles.metaRow}>
-      <Text style={styles.metaLabel}>{label}</Text>
-      <Text style={styles.metaValue}>{value}</Text>
+      <Text maxFontSizeMultiplier={1.15} style={styles.metaLabel}>
+        {label}
+      </Text>
+      <Text
+        maxFontSizeMultiplier={1.15}
+        numberOfLines={1}
+        style={styles.metaValue}
+      >
+        {value}
+      </Text>
     </View>
   );
 }
 
-function Tag({label, active = false}: {label: string; active?: boolean}) {
+function Tag({ label, active = false }: { label: string; active?: boolean }) {
   return (
     <View style={[styles.tag, active ? styles.activeTag : null]}>
-      <Text style={[styles.tagText, active ? styles.activeTagText : null]}>{label}</Text>
+      <Text
+        maxFontSizeMultiplier={1.15}
+        style={[styles.tagText, active ? styles.activeTagText : null]}
+      >
+        {label}
+      </Text>
     </View>
   );
-}
-
-function getEstimatedLiquidationPrice(
-  referencePrice: number | null,
-  direction: ContractDirection,
-  leverage: number,
-) {
-  if (referencePrice === null || !Number.isFinite(referencePrice) || leverage <= 0) {
-    return null;
-  }
-  const buffer = 0.9 / leverage;
-  return direction === 'LONG'
-    ? referencePrice * (1 - buffer)
-    : referencePrice * (1 + buffer);
 }
 
 const styles = StyleSheet.create({
+  pressed: { opacity: 0.72, transform: [{ scale: 0.98 }] },
+  submitPressed: { opacity: 0.86, transform: [{ scale: 0.992 }] },
   card: {
     flex: 1,
     height: '100%',
     minWidth: 0,
     justifyContent: 'space-between',
-    borderRadius: 6,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: colors.line,
     backgroundColor: colors.card,
     padding: 8,
+  },
+  cardCompact: {
+    paddingHorizontal: 6,
   },
   topSection: {
     minHeight: 151,
   },
   modeRow: {
     flexDirection: 'row',
+    alignItems: 'center',
     gap: 5,
   },
   tag: {
@@ -316,6 +666,39 @@ const styles = StyleSheet.create({
   activeTagText: {
     color: colors.gold,
     fontWeight: '900',
+  },
+  leverageControl: {
+    height: 34,
+    minWidth: 76,
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderRadius: 5,
+    borderWidth: 1,
+    borderColor: 'rgba(214,168,50,0.42)',
+    backgroundColor: colors.primarySoft,
+    paddingHorizontal: 8,
+  },
+  leverageControlDisabled: {
+    opacity: 0.5,
+  },
+  leverageValueWrap: {
+    minWidth: 38,
+    flex: 1,
+    alignItems: 'flex-start',
+    justifyContent: 'center',
+    marginRight: 4,
+  },
+  leverageValue: {
+    ...typography.number,
+    color: colors.gold,
+    fontSize: 11,
+    fontWeight: '900',
+    lineHeight: 14,
+  },
+  leverageLimitText: {
+    color: colors.textSubtle,
+    fontSize: 7,
+    lineHeight: 9,
   },
   actionTabs: {
     marginTop: 8,
@@ -396,16 +779,23 @@ const styles = StyleSheet.create({
     minHeight: 39,
     flexDirection: 'row',
     alignItems: 'center',
-    borderRadius: 6,
+    borderRadius: 8,
     borderWidth: 1,
     borderColor: colors.line,
     backgroundColor: colors.bgElevated,
     paddingHorizontal: 8,
   },
+  fieldCompact: {
+    paddingHorizontal: 6,
+  },
   fieldLabel: {
     color: colors.textSubtle,
     fontSize: 10,
     width: 30,
+  },
+  fieldLabelCompact: {
+    width: 24,
+    fontSize: 9,
   },
   input: {
     ...typography.number,
@@ -430,6 +820,10 @@ const styles = StyleSheet.create({
     backgroundColor: colors.primarySoft,
     borderWidth: 1,
     borderColor: 'rgba(214,168,50,0.42)',
+  },
+  inlineActionCompact: {
+    width: 34,
+    marginLeft: 4,
   },
   inlineActionText: {
     ...typography.bold,
@@ -472,31 +866,57 @@ const styles = StyleSheet.create({
   },
   metaLabel: {
     color: colors.textSubtle,
-    fontSize: 9,
+    fontSize: 10,
   },
   metaValue: {
     ...typography.number,
     flexShrink: 1,
     color: colors.textMuted,
-    fontSize: 9,
+    fontSize: 10,
     fontWeight: '700',
     textAlign: 'right',
   },
   loginHint: {
+    flex: 1,
     color: colors.textSubtle,
     fontSize: 9,
     lineHeight: 12,
+  },
+  errorText: {
+    color: colors.red,
+  },
+  successText: {
+    color: colors.green,
   },
   bottomSection: {
     minHeight: 58,
     justifyContent: 'flex-end',
   },
+  feedbackRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  reviewButton: {
+    minHeight: 22,
+    paddingHorizontal: 7,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.gold,
+    borderRadius: 6,
+  },
+  reviewButtonText: {
+    ...typography.bold,
+    color: colors.gold,
+    fontSize: 9,
+  },
   submit: {
-    height: 38,
+    height: 44,
     marginTop: 8,
     alignItems: 'center',
     justifyContent: 'center',
-    borderRadius: 7,
+    borderRadius: 9,
   },
   loginButton: {
     backgroundColor: colors.green,
@@ -511,5 +931,8 @@ const styles = StyleSheet.create({
     ...typography.bold,
     color: colors.white,
     fontSize: 13,
+  },
+  submitDisabled: {
+    opacity: 0.48,
   },
 });

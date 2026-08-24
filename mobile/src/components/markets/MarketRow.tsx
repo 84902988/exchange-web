@@ -5,7 +5,9 @@ import {
   formatMarketPrice,
   type MarketInstrument,
 } from '../../api/market';
+import {useLanguage} from '../../i18n';
 import {colors, typography} from '../../theme';
+import MarketLogo from './MarketLogo';
 
 type Props = {
   item: MarketInstrument;
@@ -13,15 +15,17 @@ type Props = {
 };
 
 export default function MarketRow({item, onPress}: Props) {
+  const {t} = useLanguage();
   const positive = (item.changePercent || 0) >= 0;
-  const avatarText = item.displaySymbol.slice(0, 2).toUpperCase();
 
-  return (
-    <Pressable style={styles.row} onPress={() => onPress?.(item)}>
+  const content = (
+    <>
       <View style={styles.left}>
-        <View style={[styles.avatar, positive ? styles.avatarUp : styles.avatarDown]}>
-          <Text style={styles.avatarText}>{avatarText}</Text>
-        </View>
+        <MarketLogo
+          label={item.displaySymbol}
+          logoUrl={item.logoUrl}
+          positive={positive}
+        />
         <View style={styles.nameWrap}>
           <Text numberOfLines={1} style={styles.symbol}>
             {item.displaySymbol}
@@ -37,8 +41,25 @@ export default function MarketRow({item, onPress}: Props) {
       <View style={[styles.badge, positive ? styles.upBadge : styles.downBadge]}>
         <Text style={styles.badgeText}>{formatMarketPercent(item.changePercent)}</Text>
       </View>
-    </Pressable>
+    </>
   );
+
+  if (onPress) {
+    return (
+      <Pressable
+        accessibilityLabel={`${item.displaySymbol}${t(
+          'common.a11ySeparator',
+        )}${formatMarketPrice(item)}`}
+        accessibilityRole="button"
+        android_ripple={{color: 'rgba(214,168,50,0.10)'}}
+        onPress={() => onPress(item)}
+        style={({pressed}) => [styles.row, pressed ? styles.pressed : null]}>
+        {content}
+      </Pressable>
+    );
+  }
+
+  return <View style={styles.row}>{content}</View>;
 }
 
 const styles = StyleSheet.create({
@@ -56,24 +77,6 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
-  },
-  avatar: {
-    width: 30,
-    height: 30,
-    borderRadius: 15,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  avatarUp: {
-    backgroundColor: 'rgba(25, 195, 125, 0.14)',
-  },
-  avatarDown: {
-    backgroundColor: 'rgba(240, 90, 90, 0.14)',
-  },
-  avatarText: {
-    ...typography.semibold,
-    color: colors.marketText,
-    fontSize: 10,
   },
   nameWrap: {
     flex: 1,
@@ -115,5 +118,9 @@ const styles = StyleSheet.create({
     color: colors.white,
     fontSize: 12,
     fontWeight: '600',
+  },
+  pressed: {
+    opacity: 0.78,
+    backgroundColor: 'rgba(214,168,50,0.06)',
   },
 });

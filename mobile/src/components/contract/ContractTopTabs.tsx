@@ -1,6 +1,6 @@
 import React from 'react';
-import {Pressable, ScrollView, StyleSheet, Text, View} from 'react-native';
-import {colors, typography} from '../../theme';
+import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { colors, typography } from '../../theme';
 
 export type ContractBusinessTab = {
   key: string;
@@ -14,30 +14,40 @@ type Props = {
   onChange: (key: string) => void;
 };
 
-function ContractTopTabs({tabs, activeKey, onChange}: Props) {
+function ContractTopTabs({ tabs, activeKey, onChange }: Props) {
   return (
     <ScrollView
       horizontal
       showsHorizontalScrollIndicator={false}
-      contentContainerStyle={styles.content}>
+      contentContainerStyle={styles.content}
+    >
       {tabs.map(tab => {
         const active = tab.key === activeKey;
         return (
           <Pressable
             key={tab.key}
-            accessibilityRole="button"
+            accessibilityRole="tab"
+            accessibilityState={{ selected: active, disabled: tab.disabled }}
+            android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
             disabled={tab.disabled}
-            style={styles.tab}
-            onPress={() => onChange(tab.key)}>
+            style={({ pressed }) => [
+              styles.tab,
+              pressed ? styles.pressed : null,
+            ]}
+            onPress={() => onChange(tab.key)}
+          >
             <Text
               style={[
                 styles.label,
                 active ? styles.activeLabel : null,
                 tab.disabled ? styles.disabledLabel : null,
-              ]}>
+              ]}
+            >
               {tab.label}
             </Text>
-            <View style={[styles.indicator, active ? styles.activeIndicator : null]} />
+            <View
+              style={[styles.indicator, active ? styles.activeIndicator : null]}
+            />
           </Pressable>
         );
       })}
@@ -48,14 +58,15 @@ function ContractTopTabs({tabs, activeKey, onChange}: Props) {
 export default React.memo(ContractTopTabs);
 
 const styles = StyleSheet.create({
+  pressed: { opacity: 0.72, transform: [{ scale: 0.98 }] },
   content: {
-    height: 32,
+    height: 46,
     alignItems: 'center',
     gap: 17,
     paddingRight: 8,
   },
   tab: {
-    height: 30,
+    height: 44,
     alignItems: 'center',
     justifyContent: 'center',
   },

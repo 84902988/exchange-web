@@ -1,67 +1,76 @@
 import React from 'react';
-import {Modal, Pressable, StyleSheet, Text, View} from 'react-native';
+import { Modal, Pressable, StyleSheet, Text, View } from 'react-native';
 import {
   ArrowDownToLine,
   ArrowRightLeft,
   ArrowUpFromLine,
-  Crown,
   FileText,
-  HelpCircle,
   ReceiptText,
-  Settings,
-  Share2,
+  Wallet,
   type LucideIcon,
 } from 'lucide-react-native';
-import {colors, typography} from '../../theme';
+import { useLanguage, type TranslationKey } from '../../i18n';
+import { colors, typography } from '../../theme';
 
 type Action = {
-  label: string;
+  key: TradeMoreAction;
+  labelKey: TranslationKey;
   Icon: LucideIcon;
 };
+
+export type TradeMoreAction =
+  | 'deposit'
+  | 'withdraw'
+  | 'transfer'
+  | 'fundHistory'
+  | 'assets'
+  | 'orders';
 
 type Props = {
   visible: boolean;
   onClose: () => void;
-  onActionPress: (label: string) => void;
+  onActionPress: (action: TradeMoreAction) => void;
 };
 
 const actions: Action[] = [
-  {label: '充值', Icon: ArrowDownToLine},
-  {label: '提现', Icon: ArrowUpFromLine},
-  {label: '划转', Icon: ArrowRightLeft},
-  {label: '订单', Icon: FileText},
-  {label: '资金流水', Icon: ReceiptText},
-  {label: 'VIP', Icon: Crown},
-  {label: '邀请', Icon: Share2},
-  {label: '设置/帮助', Icon: Settings},
-  {label: '帮助中心', Icon: HelpCircle},
+  { key: 'deposit', labelKey: 'assets.quick.deposit', Icon: ArrowDownToLine },
+  { key: 'withdraw', labelKey: 'assets.quick.withdraw', Icon: ArrowUpFromLine },
+  { key: 'transfer', labelKey: 'assets.quick.transfer', Icon: ArrowRightLeft },
+  { key: 'fundHistory', labelKey: 'assets.quick.history', Icon: ReceiptText },
+  { key: 'assets', labelKey: 'nav.assets', Icon: Wallet },
+  { key: 'orders', labelKey: 'trading.orders', Icon: FileText },
 ];
 
-export default function TradeMoreSheet({
-  visible,
-  onClose,
-  onActionPress,
-}: Props) {
+function TradeMoreSheet({ visible, onClose, onActionPress }: Props) {
+  const { t } = useLanguage();
   return (
     <Modal
       transparent
       animationType="slide"
       visible={visible}
-      onRequestClose={onClose}>
+      onRequestClose={onClose}
+    >
       <Pressable style={styles.overlay} onPress={onClose}>
         <Pressable style={styles.sheet}>
           <View style={styles.handle} />
-          <Text style={styles.title}>更多功能</Text>
+          <Text style={styles.title}>{t('trading.moreTitle')}</Text>
           <View style={styles.grid}>
-            {actions.map(({label, Icon}) => (
+            {actions.map(({ key, labelKey, Icon }) => (
               <Pressable
-                key={label}
-                style={styles.item}
-                onPress={() => onActionPress(label)}>
+                accessibilityLabel={t(labelKey)}
+                accessibilityRole="button"
+                android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
+                key={key}
+                style={({ pressed }) => [
+                  styles.item,
+                  pressed ? styles.pressed : null,
+                ]}
+                onPress={() => onActionPress(key)}
+              >
                 <View style={styles.iconWrap}>
                   <Icon color={colors.gold} size={18} strokeWidth={2.2} />
                 </View>
-                <Text style={styles.label}>{label}</Text>
+                <Text style={styles.label}>{t(labelKey)}</Text>
               </Pressable>
             ))}
           </View>
@@ -71,7 +80,10 @@ export default function TradeMoreSheet({
   );
 }
 
+export default React.memo(TradeMoreSheet);
+
 const styles = StyleSheet.create({
+  pressed: { opacity: 0.78, transform: [{ scale: 0.98 }] },
   overlay: {
     flex: 1,
     justifyContent: 'flex-end',

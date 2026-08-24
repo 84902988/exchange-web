@@ -1,34 +1,45 @@
 import React from 'react';
-import {Pressable, StyleSheet, Text} from 'react-native';
-import {Search} from 'lucide-react-native';
-import {colors, typography} from '../../theme';
+import { Pressable, StyleSheet, Text } from 'react-native';
+import { Search } from 'lucide-react-native';
+import { useLanguage } from '../../i18n';
+import { colors, typography } from '../../theme';
 
 type Props = {
   placeholder?: string;
   onPress?: () => void;
 };
 
-export default function SearchBar({placeholder = '搜索 UNI', onPress}: Props) {
+export default function SearchBar({ placeholder, onPress }: Props) {
+  const { t } = useLanguage();
+  const resolvedPlaceholder = placeholder ?? t('home.searchMarket');
   return (
     <Pressable
-      accessibilityLabel={placeholder}
+      accessibilityLabel={resolvedPlaceholder}
       accessibilityRole={onPress ? 'button' : undefined}
-      style={styles.container}
-      onPress={onPress}>
+      android_ripple={
+        onPress ? { color: 'rgba(212, 175, 55, 0.1)' } : undefined
+      }
+      style={({ pressed }) => [
+        styles.container,
+        pressed && onPress ? styles.pressed : null,
+      ]}
+      onPress={onPress}
+    >
       <Search color={colors.textSubtle} size={17} strokeWidth={2.1} />
-      <Text style={styles.placeholder}>{placeholder}</Text>
+      <Text style={styles.placeholder}>{resolvedPlaceholder}</Text>
     </Pressable>
   );
 }
 
 const styles = StyleSheet.create({
+  pressed: { opacity: 0.8, transform: [{ scale: 0.995 }] },
   container: {
     flex: 1,
-    height: 38,
+    height: 44,
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 12,
-    borderRadius: 19,
+    borderRadius: 22,
     backgroundColor: colors.card,
     borderWidth: 1,
     borderColor: colors.line,

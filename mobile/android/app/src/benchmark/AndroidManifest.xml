@@ -1,0 +1,9 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <application
+      android:networkSecurityConfig="@xml/benchmark_network_security_config">
+      <profileable
+        android:shell="true"
+        tools:targetApi="q" />
+    </application>
+</manifest>
