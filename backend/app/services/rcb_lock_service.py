@@ -282,6 +282,112 @@ def create_user_rcb_lock(
     }
 
 
+def release_matured_user_rcb_locks(
+    db: Session,
+    *,
+    user_id: int,
+    now: Optional[datetime] = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Return matured RCB locks to the user's funding balance.
+
+    The lock row and funding balance are both held for update.  The balance-log
+    unique key is a second idempotency barrier, so a retry can never credit the
+    same lock twice.
+    """
+    now_value = now or datetime.utcnow()
+    batch_limit = max(1, min(int(limit or 200), 500))
+    lock_items = (
+        db.query(UserRcbLock)
+        .filter(
+            UserRcbLock.user_id == int(user_id),
+            UserRcbLock.asset_symbol == RCB_SYMBOL,
+            UserRcbLock.status == "LOCKED",
+            UserRcbLock.end_time <= now_value,
+        )
+        .order_by(UserRcbLock.end_time.asc(), UserRcbLock.id.asc())
+        .limit(batch_limit)
+        .with_for_update()
+        .all()
+    )
+    if not lock_items:
+        return {
+            "released_count": 0,
+            "released_amount": _fmt_decimal(Decimal("0")),
+            "lock_ids": [],
+        }
+
+    lock_ids = [int(item.id) for item in lock_items]
+    existing_log_ids = {
+        str(biz_id)
+        for (biz_id,) in (
+            db.query(BalanceLog.biz_id)
+            .filter(
+                BalanceLog.user_id == int(user_id),
+                BalanceLog.coin_symbol == RCB_SYMBOL,
+                BalanceLog.chain_key == FUNDING_BALANCE_CHAIN_KEY,
+                BalanceLog.biz_type == "RCB_UNLOCK",
+                BalanceLog.biz_id.in_([str(lock_id) for lock_id in lock_ids]),
+            )
+            .all()
+        )
+    }
+    releasable_items = [item for item in lock_items if str(item.id) not in existing_log_ids]
+    released_amount = sum(
+        (_q18(item.lock_amount) for item in releasable_items),
+        Decimal("0"),
+    ).quantize(Q18)
+
+    balance = _get_funding_rcb_balance_for_update(db, int(user_id))
+    if balance is None:
+        raise RcbLockError("RCB 资金账户不存在，已阻止到期返还")
+
+    running_available = _q18(balance.available_amount)
+    before_frozen = _q18(balance.frozen_amount)
+    for lock_item in lock_items:
+        lock_item.status = "UNLOCKED"
+        lock_item.updated_at = now_value
+        db.add(lock_item)
+
+        if str(lock_item.id) in existing_log_ids:
+            continue
+
+        amount = _q18(lock_item.lock_amount)
+        before_available = running_available
+        running_available = _q18(running_available + amount)
+        db.add(
+            BalanceLog(
+                user_id=int(user_id),
+                coin_symbol=RCB_SYMBOL,
+                chain_key=FUNDING_BALANCE_CHAIN_KEY,
+                change_type="RCB_UNLOCK",
+                direction=1,
+                change_amount=amount,
+                before_available=before_available,
+                after_available=running_available,
+                before_frozen=before_frozen,
+                after_frozen=before_frozen,
+                biz_type="RCB_UNLOCK",
+                biz_id=str(lock_item.id),
+                request_id=None,
+                remark="RCB lock matured and released",
+                created_at=now_value,
+            )
+        )
+
+    balance.available_amount = running_available
+    balance.version = int(balance.version or 0) + (1 if released_amount > 0 else 0)
+    balance.updated_at = now_value
+    db.flush()
+
+    calculate_user_vip_snapshot(db=db, user_id=int(user_id))
+    return {
+        "released_count": len(releasable_items),
+        "released_amount": _fmt_decimal(released_amount),
+        "lock_ids": [int(item.id) for item in releasable_items],
+    }
+
+
 def serialize_rcb_lock(lock_item: UserRcbLock, *, current_svip: Optional[str] = None) -> dict[str, Any]:
     return {
         "id": int(lock_item.id),

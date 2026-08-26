@@ -203,6 +203,7 @@ type CreateContractTradingViewDatafeedOptions = {
   onLatestBar?: (close: string | null) => void;
   onHistoryBars?: (event: ContractHistoryBarsEvent) => void;
   onHistoryError?: (event: ContractHistoryErrorEvent) => void;
+  onHistoryTiming?: (event: ContractHistoryTimingEvent) => void;
   onRealtimeSubscriptionReady?: (evidence: ContractRealtimeSubscriptionReadiness) => void;
   onRealtimeResetRequired?: (requirement: ContractRealtimeResetRequirement) => void;
 };
@@ -220,6 +221,20 @@ export type ContractHistoryBarsEvent = {
 
 export type ContractHistoryErrorEvent = Omit<ContractHistoryBarsEvent, 'barCount'> & {
   error: string;
+};
+
+export type ContractHistoryTimingPhase =
+  | 'request'
+  | 'http-response'
+  | 'normalized'
+  | 'delivered';
+
+export type ContractHistoryTimingEvent = Pick<
+  ContractHistoryBarsEvent,
+  'symbol' | 'interval' | 'resolution' | 'firstDataRequest' | 'requestSeq'
+> & {
+  phase: ContractHistoryTimingPhase;
+  elapsedMs: number;
 };
 
 type SubscriptionEntry = {
@@ -322,6 +337,13 @@ type ContractKlineInFlightRequest = {
 export const CONTRACT_KLINE_MAX_HISTORY_PAGES = 3;
 export const CONTRACT_KLINE_MAX_ACCUMULATED_BARS = 1000;
 export const CONTRACT_KLINE_HISTORY_PAGE_LIMIT = CONTRACT_KLINE_HISTORY_CHAIN_PAGE_LIMIT;
+
+function contractHistoryPerfNowMs() {
+  const now = typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now();
+  return Math.max(0, Math.round(now * 10) / 10);
+}
 
 export function buildContractKlineInFlightKey(params: ContractKlineInFlightRequest) {
   return buildContractKlineRangeKey(params);
@@ -951,6 +973,7 @@ type LoadContractKlineBarsForCountBackResult = {
   terminalComplete: boolean;
   terminalBoundary: number | null;
   terminalReason: string | null;
+  lastHttpResponseElapsedMs: number | null;
 };
 
 export type HistoryCoverageState = {
@@ -1007,6 +1030,7 @@ async function loadContractKlineBarsForCountBack({
   let lastMetadata: ContractMarketKlineMetadataResponse | null = null;
   let stalled = false;
   let coverageReusable = true;
+  let lastHttpResponseElapsedMs: number | null = null;
 
   while (
     pageCount < CONTRACT_KLINE_MAX_HISTORY_PAGES
@@ -1051,6 +1075,8 @@ async function loadContractKlineBarsForCountBack({
       if (barsByTime.size === 0) throw error;
       break;
     }
+
+    lastHttpResponseElapsedMs = contractHistoryPerfNowMs();
 
     if (!isActive()) break;
     if (!result || !Array.isArray(result.items)) break;
@@ -1136,6 +1162,7 @@ async function loadContractKlineBarsForCountBack({
     terminalComplete,
     terminalBoundary,
     terminalReason: getContractHistoryTerminalReason(terminalMetadata),
+    lastHttpResponseElapsedMs,
   };
 }
 
@@ -1268,6 +1295,7 @@ export function createContractTradingViewDatafeed({
   onLatestBar,
   onHistoryBars,
   onHistoryError,
+  onHistoryTiming,
   onRealtimeSubscriptionReady,
   onRealtimeResetRequired,
 }: CreateContractTradingViewDatafeedOptions): ContractTradingViewDatafeed {
@@ -1569,6 +1597,21 @@ export function createContractTradingViewDatafeed({
     }
   };
 
+  const notifyHistoryTiming = (
+    event: Omit<ContractHistoryTimingEvent, 'elapsedMs'>,
+    observedElapsedMs?: number,
+  ) => {
+    if (!onHistoryTiming) return;
+    try {
+      onHistoryTiming({
+        ...event,
+        elapsedMs: observedElapsedMs ?? contractHistoryPerfNowMs(),
+      });
+    } catch {
+      // Benchmark observability must never change TradingView datafeed semantics.
+    }
+  };
+
   return {
     beginResolutionTransition: (transition) => (
       beginResolutionTransitionInternal(transition, true)
@@ -1623,6 +1666,14 @@ export function createContractTradingViewDatafeed({
       });
       const latestBarKey = buildLatestBarKey(requestSymbol, interval);
       const firstDataRequest = periodParams.firstDataRequest !== false;
+      const timingIdentity = {
+        symbol: requestSymbol,
+        interval,
+        resolution: requestResolution,
+        firstDataRequest,
+        requestSeq: requestToken.sequence,
+      };
+      notifyHistoryTiming({ ...timingIdentity, phase: 'request' });
       const hasSettledRealtimeBaseline = (
         historyReadyByLatestBarKey.get(latestBarKey) === true
         && latestBars.has(latestBarKey)
@@ -1722,6 +1773,7 @@ export function createContractTradingViewDatafeed({
           }
         }
         onHistory(bars, { noData });
+        notifyHistoryTiming({ ...timingIdentity, phase: 'delivered' });
         notifyHistoryBars({
           symbol: requestSymbol,
           interval,
@@ -1863,6 +1915,13 @@ export function createContractTradingViewDatafeed({
         const bars = result.bars
           .filter((bar) => bar.time < toTimeMs)
           .slice(-requiredBars);
+        if (result.lastHttpResponseElapsedMs !== null) {
+          notifyHistoryTiming(
+            { ...timingIdentity, phase: 'http-response' },
+            result.lastHttpResponseElapsedMs,
+          );
+        }
+        notifyHistoryTiming({ ...timingIdentity, phase: 'normalized' });
         if (monthlyTerminalCandidateKey && bars.length > 0) {
           const earliestReturnedBarTime = bars[0].time;
           const previousCandidate = monthlyHistoryTerminalCandidates.get(

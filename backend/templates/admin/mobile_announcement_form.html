@@ -1,0 +1,149 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}{% if is_edit %}编辑手机端公告{% else %}新增手机端公告{% endif %}{% endblock %}
+{% block page_title %}{% if is_edit %}编辑手机端公告{% else %}新增手机端公告{% endif %}{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">富文本与 PC 公告共用编辑器和安全白名单；保存前可预览服务端净化后的手机排版。</div>
+{% endblock %}
+{% block page_actions %}<a class="btn secondary" href="/admin/mobile-content/announcements">返回列表</a>{% endblock %}
+
+{% block content %}
+  {% if errors %}<div class="card">{% for item in errors %}<p class="muted">{{ item }}</p>{% endfor %}</div>{% endif %}
+  <section class="page-section">
+    <div class="filter-card">
+      <form method="post" action="{{ form_action }}" class="form-grid" id="mobile-announcement-form">
+        <div class="field"><label>slug（不填则根据标题生成）</label><input name="slug" value="{{ form.slug or '' }}" maxlength="191" /></div>
+        <div class="field">
+          <label>正文格式</label>
+          <select name="content_format" id="mobile-content-format">
+            <option value="SANITIZED_HTML" {% if form.content_format == 'SANITIZED_HTML' %}selected{% endif %}>富文本（推荐）</option>
+            <option value="PLAIN_TEXT" {% if form.content_format == 'PLAIN_TEXT' %}selected{% endif %}>纯文本</option>
+          </select>
+        </div>
+        <div class="field" style="grid-column:1 / -1">
+          <label>公告内容（四语言）</label>
+          {% for suffix, label in [('zh','简体中文'),('en','English'),('zh_TW','繁體中文'),('ja','日本語')] %}
+            <div class="card" style="padding:14px;margin:12px 0">
+              <h3 style="margin:0 0 10px">{{ label }}</h3>
+              <label>标题<input name="title_i18n_{{ suffix }}" value="{{ form['title_i18n_' ~ suffix] or '' }}" required maxlength="180" /></label>
+              <label>摘要<textarea name="summary_i18n_{{ suffix }}" maxlength="280">{{ form['summary_i18n_' ~ suffix] or '' }}</textarea></label>
+              <label>分类标签<input name="category_label_i18n_{{ suffix }}" maxlength="40" required value="{{ form['category_label_i18n_' ~ suffix] or '' }}" /></label>
+              <label>正文<textarea class="mobile-announcement-content" id="mobile-announcement-content-{{ suffix }}" name="content_i18n_{{ suffix }}" rows="12" required maxlength="50000">{{ form['content_i18n_' ~ suffix] or '' }}</textarea></label>
+            </div>
+          {% endfor %}
+          <input type="hidden" name="title" value="{{ form.title or '' }}" />
+          <input type="hidden" name="summary" value="{{ form.summary or '' }}" />
+          <input type="hidden" name="category_label" value="{{ form.category_label or '公告' }}" />
+          <input type="hidden" name="content" value="{{ form.content or '' }}" />
+          <span class="muted">富文本会在服务端移除脚本、事件属性和非白名单样式；图片使用后台站内上传。</span>
+        </div>
+        <div class="field">
+          <label>保存状态</label>
+          <select name="status">
+            <option value="DRAFT" {% if form.status == 'DRAFT' %}selected{% endif %}>草稿</option>
+            <option value="PUBLISHED" {% if form.status == 'PUBLISHED' %}selected{% endif %}>发布</option>
+            <option value="OFFLINE" {% if form.status == 'OFFLINE' %}selected{% endif %}>下线</option>
+          </select>
+        </div>
+        <div class="field"><label>发布时间（UTC）</label><input name="publish_at" type="datetime-local" value="{{ form.publish_at_input or '' }}" /></div>
+        <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="is_pinned" value="1" {% if form.is_pinned %}checked{% endif %} />置顶</label>
+        <div style="grid-column:1 / -1;display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn" type="submit">保存公告</button>
+          <button class="btn secondary" id="mobile-preview-button" type="button">预览手机排版</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <section class="page-section" id="mobile-preview-section" hidden>
+    <div class="filter-card">
+      <h3 style="margin-top:0">手机端安全预览</h3>
+      <p class="muted" id="mobile-preview-status">正在生成预览…</p>
+      <div style="max-width:390px;margin:16px auto 0;border:1px solid #30343d;border-radius:18px;overflow:hidden;background:#050505;padding:14px">
+        <iframe id="mobile-preview-frame" sandbox="" title="手机端公告预览" style="display:block;width:100%;height:560px;border:0;border-radius:10px;background:#111318"></iframe>
+      </div>
+    </div>
+  </section>
+
+  <script src="/static/vendor/tinymce/tinymce.min.js"></script>
+  <script>
+    (() => {
+      const contents = Array.from(document.querySelectorAll('.mobile-announcement-content'));
+      const previewContent = document.getElementById('mobile-announcement-content-zh');
+      const format = document.getElementById('mobile-content-format');
+      const previewButton = document.getElementById('mobile-preview-button');
+      const previewSection = document.getElementById('mobile-preview-section');
+      const previewStatus = document.getElementById('mobile-preview-status');
+      const previewFrame = document.getElementById('mobile-preview-frame');
+
+      const editorConfig = target => ({
+        target,
+        height: 480,
+        menubar: false,
+        branding: false,
+        promotion: false,
+        convert_urls: false,
+        plugins: 'preview lists link image table code',
+        toolbar: 'undo redo | blocks | bold italic underline | alignleft aligncenter alignright | bullist numlist | link image table | removeformat code preview',
+        images_upload_url: '/admin/uploads/image',
+        automatic_uploads: true,
+        image_advtab: true,
+      });
+
+      const syncEditor = () => {
+        if (format.value === 'SANITIZED_HTML') {
+          if (window.tinymce) contents.forEach((content) => {
+            if (!window.tinymce.get(content.id)) window.tinymce.init(editorConfig(content));
+          });
+          return;
+        }
+        contents.forEach((content) => {
+          const editor = window.tinymce && window.tinymce.get(content.id);
+          if (editor) {
+            content.value = editor.getContent({format: 'text'});
+            editor.remove();
+          }
+        });
+      };
+
+      const escapeHtml = value => value
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;');
+
+      const previewDocument = (body, contentFormat) => {
+        const safeBody = contentFormat === 'PLAIN_TEXT'
+          ? `<div class="plain">${escapeHtml(body)}</div>`
+          : body;
+        return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
+          *{box-sizing:border-box}body{margin:0;padding:18px;color:#eef0f4;background:#111318;font:15px/1.7 system-ui,-apple-system,"Segoe UI",sans-serif;overflow-wrap:anywhere}
+          .plain{white-space:pre-wrap}p{margin:0 0 14px}h1,h2,h3,h4{line-height:1.35;margin:18px 0 10px}img{display:block;max-width:100%;height:auto;margin:12px auto;border-radius:8px}
+          table{width:100%;border-collapse:collapse;display:block;overflow-x:auto}th,td{border:1px solid #343943;padding:7px}a{color:#d6a832;pointer-events:none}blockquote{margin:12px 0;padding:8px 12px;border-left:3px solid #d6a832;background:#181b21}
+        </style></head><body>${safeBody}</body></html>`;
+      };
+
+      format.addEventListener('change', syncEditor);
+      previewButton.addEventListener('click', async () => {
+        const editor = window.tinymce && window.tinymce.get(previewContent.id);
+        const payload = new FormData();
+        payload.set('content_format', format.value);
+        payload.set('content', editor ? editor.getContent() : previewContent.value);
+        previewSection.hidden = false;
+        previewStatus.textContent = '正在生成服务端安全预览…';
+        previewFrame.removeAttribute('srcdoc');
+        try {
+          const response = await fetch('/admin/mobile-content/announcements/preview', {method: 'POST', body: payload, credentials: 'same-origin'});
+          const result = await response.json();
+          if (!response.ok || !result.ok) throw new Error((result.errors || ['预览生成失败']).join('；'));
+          previewFrame.srcdoc = previewDocument(result.content, result.content_format);
+          previewStatus.textContent = '以下内容已经过与保存流程相同的服务端安全净化。';
+          previewSection.scrollIntoView({behavior: 'smooth', block: 'start'});
+        } catch (error) {
+          previewStatus.textContent = error instanceof Error ? error.message : '预览生成失败';
+        }
+      });
+
+      syncEditor();
+    })();
+  </script>
+{% endblock %}

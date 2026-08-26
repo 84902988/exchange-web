@@ -1,0 +1,163 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}手机端内容设置{% endblock %}
+{% block page_title %}手机端内容设置{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">仅驱动手机端展示；数据与 PC 站点配置完全隔离。</div>
+{% endblock %}
+
+{% block content %}
+  {% if notice %}<div class="alert success">{{ notice }}</div>{% endif %}
+  {% if error %}<div class="alert error">{{ error }}</div>{% endif %}
+  {% if errors %}
+    <div class="card">
+      {% for item in errors %}<p class="muted">{{ item }}</p>{% endfor %}
+    </div>
+  {% endif %}
+  <section class="page-section">
+    <div class="filter-card">
+      <form method="post" action="/admin/mobile-content/settings" class="form-grid">
+        <div class="field" style="grid-column:1 / -1">
+          <label>应用名称（四语言）</label>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px">
+            {% for suffix, label in [('zh','简体中文'),('en','English'),('zh_TW','繁體中文'),('ja','日本語')] %}
+              <label>{{ label }}<input name="app_name_i18n_{{ suffix }}" value="{{ form['app_name_i18n_' ~ suffix] or '' }}" required maxlength="80" /></label>
+            {% endfor %}
+          </div>
+          <input type="hidden" name="app_name" value="{{ form.app_name or '' }}" />
+        </div>
+        <div class="field" style="grid-column:1 / -1">
+          <label for="logo_url">手机端 LOGO</label>
+          <div style="display:flex;gap:10px">
+            <input id="logo_url" name="logo_url" value="{{ form.logo_url or '' }}" maxlength="500" readonly style="flex:1" />
+            <input id="logo_url_file" type="file" accept="image/png,image/jpeg,image/webp" hidden />
+            <button type="button" class="btn secondary" data-upload="logo_url">上传图片</button>
+            <button id="clear_logo" type="button" class="btn secondary">移除图片</button>
+          </div>
+          <span class="muted">建议透明 PNG/WebP，建议 512×512，压缩后不超过 2MB；避免直接复用 PC 横版 LOGO。</span>
+        </div>
+        <input id="logo_width" name="logo_width" type="hidden" value="{{ form.logo_width or '' }}" />
+        <input id="logo_height" name="logo_height" type="hidden" value="{{ form.logo_height or '' }}" />
+        <input id="logo_byte_size" name="logo_byte_size" type="hidden" value="{{ form.logo_byte_size or '' }}" />
+        <input id="logo_mime_type" name="logo_mime_type" type="hidden" value="{{ form.logo_mime_type or '' }}" />
+        <div class="field" style="grid-column:1 / -1">
+          <label>首页模块</label>
+          <div style="display:flex;flex-wrap:wrap;gap:10px 18px;padding:10px 0">
+            <label><input type="checkbox" name="home_section_asset_summary" value="1" {% if form.home_sections.asset_summary %}checked{% endif %} /> 登录后资产总览</label>
+            <label><input type="checkbox" name="home_section_quick_entries" value="1" {% if form.home_sections.quick_entries %}checked{% endif %} /> 资产快捷入口</label>
+            <label><input type="checkbox" name="home_section_market_shortcuts" value="1" {% if form.home_sections.market_shortcuts %}checked{% endif %} /> 市场快捷行情</label>
+            <label><input type="checkbox" name="home_section_promos" value="1" {% if form.home_sections.promos %}checked{% endif %} /> 活动轮播</label>
+            <label><input type="checkbox" name="home_section_announcements" value="1" {% if form.home_sections.announcements %}checked{% endif %} /> 公告列表</label>
+          </div>
+          <span class="muted">关闭模块后，手机端不再展示对应区域；活动和公告关闭后公开 bootstrap 也不查询对应列表。</span>
+        </div>
+        <div class="field">
+          <label for="home_market_shortcut_limit">首页行情卡数量</label>
+          <input id="home_market_shortcut_limit" name="home_market_shortcut_limit" type="number" min="1" max="4" value="{{ form.home_market_shortcut_limit or 4 }}" required />
+        </div>
+        <div class="field" style="grid-column:1 / -1">
+          <label>首页行情快捷位</label>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px">
+            {% for selected_symbol in form.home_market_shortcut_symbols %}
+              {% set slot_index = loop.index %}
+              <label>
+                位置 {{ slot_index }}
+                <select name="home_market_shortcut_symbol_{{ slot_index }}" required>
+                  {% for symbol in form.home_market_symbol_options %}
+                    <option value="{{ symbol }}" {% if symbol == selected_symbol %}selected{% endif %}>{{ symbol }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+            {% endfor %}
+          </div>
+          <span class="muted">按位置 1→4 排序，只能选择后台已启用的现货或合约标的；保存后手机首页按此顺序展示。</span>
+        </div>
+        <div class="field">
+          <label for="home_promo_limit">活动轮播最多显示</label>
+          <input id="home_promo_limit" name="home_promo_limit" type="number" min="1" max="8" value="{{ form.home_promo_limit or 8 }}" required />
+        </div>
+        <div class="field">
+          <label for="home_announcement_limit">公告最多显示</label>
+          <input id="home_announcement_limit" name="home_announcement_limit" type="number" min="1" max="10" value="{{ form.home_announcement_limit or 3 }}" required />
+        </div>
+        <div class="field" style="grid-column:1 / -1">
+          <label>资产快捷入口</label>
+          <div style="overflow:auto">
+            <table style="width:100%;min-width:720px">
+              <thead>
+                <tr>
+                  <th style="text-align:left">启用</th>
+                  <th style="text-align:left">功能</th>
+                  <th style="text-align:left">手机端标题</th>
+                  <th style="text-align:left">说明</th>
+                  <th style="text-align:left">排序</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for entry in form.home_quick_entries %}
+                  <tr>
+                    <td><input type="checkbox" name="home_quick_{{ entry.id|lower }}_enabled" value="1" {% if entry.enabled %}checked{% endif %} /></td>
+                    <td><code>{{ entry.id }}</code></td>
+                    <td>
+                      {% for locale, suffix, label in [('zh','zh','简中'),('en','en','EN'),('zh-TW','zh_TW','繁中'),('ja','ja','日本語')] %}
+                        <label style="display:block;margin-bottom:6px">{{ label }}<input name="home_quick_{{ entry.id|lower }}_title_i18n_{{ suffix }}" value="{{ entry.title_i18n[locale] or '' }}" maxlength="12" required /></label>
+                      {% endfor %}
+                      <input type="hidden" name="home_quick_{{ entry.id|lower }}_title" value="{{ entry.title }}" />
+                    </td>
+                    <td>
+                      {% for locale, suffix, label in [('zh','zh','简中'),('en','en','EN'),('zh-TW','zh_TW','繁中'),('ja','ja','日本語')] %}
+                        <label style="display:block;margin-bottom:6px">{{ label }}<input name="home_quick_{{ entry.id|lower }}_description_i18n_{{ suffix }}" value="{{ entry.description_i18n[locale] or '' }}" maxlength="24" required /></label>
+                      {% endfor %}
+                      <input type="hidden" name="home_quick_{{ entry.id|lower }}_description" value="{{ entry.description }}" />
+                    </td>
+                    <td><input name="home_quick_{{ entry.id|lower }}_sort_order" type="number" min="0" max="99" value="{{ entry.sort_order }}" required /></td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          <span class="muted">功能 ID 与 App 白名单路由固定，运营只能调整显隐、标题、说明和顺序，不能填写任意 URL 或跳转目标。</span>
+        </div>
+        <div style="grid-column:1 / -1">
+          <button type="submit" class="btn">保存手机端设置</button>
+        </div>
+      </form>
+    </div>
+  </section>
+  <script>
+    document.querySelectorAll("[data-upload]").forEach((button) => {
+      const name = button.dataset.upload;
+      const input = document.getElementById(name);
+      const fileInput = document.getElementById(`${name}_file`);
+      button.addEventListener("click", () => fileInput.click());
+      fileInput.addEventListener("change", async () => {
+        if (!fileInput.files.length) return;
+        button.disabled = true;
+        const data = new FormData();
+        data.append("file", fileInput.files[0]);
+        try {
+          const response = await fetch("/admin/uploads/image?scope=mobile", {method: "POST", body: data, credentials: "same-origin"});
+          const body = await response.json();
+          if (!response.ok) throw new Error(body.detail || "上传失败");
+          input.value = body.url;
+          if (name === "logo_url") {
+            ["width", "height", "byte_size", "mime_type"].forEach((field) => {
+              document.getElementById(`logo_${field}`).value = body[field] || "";
+            });
+          }
+        } catch (error) {
+          window.alert(error.message || "上传失败");
+        } finally {
+          button.disabled = false;
+          fileInput.value = "";
+        }
+      });
+    });
+    document.getElementById("clear_logo").addEventListener("click", () => {
+      document.getElementById("logo_url").value = "";
+      ["width", "height", "byte_size", "mime_type"].forEach((field) => {
+        document.getElementById(`logo_${field}`).value = "";
+      });
+    });
+  </script>
+{% endblock %}

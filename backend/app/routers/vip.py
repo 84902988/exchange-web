@@ -24,8 +24,14 @@ from app.schemas.vip import (
     VipRcbLockCreateApiResponse,
     VipRcbLockIn,
     VipRcbLocksApiResponse,
+    VipRcbReleaseApiResponse,
 )
-from app.services.rcb_lock_service import RcbLockError, create_user_rcb_lock, list_user_rcb_locks
+from app.services.rcb_lock_service import (
+    RcbLockError,
+    create_user_rcb_lock,
+    list_user_rcb_locks,
+    release_matured_user_rcb_locks,
+)
 from app.services.vip_query import get_vip_overview
 from app.services.vip_service import calculate_user_vip_snapshot
 
@@ -224,3 +230,26 @@ def my_rcb_locks(
 ):
     trace_id = getattr(request.state, "trace_id", None)
     return ok(data=list_user_rcb_locks(db, user_id=int(user_id)), trace_id=trace_id)
+
+
+@router.post("/rcb-locks/release-matured", response_model=VipRcbReleaseApiResponse)
+def release_my_matured_rcb_locks(
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    trace_id = getattr(request.state, "trace_id", None)
+    try:
+        data = release_matured_user_rcb_locks(db, user_id=int(user_id))
+        db.commit()
+        return ok(data=data, trace_id=trace_id)
+    except RcbLockError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"code": "RCB_RELEASE_ERROR", "message": str(exc)})
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to release matured RCB locks for user_id=%s", user_id)
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "INTERNAL_ERROR", "message": "RCB matured lock release failed"},
+        )

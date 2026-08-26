@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -13,6 +13,7 @@ from app.db.models.reference_overlay import ReferenceOverlay
 
 
 STOCK_REFERENCE_OVERLAY_DEFAULT_REFRESH_SECONDS = 15
+IRON_REFERENCE_OVERLAY_STALE_AFTER = timedelta(hours=36)
 
 
 def _decimal_to_text(value: Any) -> str | None:
@@ -89,10 +90,30 @@ def _stock_overlay_should_refresh(overlay: ReferenceOverlay, *, now: datetime) -
     return elapsed >= _refresh_interval_seconds(overlay)
 
 
-def _maybe_refresh_stock_overlay(db: Session, overlay: ReferenceOverlay | None) -> ReferenceOverlay | None:
+def _iron_overlay_should_refresh(overlay: ReferenceOverlay, *, now: datetime) -> bool:
+    if int(overlay.enabled or 0) != 1:
+        return False
+    if _normalize_text(overlay.reference_type or overlay.kind) != "IRON":
+        return False
+    if _normalize_text(overlay.price_source) != "AUTO":
+        return False
+
+    last_sync_at = overlay.last_sync_at
+    if last_sync_at is None:
+        return True
+    if _normalize_text(overlay.sync_status) == "FAILED":
+        return (now - last_sync_at).total_seconds() >= _refresh_interval_seconds(overlay)
+    return last_sync_at.date() < now.date()
+
+
+def _maybe_refresh_auto_overlay(db: Session, overlay: ReferenceOverlay | None) -> ReferenceOverlay | None:
     if overlay is None:
         return None
-    if not _stock_overlay_should_refresh(overlay, now=datetime.utcnow()):
+    now = datetime.utcnow()
+    if not (
+        _stock_overlay_should_refresh(overlay, now=now)
+        or _iron_overlay_should_refresh(overlay, now=now)
+    ):
         return overlay
 
     overlay_id = int(overlay.id)
@@ -145,6 +166,11 @@ def serialize_reference_overlay(
             display_price = last_ref_price
             source_price_label = overlay.last_ref_label or None
         stale = sync_status == "FAILED"
+        if reference_type == "IRON":
+            freshness_at = overlay.price_time or overlay.last_sync_at
+            stale = stale or freshness_at is None or (
+                datetime.utcnow() - freshness_at > IRON_REFERENCE_OVERLAY_STALE_AFTER
+            )
 
     if display_price is None:
         return _disabled_payload(str(overlay.symbol or requested_symbol or "").strip().upper())
@@ -195,10 +221,10 @@ def serialize_reference_overlay(
         "last_ref_price": _decimal_to_text(overlay.last_ref_price),
         "last_ref_label": overlay.last_ref_label,
         "last_sync_at": _datetime_to_text(overlay.last_sync_at),
-        "market_status": overlay.market_status or "UNKNOWN",
-        "market_status_text": overlay.market_status_text,
+        "market_status": "UNKNOWN" if stale else (overlay.market_status or "UNKNOWN"),
+        "market_status_text": "数据延迟" if stale else overlay.market_status_text,
         "price_time": _datetime_to_text(overlay.price_time),
-        "is_realtime": bool(overlay.is_realtime),
+        "is_realtime": bool(overlay.is_realtime) and not stale,
         "kind": overlay.kind,
         "title": localized_title,
         "subtitle": localized_source_label,
@@ -238,7 +264,7 @@ def get_reference_overlay_for_symbol(db: Session, symbol: str, *, locale: str = 
                 .filter(func.replace(ReferenceOverlay.symbol, "-", "") == compact_symbol)
                 .first()
             )
-        overlay = _maybe_refresh_stock_overlay(db, overlay)
+        overlay = _maybe_refresh_auto_overlay(db, overlay)
     except SQLAlchemyError:
         db.rollback()
         raise

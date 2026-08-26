@@ -10,11 +10,15 @@ describe('mobile development launcher', () => {
       'utf8',
     );
     const wakeCall = launcher.indexOf('Wake-EmulatorScreen -Device $Device');
-    const runAndroid = launcher.indexOf('npm.cmd run android');
+    const buildApk = launcher.indexOf('& $GradleWrapperPath');
+    const installApk = launcher.indexOf('install -r $DebugApkPath');
+    const launchApp = launcher.indexOf('shell monkey');
 
     expect(launcher).toContain('shell input keyevent KEYCODE_WAKEUP');
     expect(launcher).toContain('shell wm dismiss-keyguard');
     expect(wakeCall).toBeGreaterThan(-1);
-    expect(runAndroid).toBeGreaterThan(wakeCall);
+    expect(buildApk).toBeGreaterThan(wakeCall);
+    expect(installApk).toBeGreaterThan(buildApk);
+    expect(launchApp).toBeGreaterThan(installApk);
   });
 });

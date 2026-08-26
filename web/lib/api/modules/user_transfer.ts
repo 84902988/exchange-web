@@ -32,16 +32,18 @@ export type UserTransferRecord = {
   fee_amount: string;
   net_amount: string;
   status: string;
-  sender_available_before: string;
-  sender_available_after: string;
-  receiver_available_before: string;
-  receiver_available_after: string;
   remark?: string | null;
   created_at: string;
 };
 
 export type CreateUserTransferResponse = {
   record: UserTransferRecord;
+};
+
+export type UserTransferRequestStatusResponse = {
+  request_id: string;
+  state: "COMPLETED" | "NOT_FOUND";
+  record?: UserTransferRecord | null;
 };
 
 export type GetUserTransferRecordsParams = {
@@ -67,6 +69,14 @@ const UserTransferAPI = {
 
   async createTransfer(payload: CreateUserTransferPayload): Promise<CreateUserTransferResponse> {
     return apiPost<CreateUserTransferResponse, CreateUserTransferPayload>("/user-transfer", payload);
+  },
+
+  async getRequestStatus(requestId: string): Promise<UserTransferRequestStatusResponse> {
+    const qs = new URLSearchParams();
+    qs.set("request_id", requestId.trim());
+    return apiGet<UserTransferRequestStatusResponse>(
+      `/user-transfer/request-status?${qs.toString()}`
+    );
   },
 
   async getRecords(params: GetUserTransferRecordsParams = {}): Promise<GetUserTransferRecordsResponse> {

@@ -135,6 +135,45 @@ describe('MobileKlineChart responsive canvas', () => {
     act(() => renderer.unmount());
   });
 
+  it('separates labels for nearby position prices without moving their price lines', () => {
+    const keys = ['8:ENTRY', '8:TP', '8:SL'];
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = ReactTestRenderer.create(
+        <MobileKlineChart
+          height={220}
+          interval="1d"
+          items={items}
+          referencePriceLines={[
+            {key: keys[0], kind: 'ENTRY', label: 'BUY 开仓均价', price: 178},
+            {key: keys[1], kind: 'TAKE_PROFIT', label: 'BUY 止盈价', price: 177.9},
+            {key: keys[2], kind: 'STOP_LOSS', label: 'BUY 止损价', price: 177.8},
+          ]}
+        />,
+      );
+    });
+
+    const labelYs = keys
+      .map(
+        key =>
+          renderer.root.findByProps({
+            testID: `kline-reference-label-${key}`,
+          }).props.y as number,
+      )
+      .sort((left, right) => left - right);
+    expect(labelYs[1] - labelYs[0]).toBeGreaterThanOrEqual(14);
+    expect(labelYs[2] - labelYs[1]).toBeGreaterThanOrEqual(14);
+
+    const priceLineYs = keys.map(
+      key =>
+        renderer.root.findByProps({
+          testID: `kline-reference-price-line-${key}`,
+        }).props.y1 as number,
+    );
+    expect(Math.max(...priceLineYs) - Math.min(...priceLineYs)).toBeLessThan(3);
+    act(() => renderer.unmount());
+  });
+
   it('removes and restores the indicator pane without removing the overlay', () => {
     const indicatorConfig = defaultConfigForSelection({
       overlay: 'SUPER',

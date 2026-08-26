@@ -10,6 +10,7 @@ from urllib.parse import unquote, urlsplit
 import pytest
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import Response
+from PIL import Image
 from starlette.datastructures import Headers
 
 from app.core.config import settings
@@ -133,6 +134,12 @@ def _synthetic_upload(content: bytes, content_type: str, filename: str = "test.j
     )
 
 
+def _valid_image_bytes(image_format: str = "JPEG", size: tuple[int, int] = (8, 8)) -> bytes:
+    output = BytesIO()
+    Image.new("RGB", size, color=(24, 96, 160)).save(output, format=image_format)
+    return output.getvalue()
+
+
 def _prepare_private_file(monkeypatch, tmp_path: Path) -> Path:
     storage_root = tmp_path / "private" / "kyc"
     storage_root.mkdir(parents=True)
@@ -147,7 +154,7 @@ def test_new_upload_uses_private_storage_key_and_not_public_static(monkeypatch, 
 
     storage_key = asyncio.run(
         kyc_storage.save_kyc_upload(
-            _synthetic_upload(TEST_BYTES, "image/jpeg"),
+            _synthetic_upload(_valid_image_bytes(), "image/jpeg"),
             "front",
         )
     )
@@ -183,6 +190,8 @@ def test_owner_can_read_material_with_safe_headers(monkeypatch, tmp_path, caplog
     assert response.headers["content-type"].startswith("image/jpeg")
     assert response.headers["content-disposition"] == 'inline; filename="kyc-document.jpg"'
     assert response.headers["cache-control"] == "no-store, private"
+    assert response.headers["cross-origin-resource-policy"] == "same-origin"
+    assert response.headers["referrer-policy"] == "no-referrer"
     assert response.headers["x-content-type-options"] == "nosniff"
     assert str(storage_root) not in repr(response.headers)
     assert str(storage_root) not in caplog.text
@@ -199,7 +208,7 @@ def test_other_user_cannot_read_material(monkeypatch, tmp_path):
 
 def test_authorized_admin_can_read_material(monkeypatch, tmp_path):
     _prepare_private_file(monkeypatch, tmp_path)
-    monkeypatch.setattr(kyc_router, "_admin_required", lambda _request, _db: None)
+    monkeypatch.setattr(kyc_router, "_admin_read_required", lambda _request, _db: None)
     response = _get(
         _app_with_submission(_submission()),
         "/admin/kyc/11/materials/front",
@@ -212,7 +221,7 @@ def test_admin_without_kyc_permission_is_rejected(monkeypatch, tmp_path):
     _prepare_private_file(monkeypatch, tmp_path)
     monkeypatch.setattr(
         kyc_router,
-        "_admin_required",
+        "_admin_read_required",
         lambda _request, _db: Response(status_code=403),
     )
     response = _get(
@@ -284,6 +293,8 @@ def test_legacy_public_url_reference_reads_only_from_private_storage(monkeypatch
     assert response.content == TEST_BYTES
     assert serialized is not None
     assert serialized["front_image_url"].startswith("/me/kyc/submissions/")
+    assert serialized["id_number"] != item.id_number
+    assert admin_serialized["id_number_masked"] == serialized["id_number"]
     assert "/static/uploads/kyc/" not in repr(serialized)
     assert admin_serialized["front_image_read_url"].startswith("/admin/kyc/")
     assert "/static/uploads/kyc/" not in repr(admin_serialized)
@@ -337,6 +348,49 @@ def test_upload_type_and_five_megabyte_limit_are_preserved(monkeypatch, tmp_path
     assert too_large.value.detail["code"] == "IMAGE_TOO_LARGE"
 
 
+def test_upload_rejects_fake_or_mismatched_image_content(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "KYC_STORAGE_DIR", str(tmp_path / "private" / "kyc"))
+
+    with pytest.raises(HTTPException) as fake_image:
+        asyncio.run(kyc_storage.save_kyc_upload(
+            _synthetic_upload(TEST_BYTES, "image/jpeg"),
+            "front",
+        ))
+    assert fake_image.value.detail["code"] == "INVALID_IMAGE"
+
+    with pytest.raises(HTTPException) as mismatched_image:
+        asyncio.run(kyc_storage.save_kyc_upload(
+            _synthetic_upload(_valid_image_bytes("PNG"), "image/jpeg"),
+            "front",
+        ))
+    assert mismatched_image.value.detail["code"] == "INVALID_IMAGE"
+
+
+def test_upload_rejects_excessive_dimensions(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "KYC_STORAGE_DIR", str(tmp_path / "private" / "kyc"))
+    monkeypatch.setattr(kyc_storage, "MAX_IMAGE_DIMENSION", 4)
+
+    with pytest.raises(HTTPException) as invalid_dimensions:
+        asyncio.run(kyc_storage.save_kyc_upload(
+            _synthetic_upload(_valid_image_bytes(size=(8, 8)), "image/jpeg"),
+            "front",
+        ))
+    assert invalid_dimensions.value.detail["code"] == "IMAGE_DIMENSIONS_INVALID"
+
+
+def test_private_upload_can_be_removed_after_failed_submission(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "KYC_STORAGE_DIR", str(tmp_path / "private" / "kyc"))
+    reference = asyncio.run(kyc_storage.save_kyc_upload(
+        _synthetic_upload(_valid_image_bytes(), "image/jpeg"),
+        "front",
+    ))
+    stored_path = kyc_storage.resolve_kyc_file(reference).path
+
+    assert kyc_storage.remove_kyc_upload(reference) is True
+    assert stored_path.exists() is False
+    assert kyc_storage.remove_kyc_upload(reference) is False
+
+
 def test_public_static_storage_configuration_is_rejected(monkeypatch):
     monkeypatch.setattr(
         settings,
@@ -369,7 +423,7 @@ def test_upload_requests_private_directory_permissions(monkeypatch, tmp_path):
     monkeypatch.setattr(kyc_storage.os, "chmod", record_chmod)
     asyncio.run(
         kyc_storage.save_kyc_upload(
-            _synthetic_upload(TEST_BYTES, "image/jpeg"),
+            _synthetic_upload(_valid_image_bytes(), "image/jpeg"),
             "front",
         )
     )
@@ -378,7 +432,7 @@ def test_upload_requests_private_directory_permissions(monkeypatch, tmp_path):
     assert any(mode == 0o600 and path.parent == storage_root for path, mode in chmod_calls)
 
 
-def test_admin_kyc_permission_matches_existing_rbac_scope(monkeypatch):
+def test_admin_kyc_uses_dedicated_view_and_manage_permissions(monkeypatch):
     from app.routers import admin_pages
 
     observed = {}
@@ -391,10 +445,20 @@ def test_admin_kyc_permission_matches_existing_rbac_scope(monkeypatch):
         return Response(status_code=403)
 
     monkeypatch.setattr(admin_pages, "require_admin_permission", require_permission)
-    response = kyc_router._admin_required(request, db)
+    response = kyc_router._admin_read_required(request, db)
 
     assert response.status_code == 403
-    assert observed["permission_code"] == "users.view"
+    assert observed["permission_code"] == "kyc.view"
+
+    def require_post_permission(_request, _db, permission_code):
+        observed["post_permission_code"] = permission_code
+        return Response(status_code=403)
+
+    monkeypatch.setattr(admin_pages, "require_admin_post_permission", require_post_permission)
+    response = kyc_router._admin_review_required(request, db)
+
+    assert response.status_code == 403
+    assert observed["post_permission_code"] == "kyc.manage"
 
 
 def test_symlinked_material_is_rejected(monkeypatch, tmp_path):

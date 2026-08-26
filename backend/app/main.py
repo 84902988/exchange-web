@@ -26,12 +26,14 @@ load_dotenv(dotenv_path=ENV_PATH, override=False)
 # Config / Settings (reads from env)
 # =========================
 from app.core.config import settings  # noqa: E402
+from app.core.admin_session import is_admin_session_secret_strong  # noqa: E402
 from app.middleware.geo_restriction import GeoRestrictionMiddleware  # noqa: E402
 from app.services.public_static_files import KycIsolatedStaticFiles  # noqa: E402
 
 # Routers
 from app.routers.health import router as health_router  # noqa: E402
 from app.routers.admin_pages import router as admin_pages_router  # noqa: E402
+from app.routers.admin_mobile_content import router as admin_mobile_content_router  # noqa: E402
 from app.routers.me import profile_router as user_profile_router  # noqa: E402
 from app.routers.me import router as me_router  # noqa: E402
 from app.routers.auth_jwt import router as auth_jwt_router  # noqa: E402
@@ -65,7 +67,10 @@ from app.routers.user_invite import router as user_invite_router
 from app.routers.user_invited_friends import router as user_invited_friends_router
 from app.routers.stock_token import router as stock_token_router
 from app.routers.announcement_reads import router as announcement_reads_router
+from app.routers.account_email import router as account_email_router
+from app.routers.account_security import router as account_security_router
 from app.routers.site_content import router as site_content_router
+from app.routers.mobile_content import router as mobile_content_router
 from app.routers.support_tickets import router as support_tickets_router
 from app.routers.activity import router as activity_router
 from app.routers.geo_access import router as geo_access_router
@@ -135,6 +140,10 @@ _require_env(
         "MORALIS_WEBHOOK_SECRET",
     ]
 )
+if not is_admin_session_secret_strong(os.getenv("JWT_SECRET")):
+    raise RuntimeError(
+        "JWT_SECRET must contain at least 32 non-placeholder bytes for admin sessions"
+    )
 
 # 启动日志：不要打印敏感值，只打印长度或是否存在。
 app = FastAPI(
@@ -255,6 +264,7 @@ app.add_middleware(
 # Routers
 # =========================
 app.include_router(admin_pages_router)
+app.include_router(admin_mobile_content_router)
 app.include_router(activity_admin_router)
 
 # health routes
@@ -303,7 +313,10 @@ app.include_router(user_invite_router)
 app.include_router(user_invited_friends_router)
 app.include_router(stock_token_router)
 app.include_router(announcement_reads_router)
+app.include_router(account_email_router)
+app.include_router(account_security_router)
 app.include_router(site_content_router)
+app.include_router(mobile_content_router)
 app.include_router(support_tickets_router)
 app.include_router(activity_router)
 app.include_router(kyc_router)

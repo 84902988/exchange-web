@@ -4,12 +4,14 @@ import os
 import re
 import uuid
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
 from urllib.parse import unquote, urlsplit
 
 from fastapi import HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from PIL import Image, UnidentifiedImageError
 
 from app.core.config import BASE_DIR, settings
 
@@ -20,6 +22,8 @@ ALLOWED_IMAGE_TYPES = {
     "image/webp": ".webp",
 }
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
+MAX_IMAGE_DIMENSION = 4096
+MAX_IMAGE_PIXELS = 16_000_000
 KYC_STORAGE_KEY_PREFIX = "kyc:"
 LEGACY_KYC_URL_PREFIX = "/static/uploads/kyc/"
 _SAFE_FILENAME_RE = re.compile(r"^[0-9a-f]{32}\.(?:jpg|png|webp)$", re.IGNORECASE)
@@ -27,6 +31,11 @@ _MEDIA_TYPES = {
     ".jpg": "image/jpeg",
     ".png": "image/png",
     ".webp": "image/webp",
+}
+_EXPECTED_IMAGE_FORMATS = {
+    ".jpg": "JPEG",
+    ".png": "PNG",
+    ".webp": "WEBP",
 }
 
 
@@ -89,8 +98,40 @@ def build_kyc_storage_key(filename: str) -> str:
     return f"{KYC_STORAGE_KEY_PREFIX}{safe_filename}"
 
 
+def _validate_kyc_image_content(content: bytes, extension: str, label: str) -> None:
+    expected_format = _EXPECTED_IMAGE_FORMATS[extension]
+    try:
+        with Image.open(BytesIO(content)) as image:
+            actual_format = (image.format or "").upper()
+            width, height = image.size
+            if actual_format != expected_format:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "INVALID_IMAGE", "message": f"{label} image format does not match its type"},
+                )
+            if (
+                width <= 0
+                or height <= 0
+                or width > MAX_IMAGE_DIMENSION
+                or height > MAX_IMAGE_DIMENSION
+                or width * height > MAX_IMAGE_PIXELS
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "IMAGE_DIMENSIONS_INVALID", "message": f"{label} image dimensions are invalid"},
+                )
+            image.verify()
+    except HTTPException:
+        raise
+    except (Image.DecompressionBombError, UnidentifiedImageError, OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_IMAGE", "message": f"{label} image content is invalid"},
+        ) from exc
+
+
 async def save_kyc_upload(file: UploadFile, label: str) -> str:
-    content_type = (file.content_type or "").lower()
+    content_type = (file.content_type or "").split(";", 1)[0].strip().lower()
     extension = ALLOWED_IMAGE_TYPES.get(content_type)
     if not extension:
         raise HTTPException(
@@ -111,6 +152,8 @@ async def save_kyc_upload(file: UploadFile, label: str) -> str:
             detail={"code": "IMAGE_TOO_LARGE", "message": f"{label} image is too large"},
         )
 
+    _validate_kyc_image_content(content, extension, label)
+
     storage_root = get_kyc_storage_dir()
     storage_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
@@ -126,6 +169,17 @@ async def save_kyc_upload(file: UploadFile, label: str) -> str:
     except OSError:
         pass
     return build_kyc_storage_key(filename)
+
+
+def remove_kyc_upload(reference: Optional[str]) -> bool:
+    if not reference:
+        return False
+    try:
+        stored_file = resolve_kyc_file(reference)
+        stored_file.path.unlink(missing_ok=True)
+    except (KycStorageError, OSError):
+        return False
+    return True
 
 
 def resolve_kyc_file(reference: str) -> KycStoredFile:
@@ -164,6 +218,8 @@ def build_kyc_file_response(reference: Optional[str]) -> FileResponse:
             "Cache-Control": "no-store, private",
             "Content-Disposition": f'inline; filename="kyc-document{stored_file.extension}"',
             "Content-Security-Policy": "default-src 'none'; sandbox",
+            "Cross-Origin-Resource-Policy": "same-origin",
+            "Referrer-Policy": "no-referrer",
             "X-Content-Type-Options": "nosniff",
         },
     )

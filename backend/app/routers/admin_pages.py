@@ -16,7 +16,7 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
-from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
@@ -27,8 +27,15 @@ from sqlalchemy import func, text
 from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.orm import Session
 
+from app.core.admin_session import (
+    ADMIN_SESSION_MAX_AGE_SECONDS,
+    AdminSessionConfigurationError,
+    create_admin_session_token,
+    verify_admin_session_token,
+)
 from app.core.chain_capabilities import CONFIG_ONLY, EVM, READY, get_chain_capability, get_chain_runtime_status
 from app.core.config import settings
+from app.core.cookie_policy import get_cookie_options
 from app.core.redis import get_redis
 from app.core.request_utils import get_client_ip, get_user_agent
 from app.core.security import verify_password
@@ -643,15 +650,16 @@ templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 logger = logging.getLogger(__name__)
 
 COOKIE_NAME = "admin_auth"
-COOKIE_VALUE = "1"
 ADMIN_USER_ID_COOKIE_NAME = "admin_user_id"
 ADMIN_USERNAME_COOKIE_NAME = "admin_username"
-ADMIN_COOKIE_MAX_AGE = 3600 * 8
+ADMIN_COOKIE_MAX_AGE = ADMIN_SESSION_MAX_AGE_SECONDS
+ADMIN_SESSION_REQUEST_STATE_KEY = "_verified_admin_session_principal"
 ADMIN_PERMISSION_SUPER_ADMIN_ONLY = "__super_admin_only__"
 ADMIN_POST_FORBIDDEN_MESSAGE = "当前账号没有执行此操作的权限，请联系超级管理员"
 ADMIN_STATUS_ACTIVE = "ACTIVE"
 ADMIN_LOGIN_INVALID_MESSAGE = "用户名或密码错误"
 ADMIN_LOGIN_DISABLED_MESSAGE = "管理员账号已停用"
+ADMIN_LOGIN_SESSION_UNAVAILABLE_MESSAGE = "后台登录服务配置异常，请联系管理员"
 ADMIN_LOGIN_CAPTCHA_REQUIRED_MESSAGE = "请输入图形验证码"
 ADMIN_LOGIN_CAPTCHA_INVALID_MESSAGE = "验证码错误或已过期"
 ADMIN_LOGIN_CAPTCHA_UNAVAILABLE_MESSAGE = "验证码服务暂不可用，请稍后重试"
@@ -676,6 +684,8 @@ UPLOAD_IMAGE_DEFAULT_EXT = {
 UPLOAD_SITE_MEDIA_MAX_BYTES = 20 * 1024 * 1024
 UPLOAD_SITE_VIDEO_MAX_BYTES = 100 * 1024 * 1024
 UPLOAD_SITE_OUTPUT_MAX_BYTES = 20 * 1024 * 1024
+UPLOAD_SITE_IMAGE_MAX_PIXELS = 20_000_000
+UPLOAD_MOBILE_OUTPUT_MAX_BYTES = 2_000_000
 UPLOAD_SITE_IMAGE_TYPES = {
     **UPLOAD_IMAGE_TYPES,
 }
@@ -718,6 +728,12 @@ def _ensure_site_upload_dir() -> Path:
     return upload_dir
 
 
+def _ensure_mobile_upload_dir() -> Path:
+    upload_dir = BASE_DIR / "static" / "uploads" / "mobile"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    return upload_dir
+
+
 def _ensure_output_within_limit(target: Path, detail: str) -> None:
     if target.stat().st_size <= UPLOAD_SITE_OUTPUT_MAX_BYTES:
         return
@@ -733,6 +749,14 @@ def _compress_site_image(content: bytes, target: Path) -> None:
 
     try:
         with Image.open(io.BytesIO(content)) as image:
+            if (
+                image.width <= 0
+                or image.height <= 0
+                or image.width > 10_000
+                or image.height > 10_000
+                or image.width * image.height > UPLOAD_SITE_IMAGE_MAX_PIXELS
+            ):
+                raise ValueError("image dimensions exceed safe limits")
             image = ImageOps.exif_transpose(image)
             resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
             image.thumbnail((1920, 1920), resampling)
@@ -830,7 +854,7 @@ ADMIN_GET_PERMISSION_EXACT: Dict[str, str] = {
     "/admin/trading-dashboard": "dashboard.view",
     "/admin/risk-dashboard": "dashboard.view",
     "/admin/users": "users.view",
-    "/admin/kyc/submissions": "users.view",
+    "/admin/kyc/submissions": "kyc.view",
     "/admin/assets": "assets.view",
     "/admin/balance-logs": "balance_logs.view",
     "/admin/deposit-records": "deposit_records.view",
@@ -875,6 +899,7 @@ ADMIN_GET_PERMISSION_EXACT: Dict[str, str] = {
     "/admin/system/services": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/system/rq": ADMIN_PERMISSION_SUPER_ADMIN_ONLY,
     "/admin/site-settings": "site_settings.manage",
+    "/admin/mobile-content/settings": "mobile_content.manage",
     "/admin/site-about-page": "site_content.manage",
     "/admin/site-legal-pages": "site_content.manage",
     "/admin/support-tickets": "support_tickets.manage",
@@ -883,6 +908,7 @@ ADMIN_GET_PERMISSION_EXACT: Dict[str, str] = {
 }
 
 ADMIN_GET_PERMISSION_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("/admin/kyc", "kyc.view"),
     ("/admin/pairs", "trading_pairs.manage"),
     ("/admin/reference-overlays", "trading_pairs.manage"),
     ("/admin/contract-symbols", "contract_symbols.manage"),
@@ -897,6 +923,7 @@ ADMIN_GET_PERMISSION_PREFIXES: tuple[tuple[str, str], ...] = (
     ("/admin/stock-token-locks", "stock_locks.view"),
     ("/admin/stock-token-release-logs", "stock_locks.view"),
     ("/admin/home-banners", "banners.manage"),
+    ("/admin/mobile-content", "mobile_content.manage"),
     ("/admin/activity-banners", "banners.manage"),
     ("/admin/activities", "banners.manage"),
     ("/admin/announcements", "announcements.manage"),
@@ -1022,23 +1049,16 @@ def _verify_admin_login_captcha(captcha_id: str, captcha_code: str) -> tuple[boo
 
 
 def get_admin_from_request(request: Request) -> Optional[Dict[str, Any]]:
-    if request.cookies.get(COOKIE_NAME) != COOKIE_VALUE:
-        return None
+    if hasattr(request.state, ADMIN_SESSION_REQUEST_STATE_KEY):
+        return getattr(request.state, ADMIN_SESSION_REQUEST_STATE_KEY)
 
-    admin_user_id = str(request.cookies.get(ADMIN_USER_ID_COOKIE_NAME) or "").strip()
-    admin_username = str(request.cookies.get(ADMIN_USERNAME_COOKIE_NAME) or "").strip()
-    if not admin_user_id or not admin_username:
-        return None
-
-    try:
-        parsed_admin_user_id = int(admin_user_id)
-    except ValueError:
-        return None
-
-    return {
-        "id": parsed_admin_user_id,
-        "username": unquote(admin_username),
-    }
+    principal = verify_admin_session_token(
+        request.cookies.get(COOKIE_NAME),
+        secret=getattr(settings, "JWT_SECRET", None),
+        max_age_seconds=ADMIN_COOKIE_MAX_AGE,
+    )
+    setattr(request.state, ADMIN_SESSION_REQUEST_STATE_KEY, principal)
+    return principal
 
 
 def _default_pagination() -> Dict[str, int]:
@@ -2145,6 +2165,8 @@ def _build_admin_roles_redirect_url(
 _ADMIN_ROLE_PERMISSION_DISPLAY: Dict[str, Dict[str, str]] = {
     "dashboard.view": {"name": "仪表盘查", "description": "可查看后台首页指标和运营概览"},
     "users.view": {"name": "用户管理查看", "description": "可查看用户列表、用户详情和用户基础信息"},
+    "kyc.view": {"name": "KYC 资料查看", "description": "可查看身份认证记录和受保护的证件材料"},
+    "kyc.manage": {"name": "KYC 审核管理", "description": "可通过或拒绝身份认证申请"},
     "assets.view": {"name": "资产查询", "description": "可查看用户资产、平台资产与资产查询页面"},
     "balance_logs.view": {"name": "资金流水查看", "description": "可查看用户资金流水记"},
     "deposit_records.view": {"name": "充值记录查", "description": "可查看用户充值记"},
@@ -2185,6 +2207,7 @@ _ADMIN_ROLE_PERMISSION_DISPLAY: Dict[str, Dict[str, str]] = {
     "banners.manage": {"name": "Banner 管理", "description": "可维护首页 Banner 和运营活动展示"},
     "announcements.manage": {"name": "公告管理", "description": "可维护公告内容和上下架状"},
     "site_content.manage": {"name": "内容管理", "description": "可维护站点配置、Banner、公告和图片上传"},
+    "mobile_content.manage": {"name": "手机端内容管理", "description": "可维护独立的手机端设置、Banner、公告与移动图片"},
     "support_tickets.manage": {"name": "支持工单管理", "description": "可查看、回复和更新用户支持工单状态"},
     "audit.view": {"name": "操作审计查看", "description": "可查看后台操作审计记"},
     "admin_users.manage": {"name": "管理员账号管", "description": "可新增、启停、重置后台管理员账号，并执行用户账号高风险控"},
@@ -2204,6 +2227,8 @@ _ADMIN_ROLE_PERMISSION_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         "用户资料、资金记录、提现审核、平台调账和资产配置",
         (
             "users.view",
+            "kyc.view",
+            "kyc.manage",
             "assets.view",
             "balance_logs.view",
             "deposit_records.view",
@@ -2262,7 +2287,7 @@ _ADMIN_ROLE_PERMISSION_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
         "内容管理",
         "站点配置、Banner、公告和运营内容",
-        ("site_settings.manage", "banners.manage", "announcements.manage", "site_content.manage"),
+        ("site_settings.manage", "banners.manage", "announcements.manage", "site_content.manage", "mobile_content.manage"),
     ),
 )
 
@@ -2366,21 +2391,94 @@ def render_inline(
     return HTMLResponse(content=template.render(**data), status_code=status_code)
 
 
-def _set_admin_login_cookies(response: Response, admin_user: AdminUser) -> None:
-    cookie_options = {
-        "httponly": True,
+def _admin_cookie_scopes(request: Request) -> tuple[dict[str, Any], list[tuple[str, Optional[str]]]]:
+    shared_options = get_cookie_options(request)
+    options = {
+        "domain": None,
+        "secure": bool(shared_options.get("secure")),
         "samesite": "lax",
-        "max_age": ADMIN_COOKIE_MAX_AGE,
     }
-    response.set_cookie(key=COOKIE_NAME, value=COOKIE_VALUE, **cookie_options)
-    response.set_cookie(key=ADMIN_USER_ID_COOKIE_NAME, value=str(admin_user.id), **cookie_options)
-    response.set_cookie(key=ADMIN_USERNAME_COOKIE_NAME, value=quote(admin_user.username), **cookie_options)
+    cookie_path = str(getattr(settings, "COOKIE_PATH", "/") or "/")
+    legacy_domain = shared_options.get("domain")
+    scopes: list[tuple[str, Optional[str]]] = []
+    for scope in (
+        (cookie_path, None),
+        ("/", None),
+        (cookie_path, legacy_domain),
+        ("/", legacy_domain),
+    ):
+        if scope not in scopes:
+            scopes.append(scope)
+    return options, scopes
 
 
-def _delete_admin_login_cookies(response: Response) -> None:
-    response.delete_cookie(COOKIE_NAME)
-    response.delete_cookie(ADMIN_USER_ID_COOKIE_NAME)
-    response.delete_cookie(ADMIN_USERNAME_COOKIE_NAME)
+def _expire_admin_cookie(
+    response: Response,
+    *,
+    key: str,
+    options: dict[str, Any],
+    path: str,
+    domain: Optional[str],
+) -> None:
+    response.delete_cookie(
+        key=key,
+        path=path,
+        domain=domain,
+        secure=bool(options.get("secure")),
+        httponly=True,
+        samesite=str(options.get("samesite") or "lax"),
+    )
+
+
+def _set_admin_login_cookies(response: Response, request: Request, session_token: str) -> None:
+    options, scopes = _admin_cookie_scopes(request)
+    target_scope = (str(getattr(settings, "COOKIE_PATH", "/") or "/"), None)
+
+    # Retire the former unsigned identity cookies on every successful login.
+    for legacy_name in (ADMIN_USER_ID_COOKIE_NAME, ADMIN_USERNAME_COOKIE_NAME):
+        for path, domain in scopes:
+            _expire_admin_cookie(
+                response,
+                key=legacy_name,
+                options=options,
+                path=path,
+                domain=domain,
+            )
+
+    # If the configured domain/path differs from the legacy host-only root
+    # cookie, explicitly expire those historical scopes before setting v1.
+    for path, domain in scopes[1:]:
+        _expire_admin_cookie(
+            response,
+            key=COOKIE_NAME,
+            options=options,
+            path=path,
+            domain=domain,
+        )
+
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=session_token,
+        httponly=True,
+        secure=bool(options.get("secure")),
+        samesite=str(options.get("samesite") or "lax"),
+        max_age=ADMIN_COOKIE_MAX_AGE,
+        path=target_scope[0],
+        domain=target_scope[1],
+    )
+
+
+def _delete_admin_login_cookies(response: Response, request: Request) -> None:
+    options, scopes = _admin_cookie_scopes(request)
+    for cookie_name in (COOKIE_NAME, ADMIN_USER_ID_COOKIE_NAME, ADMIN_USERNAME_COOKIE_NAME):
+        for path, domain in scopes:
+            _expire_admin_cookie(
+                response,
+                key=cookie_name,
+                options=options,
+                path=path,
+                domain=domain,
+            )
 
 
 def _path_matches_admin_prefix(path: str, prefix: str) -> bool:
@@ -2454,10 +2552,71 @@ def _render_admin_post_forbidden() -> Response:
     )
 
 
+def _origin_identity(value: str) -> Optional[tuple[str, str, int]]:
+    try:
+        parsed = urlsplit(value)
+        scheme = parsed.scheme.lower()
+        hostname = (parsed.hostname or "").lower()
+        if (
+            scheme not in {"http", "https"}
+            or not hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            return None
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except (TypeError, ValueError):
+        return None
+    return scheme, hostname, port
+
+
+def _request_origin_identity(request: Request) -> Optional[tuple[str, str, int]]:
+    forwarded_proto = (
+        request.headers.get("x-forwarded-proto") or ""
+    ).split(",", 1)[0].strip()
+    forwarded_host = (
+        request.headers.get("x-forwarded-host") or ""
+    ).split(",", 1)[0].strip()
+    scheme = forwarded_proto or request.url.scheme
+    host = forwarded_host or request.headers.get("host") or request.url.netloc
+    return _origin_identity(f"{scheme}://{host}")
+
+
+def _admin_mutation_is_same_origin(request: Request) -> bool:
+    if request.method.upper() in {"GET", "HEAD", "OPTIONS"}:
+        return True
+    expected = _request_origin_identity(request)
+    origin = (request.headers.get("origin") or "").strip()
+    if origin:
+        if origin.lower() == "null":
+            return False
+        return expected is not None and _origin_identity(origin) == expected
+    referer = (request.headers.get("referer") or "").strip()
+    return bool(
+        referer
+        and expected is not None
+        and _origin_identity(referer) == expected
+    )
+
+
+def _render_admin_csrf_forbidden() -> Response:
+    return HTMLResponse(
+        content=(
+            "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"UTF-8\">"
+            "<title>请求来源无效</title></head><body>"
+            "<p>请求来源校验失败，请从当前后台页面重新操作。</p>"
+            "</body></html>"
+        ),
+        status_code=403,
+    )
+
+
 def require_admin_post_permission(request: Request, db: Session, permission_code: str) -> Optional[Response]:
     redir = require_admin(request)
     if redir:
         return redir
+    if not _admin_mutation_is_same_origin(request):
+        return _render_admin_csrf_forbidden()
 
     try:
         rbac_context = get_current_admin_rbac_context(request, db)
@@ -2497,22 +2656,36 @@ async def upload_admin_site_image(
 ):
     if get_admin_from_request(request) is None:
         raise HTTPException(status_code=401, detail="Admin login required")
+    if not _admin_mutation_is_same_origin(request):
+        raise HTTPException(status_code=403, detail="Admin request origin is invalid")
     db = SessionLocal()
     try:
         rbac_context = get_current_admin_rbac_context(request, db)
     finally:
         db.close()
     current_permissions = rbac_context.get("permissions") or set()
-    if not (
-        bool(rbac_context.get("is_super_admin"))
+    is_super_admin = bool(rbac_context.get("is_super_admin"))
+    can_upload_general_media = (
+        is_super_admin
         or "site_content.manage" in current_permissions
         or "trading_pairs.manage" in current_permissions
-    ):
+    )
+    can_upload_mobile_raster = "mobile_content.manage" in current_permissions
+    upload_scope = str(request.query_params.get("scope") or "").strip().lower()
+    if upload_scope not in {"", "mobile"}:
+        raise HTTPException(status_code=400, detail="上传作用域无效")
+    is_mobile_upload = upload_scope == "mobile"
+    if is_mobile_upload:
+        if not (is_super_admin or can_upload_mobile_raster):
+            return _render_admin_post_forbidden()
+    elif not can_upload_general_media:
         return _render_admin_post_forbidden()
 
     content_type = _normalize_upload_content_type(file.content_type)
     original_ext = Path(file.filename or "").suffix.lower()
     media_type = _validate_site_media_type(content_type, original_ext)
+    if is_mobile_upload and media_type != "image":
+        raise HTTPException(status_code=400, detail="手机端内容权限仅允许上传 PNG/JPEG/WebP 位图")
 
     max_bytes = UPLOAD_SITE_VIDEO_MAX_BYTES if media_type == "video" else UPLOAD_SITE_MEDIA_MAX_BYTES
     content = await file.read(max_bytes + 1)
@@ -2524,7 +2697,11 @@ async def upload_admin_site_image(
             raise HTTPException(status_code=400, detail="视频最大 100MB，上传后会自动转码压缩")
         raise HTTPException(status_code=400, detail="图片最大 20MB，上传后会自动压缩")
 
-    upload_dir = _ensure_site_upload_dir()
+    upload_dir = (
+        _ensure_mobile_upload_dir()
+        if is_mobile_upload
+        else _ensure_site_upload_dir()
+    )
     if media_type == "video":
         target = _transcode_site_video(content, original_ext, upload_dir)
     elif media_type == "svg":
@@ -2534,10 +2711,27 @@ async def upload_admin_site_image(
     else:
         target = upload_dir / f"{uuid.uuid4().hex}.webp"
         _compress_site_image(content, target)
+        if is_mobile_upload and target.stat().st_size > UPLOAD_MOBILE_OUTPUT_MAX_BYTES:
+            target.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail="手机端图片压缩后仍超过 2MB，请降低尺寸")
 
     filename = target.name
-    url = f"/static/uploads/site/{filename}"
-    return {"url": url, "location": url}
+    url_prefix = "/static/uploads/mobile" if is_mobile_upload else "/static/uploads/site"
+    url = f"{url_prefix}/{filename}"
+    response_payload: dict[str, Any] = {"url": url, "location": url}
+    if media_type == "image":
+        from PIL import Image
+
+        with Image.open(target) as output_image:
+            response_payload.update(
+                {
+                    "width": int(output_image.width),
+                    "height": int(output_image.height),
+                    "byte_size": int(target.stat().st_size),
+                    "mime_type": "image/webp",
+                }
+            )
+    return response_payload
 
 
 @router.post("/asset-configs/upload-asset-icon")
@@ -2842,13 +3036,29 @@ def login_submit(
             status_code=400,
         )
 
+    try:
+        session_token = create_admin_session_token(
+            admin_id=int(admin_user.id),
+            username=str(admin_user.username),
+            secret=getattr(settings, "JWT_SECRET", None),
+            max_age_seconds=ADMIN_COOKIE_MAX_AGE,
+        )
+    except (AdminSessionConfigurationError, TypeError, ValueError):
+        logger.exception("Admin login session signing is unavailable")
+        return render(
+            request,
+            "admin/login.html",
+            ctx=_admin_login_template_ctx(error=ADMIN_LOGIN_SESSION_UNAVAILABLE_MESSAGE),
+            status_code=503,
+        )
+
     admin_user.last_login_at = datetime.utcnow()
     admin_user.updated_at = datetime.utcnow()
     db.add(admin_user)
     db.commit()
 
     resp = RedirectResponse(url="/admin/dashboard", status_code=302)
-    _set_admin_login_cookies(resp, admin_user)
+    _set_admin_login_cookies(resp, request, session_token)
     return resp
 
 
@@ -15879,7 +16089,7 @@ def support_ticket_status_submit(
 
 
 @router.get("/logout")
-def logout():
+def logout(request: Request):
     resp = RedirectResponse(url="/admin/login", status_code=302)
-    _delete_admin_login_cookies(resp)
+    _delete_admin_login_cookies(resp, request)
     return resp

@@ -18,7 +18,7 @@ class User(Base):
 
     # ✅ 对齐数据库：bigint unsigned NOT NULL AUTO_INCREMENT
     id: Mapped[int] = mapped_column(
-        MySQL_BIGINT(unsigned=True),
+        MySQL_BIGINT(unsigned=True).with_variant(Integer(), "sqlite"),
         primary_key=True,
         autoincrement=True,
     )

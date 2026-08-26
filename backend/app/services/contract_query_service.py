@@ -1043,6 +1043,7 @@ def get_user_contract_trades(
         .limit(normalized_page_size)
         .all()
     )
+    close_reasons_by_order_id = _contract_trade_close_reasons_by_order_id(db, rows)
 
     return ContractTradeListResponse(
         items=[
@@ -1062,6 +1063,7 @@ def get_user_contract_trades(
                 fee_amount=_fmt_decimal(trade.fee_amount if has_fee_amount else Decimal("0")),
                 spread_fee=_fmt_decimal(trade.spread_fee),
                 realized_pnl=_fmt_decimal(trade.realized_pnl),
+                close_reason=close_reasons_by_order_id.get(int(trade.order_id)),
                 created_at=_fmt_datetime(trade.created_at),
             )
             for trade in rows
@@ -1070,3 +1072,31 @@ def get_user_contract_trades(
         page=normalized_page,
         page_size=normalized_page_size,
     )
+
+
+def _contract_trade_close_reasons_by_order_id(
+    db: Session,
+    trades: list[ContractTrade],
+) -> dict[int, str]:
+    order_ids = sorted(
+        {
+            int(trade.order_id)
+            for trade in trades
+            if getattr(trade, "order_id", None) is not None
+            and str(getattr(trade, "action", "") or "").strip().upper() == "CLOSE"
+        }
+    )
+    if not order_ids:
+        return {}
+
+    rows = (
+        db.query(ContractOrder.id, ContractOrder.fail_reason)
+        .filter(ContractOrder.id.in_(order_ids))
+        .all()
+    )
+    result: dict[int, str] = {}
+    for order_id, fail_reason in rows:
+        normalized_reason = str(fail_reason or "").strip().upper()
+        if normalized_reason:
+            result[int(order_id)] = normalized_reason
+    return result

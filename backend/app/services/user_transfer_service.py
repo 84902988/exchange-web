@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Optional
@@ -18,6 +20,7 @@ from app.schemas.user_transfer import (
     UserTransferRecordItem,
     UserTransferRecordsData,
     UserTransferRequest,
+    UserTransferRequestStatusData,
     UserTransferSubmitData,
 )
 from app.services.balance import FUNDING_BALANCE_CHAIN_KEY
@@ -37,6 +40,10 @@ class UserTransferNotFound(UserTransferServiceError):
 
 class UserTransferInsufficientBalance(UserTransferServiceError):
     code = "INSUFFICIENT_AVAILABLE_BALANCE"
+
+
+class UserTransferIdempotencyConflict(UserTransferServiceError):
+    code = "IDEMPOTENCY_KEY_REUSE_MISMATCH"
 
 
 class UserTransferService:
@@ -85,29 +92,46 @@ class UserTransferService:
         payload: UserTransferRequest,
     ) -> UserTransferSubmitData:
         request_id = self._normalize_request_id(payload.request_id)
-        existing = self._find_existing(db, from_user_id=from_user_id, request_id=request_id)
-        if existing:
-            return UserTransferSubmitData(record=self._to_record_item(existing, current_user_id=from_user_id))
-
         symbol = self._normalize_symbol(payload.symbol)
         amount = self._normalize_amount(payload.amount)
         recipient_email = self._normalize_email(payload.recipient_email)
         remark = (payload.remark or "").strip() or None
+        request_fingerprint = self._build_request_fingerprint(
+            recipient_email=recipient_email,
+            symbol=symbol,
+            amount=amount,
+            remark=remark,
+        )
+        existing = self._find_existing(db, from_user_id=from_user_id, request_id=request_id)
+        if existing:
+            self._assert_idempotency_match(
+                existing,
+                request_fingerprint=request_fingerprint,
+                recipient_email=recipient_email,
+                symbol=symbol,
+                amount=amount,
+                remark=remark,
+            )
+            return UserTransferSubmitData(record=self._to_record_item(existing, current_user_id=from_user_id))
 
         try:
-            sender = self._get_user(db, from_user_id, for_update=True)
-            self._ensure_active_user(sender, "sender")
-
-            recipient = (
-                db.query(User)
-                .filter(User.email == recipient_email)
-                .with_for_update()
-                .first()
-            )
-            if not recipient:
+            recipient_candidate = db.query(User).filter(User.email == recipient_email).first()
+            if not recipient_candidate:
                 raise UserTransferNotFound("recipient not found")
-            if int(recipient.id) == int(from_user_id):
+            if int(recipient_candidate.id) == int(from_user_id):
                 raise UserTransferBadRequest("cannot transfer to yourself")
+
+            locked_users = self._lock_users(
+                db,
+                user_ids=[int(from_user_id), int(recipient_candidate.id)],
+            )
+            sender = locked_users.get(int(from_user_id))
+            recipient = locked_users.get(int(recipient_candidate.id))
+            if not sender:
+                raise UserTransferBadRequest("user not found")
+            if not recipient or self._normalize_email(recipient.email).casefold() != recipient_email.casefold():
+                raise UserTransferNotFound("recipient not found")
+            self._ensure_active_user(sender, "sender")
             self._ensure_active_user(recipient, "recipient")
 
             now = datetime.utcnow()
@@ -143,6 +167,7 @@ class UserTransferService:
             record = UserTransfer(
                 transfer_no=transfer_no,
                 request_id=request_id,
+                request_fingerprint=request_fingerprint,
                 from_user_id=int(sender.id),
                 to_user_id=int(recipient.id),
                 coin_symbol=symbol,
@@ -218,8 +243,41 @@ class UserTransferService:
             db.rollback()
             existing = self._find_existing(db, from_user_id=from_user_id, request_id=request_id)
             if existing:
+                self._assert_idempotency_match(
+                    existing,
+                    request_fingerprint=request_fingerprint,
+                    recipient_email=recipient_email,
+                    symbol=symbol,
+                    amount=amount,
+                    remark=remark,
+                )
                 return UserTransferSubmitData(record=self._to_record_item(existing, current_user_id=from_user_id))
             raise
+
+    def get_request_status(
+        self,
+        db: Session,
+        *,
+        from_user_id: int,
+        request_id: str,
+    ) -> UserTransferRequestStatusData:
+        normalized_request_id = self._normalize_request_id(request_id)
+        existing = self._find_existing(
+            db,
+            from_user_id=from_user_id,
+            request_id=normalized_request_id,
+        )
+        if not existing:
+            return UserTransferRequestStatusData(
+                request_id=normalized_request_id,
+                state="NOT_FOUND",
+                record=None,
+            )
+        return UserTransferRequestStatusData(
+            request_id=normalized_request_id,
+            state="COMPLETED",
+            record=self._to_record_item(existing, current_user_id=from_user_id),
+        )
 
     def list_records(
         self,
@@ -311,6 +369,16 @@ class UserTransferService:
         if int(user.status or 0) != 1:
             raise UserTransferBadRequest(f"{role} status is not active")
 
+    def _lock_users(self, db: Session, *, user_ids: list[int]) -> dict[int, User]:
+        rows = (
+            db.query(User)
+            .filter(User.id.in_(sorted(set(int(uid) for uid in user_ids))))
+            .order_by(User.id.asc())
+            .with_for_update()
+            .all()
+        )
+        return {int(user.id): user for user in rows}
+
     def _lock_funding_balances(
         self,
         db: Session,
@@ -356,6 +424,54 @@ class UserTransferService:
             .first()
         )
 
+    def _build_request_fingerprint(
+        self,
+        *,
+        recipient_email: str,
+        symbol: str,
+        amount: Decimal,
+        remark: Optional[str],
+    ) -> str:
+        canonical = json.dumps(
+            {
+                "amount": self._canonical_decimal(amount),
+                "recipient_email": recipient_email.casefold(),
+                "remark": remark or "",
+                "symbol": symbol,
+                "version": 1,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _assert_idempotency_match(
+        self,
+        record: UserTransfer,
+        *,
+        request_fingerprint: str,
+        recipient_email: str,
+        symbol: str,
+        amount: Decimal,
+        remark: Optional[str],
+    ) -> None:
+        stored_fingerprint = getattr(record, "request_fingerprint", None)
+        if stored_fingerprint:
+            matches = stored_fingerprint == request_fingerprint
+        else:
+            matches = (
+                str(record.coin_symbol or "").upper() == symbol
+                and self._safe_decimal(record.amount) == amount
+                and ((record.remark or "").strip() or None) == remark
+                and str(record.recipient_email_mask or "").casefold()
+                == self._mask_email(recipient_email).casefold()
+            )
+        if not matches:
+            raise UserTransferIdempotencyConflict(
+                "request_id was already used with different transfer parameters"
+            )
+
     def _normalize_email(self, email: str) -> str:
         normalized = (email or "").strip()
         if not normalized or "@" not in normalized:
@@ -387,6 +503,12 @@ class UserTransferService:
         if normalized <= Decimal("0"):
             raise UserTransferBadRequest("amount must be greater than 0")
         return normalized
+
+    def _canonical_decimal(self, value: Decimal) -> str:
+        normalized = self._safe_decimal(value).normalize()
+        if normalized == 0:
+            return "0"
+        return format(normalized, "f")
 
     def _build_transfer_no(self, now: datetime) -> str:
         return "UTR{0}{1}".format(now.strftime("%Y%m%d%H%M%S"), uuid4().hex[:8].upper())
@@ -436,10 +558,6 @@ class UserTransferService:
             fee_amount=self._format_decimal(row.fee_amount),
             net_amount=self._format_decimal(row.net_amount),
             status=row.status,
-            sender_available_before=self._format_decimal(row.sender_available_before),
-            sender_available_after=self._format_decimal(row.sender_available_after),
-            receiver_available_before=self._format_decimal(row.receiver_available_before),
-            receiver_available_after=self._format_decimal(row.receiver_available_after),
             remark=row.remark,
             created_at=row.created_at.isoformat() if row.created_at else "",
         )

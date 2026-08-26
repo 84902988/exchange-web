@@ -1203,7 +1203,6 @@ def list_my_balance_logs(
     if biz_type:
         # 前端交易类型筛选使用 biz_type 参数；实际展示优先采用 change_type。
         where_sql += " AND (change_type = :biz_type OR biz_type = :biz_type) "
-        where_sql += " AND (change_type = :biz_type OR biz_type = :biz_type) "
         params["biz_type"] = biz_type.strip().upper()
 
     total_row = db.execute(

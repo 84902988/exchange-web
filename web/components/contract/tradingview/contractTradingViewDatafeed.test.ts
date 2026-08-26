@@ -902,6 +902,7 @@ test('normal current request calls onHistory exactly once and never calls onErro
   requestKlines = async () => metadata([row(1_717_000_000_000, '101')]);
   const historyCalls: HistoryCall[] = [];
   const historyEvents: any[] = [];
+  const timingEvents: any[] = [];
   const callbackOrder: string[] = [];
   let errorCalls = 0;
   const latest: Array<string | null> = [];
@@ -911,6 +912,10 @@ test('normal current request calls onHistory exactly once and never calls onErro
     onHistoryBars: (event: unknown) => {
       callbackOrder.push('onHistoryBars');
       historyEvents.push(event);
+    },
+    onHistoryTiming: (event: any) => {
+      callbackOrder.push(event.phase);
+      timingEvents.push(event);
     },
   });
 
@@ -930,7 +935,19 @@ test('normal current request calls onHistory exactly once and never calls onErro
   assert.equal(historyCalls[0].meta.noData, false);
   assert.equal(errorCalls, 0);
   assert.deepEqual(latest, ['101']);
-  assert.deepEqual(callbackOrder, ['onHistory', 'onHistoryBars']);
+  assert.deepEqual(callbackOrder, [
+    'request',
+    'http-response',
+    'normalized',
+    'onHistory',
+    'delivered',
+    'onHistoryBars',
+  ]);
+  assert.deepEqual(
+    timingEvents.map((event) => event.phase),
+    ['request', 'http-response', 'normalized', 'delivered'],
+  );
+  assert.ok(timingEvents.every((event) => Number.isFinite(event.elapsedMs)));
   assert.deepEqual(historyEvents, [{
     symbol: 'BTCUSDT_PERP',
     interval: '1m',

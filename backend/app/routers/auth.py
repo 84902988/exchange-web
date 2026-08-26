@@ -19,7 +19,7 @@ from app.core.security import (
     hash_password,
     hash_refresh_token,  # ✅ 新增
 )
-from app.db.models import User, UserOtp, UserSession  # ✅ 新增 UserSession
+from app.db.models import User, UserOtp, UserSecurityEvent, UserSession  # ✅ 新增 UserSession
 from app.db.session import get_db
 from app.tasks.email_tasks import enqueue_send_verify_code_email
 from app.services.bd_invite_service import bind_user_to_bd_invite, validate_invite_code_for_register
@@ -70,7 +70,7 @@ class VerifyOtpIn(BaseModel):
 class RegisterIn(BaseModel):
     email: EmailStr = Field(..., example="test@example.com", description="注册邮箱")
     otp: str = Field(..., min_length=4, max_length=8, description="邮箱验证码（来自 /auth/otp/send）", example="123456")
-    password: str = Field(..., min_length=6, max_length=64, description="登录密码（建议至少 8 位，包含大小写+数字）", example="Abc12345")
+    password: str = Field(..., min_length=8, max_length=64, description="登录密码（8-64 位，包含大小写字母、数字和特殊字符）", example="Abc12345!")
 
     invite_code: Optional[str] = Field(default=None, max_length=64, description="普通用户邀请码")
     invite_type: Optional[str] = Field(default=None, max_length=32, description="邀请来源：bd 或 user")
@@ -88,12 +88,6 @@ class ResetPasswordIn(BaseModel):
 class LoginIn(BaseModel):
     email: EmailStr = Field(..., example="test@example.com", description="登录邮箱")
     password: str = Field(..., min_length=6, max_length=64, example="Abc12345")
-
-
-def _is_invite_not_bd(exc: HTTPException) -> bool:
-    detail = exc.detail if isinstance(exc.detail, dict) else {}
-    code = str(detail.get("code") or "")
-    return code in {"INVITE_CODE_NOT_FOUND", "INVITER_NOT_ACTIVE_BD"}
 
 
 def _normalize_invite_type(value: Optional[str]) -> str:
@@ -114,22 +108,20 @@ def _resolve_register_invite(
     if not code:
         return None
 
+    raw_type = str(invite_type or "").strip()
     normalized_type = _normalize_invite_type(invite_type)
-    if normalized_type == "user":
-        inviter = validate_user_invite_code_for_register(db, code)
-        return {"type": "user", "invite_code": normalize_user_invite_code(inviter.invite_code or code)}
+    if raw_type and not normalized_type:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVITE_TYPE_INVALID", "message": "邀请类型无效，请重新获取邀请链接"},
+        )
 
     if normalized_type == "bd":
         bd_code = validate_invite_code_for_register(db, code)
         return {"type": "bd", "invite_code": bd_code}
 
-    try:
-        bd_code = validate_invite_code_for_register(db, code)
-        return {"type": "bd", "invite_code": bd_code}
-    except HTTPException as exc:
-        if not _is_invite_not_bd(exc):
-            raise
-
+    # invite_code is the ordinary-invite field. A BD relation must always be
+    # explicitly requested so legacy clients cannot silently change attribution.
     inviter = validate_user_invite_code_for_register(db, code)
     return {"type": "user", "invite_code": normalize_user_invite_code(inviter.invite_code or code)}
 
@@ -149,11 +141,26 @@ def _normalize(email: str, scene: str) -> tuple[str, str]:
 
 
 def _scene_to_purpose(scene: str) -> str:
-    if scene in ("reset", "reset_password"):
-        return "reset_password"
-    if scene == "login":
-        return "login"
-    return "register"
+    purpose = {
+        "register": "register",
+        "login": "login",
+        "reset": "reset_password",
+        "reset_password": "reset_password",
+    }.get((scene or "").strip().lower())
+    if not purpose:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "OTP_SCENE_INVALID", "message": "Unsupported OTP scene"},
+        )
+    return purpose
+
+
+def _mask_email(email: str) -> str:
+    local, _, domain = str(email or "").strip().lower().partition("@")
+    if not local or not domain:
+        return "***"
+    visible = local[:2] if len(local) > 2 else local[:1]
+    return f"{visible}***@{domain}"
 
 
 def _hash_otp(code: str) -> str:
@@ -308,6 +315,7 @@ async def register(request: Request, body: RegisterIn, response: Response, db: S
     trace_id = getattr(request.state, "trace_id", None)
     email = body.email.lower().strip()
     logger.info("auth_register_attempt trace_id=%s", trace_id)
+    _validate_password_strength(body.password)
     invite_info = None
     if body.invite_code is not None:
         invite_info = _resolve_register_invite(db, body.invite_code, body.invite_type)
@@ -324,10 +332,26 @@ async def register(request: Request, body: RegisterIn, response: Response, db: S
         )
 
     # 3) 创建用户
-    user = User(email=email, password_hash=hash_password(body.password), status=1)
+    registered_at = datetime.utcnow()
+    user = User(
+        email=email,
+        password_hash=hash_password(body.password),
+        status=1,
+        email_verified_at=registered_at,
+    )
     db.add(user)
     db.flush()
     db.refresh(user)
+    db.add(
+        UserSecurityEvent(
+            user_id=int(user.id),
+            event_type="EMAIL_VERIFIED",
+            ip=get_client_ip(request),
+            user_agent=get_user_agent(request),
+            details={"email": _mask_email(email), "source": "registration"},
+            created_at=registered_at,
+        )
+    )
 
     ensure_user_invite_code(db, user)
     if invite_info is not None:
@@ -432,8 +456,34 @@ async def reset_password(request: Request, body: ResetPasswordIn, db: Session = 
 
     _consume_otp_or_raise_db(db, account=email, purpose="reset_password", code=code)
 
+    now = datetime.utcnow()
     user.password_hash = hash_password(password)
-    db.add(user)
+    user.password_changed_at = now
+    user.updated_at = now
+    revoked_sessions = (
+        db.query(UserSession)
+        .filter(
+            UserSession.user_id == int(user.id),
+            UserSession.revoked_at.is_(None),
+        )
+        .update(
+            {UserSession.revoked_at: now, UserSession.last_used_at: now},
+            synchronize_session=False,
+        )
+    )
+    db.add(
+        UserSecurityEvent(
+            user_id=int(user.id),
+            event_type="PASSWORD_RESET",
+            ip=get_client_ip(request),
+            user_agent=get_user_agent(request),
+            details={
+                "email": _mask_email(email),
+                "revoked_sessions": int(revoked_sessions or 0),
+            },
+            created_at=now,
+        )
+    )
     db.commit()
 
     return {

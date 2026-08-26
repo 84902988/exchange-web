@@ -103,9 +103,19 @@ class VipRcbLocksOut(BaseModel):
     items: list[VipRcbLockOut]
 
 
+class VipRcbReleaseOut(BaseModel):
+    released_count: int
+    released_amount: str
+    lock_ids: list[int]
+
+
 class VipRcbLockCreateApiResponse(ApiResponse[VipRcbLockCreateOut]):
     pass
 
 
 class VipRcbLocksApiResponse(ApiResponse[VipRcbLocksOut]):
+    pass
+
+
+class VipRcbReleaseApiResponse(ApiResponse[VipRcbReleaseOut]):
     pass

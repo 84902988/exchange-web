@@ -86,6 +86,7 @@ import { useDeferredScreenContent } from '../../hooks/useDeferredScreenContent';
 import { useMarketScreenActive } from '../../hooks/useMarketScreenActive';
 import { usePrivateTradingRealtime } from '../../hooks/usePrivateTradingRealtime';
 import { isContractExecutionLeaseActive } from '../../realtime/contractExecutionLease';
+import { getContractMarketRealtimeStore } from '../../realtime/contractMarketRealtime';
 import { useAuth } from '../../store/authStore';
 import { useLanguage } from '../../i18n';
 import {
@@ -131,7 +132,7 @@ type RootNavigation = CompositeNavigationProp<
 const KLINE_INTERVAL_SWITCH_DEBOUNCE_MS = 180;
 const CONTRACT_MIN_LEVERAGE = 1;
 const CONTRACT_PRIVATE_DATA_TTL_MS = 30_000;
-const CONTRACT_PRIVATE_REFRESH_LEAD_MS = 5_000;
+const CONTRACT_PRIVATE_REFRESH_LEAD_MS = 10_000;
 const CONTRACT_PENDING_INTENT_RECHECK_MS = 10_000;
 const CONTRACT_PRIVATE_RETRY_MS = 5_000;
 const PENDING_INTENT_MANUAL_REVIEW_DELAY_MS = 60_000;
@@ -365,6 +366,8 @@ export default function ContractScreen() {
   const [tpSlSaving, setTpSlSaving] = useState(false);
   const [tpSlError, setTpSlError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [waitingForExecutionLease, setWaitingForExecutionLease] =
+    useState(false);
   const [orderConfirmVisible, setOrderConfirmVisible] = useState(false);
   const [contractConfirmHidden, setContractConfirmHidden] = useState(false);
   const [closeAllConfirmVisible, setCloseAllConfirmVisible] = useState(false);
@@ -391,6 +394,7 @@ export default function ContractScreen() {
   const [orderIntentLoadFailure, setOrderIntentLoadFailure] =
     useState<PendingTradeIntentLoadError | null>(null);
   const submittingRef = useRef(false);
+  const waitingForExecutionLeaseRef = useRef(false);
   const tpSlSavingRef = useRef(false);
   const positionClosePreparingRef = useRef(false);
   const closingAllPositionsRef = useRef(false);
@@ -955,13 +959,22 @@ export default function ContractScreen() {
         return true;
       } catch (error) {
         if (generation !== privateCriticalGenerationRef.current) return false;
-        privateAuthorityRef.current = unavailablePrivateAuthority(generation);
-        setPrivateCriticalUpdatedAtMs(null);
-        setPrivateCriticalError(
-          error instanceof Error
-            ? error.message
-            : tRef.current('contract.accountLoadFailed'),
-        );
+        const previousAuthorityStillFresh =
+          preserveCurrentAuthority &&
+          privateAuthorityRef.current === previousAuthority &&
+          previousAuthority.expiresAtMs !== null &&
+          previousAuthority.expiresAtMs > Date.now();
+        if (previousAuthorityStillFresh) {
+          setPrivateCriticalError(null);
+        } else {
+          privateAuthorityRef.current = unavailablePrivateAuthority(generation);
+          setPrivateCriticalUpdatedAtMs(null);
+          setPrivateCriticalError(
+            error instanceof Error
+              ? error.message
+              : tRef.current('contract.accountLoadFailed'),
+          );
+        }
         return false;
       } finally {
         if (preservationTimer !== null) clearTimeout(preservationTimer);
@@ -1045,15 +1058,27 @@ export default function ContractScreen() {
           setPrivateHistoryUpdatedAtMs(updatedAtMs);
           setPrivateHistoryError(null);
         } else {
-          privateHistoryReadyRef.current = false;
-          privateHistoryUpdatedAtMsRef.current = null;
-          setPrivateHistoryReady(false);
-          setPrivateHistoryUpdatedAtMs(null);
-          setPrivateHistoryError(
-            historyResult.reason instanceof Error
-              ? historyResult.reason.message
-              : tRef.current('contract.historyLoadFailed'),
-          );
+          const previousHistoryStillFresh =
+            preserveCurrentHistory &&
+            privateHistoryReadyRef.current &&
+            privateHistoryUpdatedAtMsRef.current ===
+              previousHistoryUpdatedAtMs &&
+            previousHistoryUpdatedAtMs !== null &&
+            previousHistoryUpdatedAtMs + CONTRACT_PRIVATE_DATA_TTL_MS >
+              Date.now();
+          if (previousHistoryStillFresh) {
+            setPrivateHistoryError(null);
+          } else {
+            privateHistoryReadyRef.current = false;
+            privateHistoryUpdatedAtMsRef.current = null;
+            setPrivateHistoryReady(false);
+            setPrivateHistoryUpdatedAtMs(null);
+            setPrivateHistoryError(
+              historyResult.reason instanceof Error
+                ? historyResult.reason.message
+                : tRef.current('contract.historyLoadFailed'),
+            );
+          }
         }
         const fillsResult = await fillsResultPromise;
         if (generation !== privateSecondaryGenerationRef.current) return;
@@ -1864,20 +1889,21 @@ export default function ContractScreen() {
     const schedule = () => {
       const privateAuthority = privateAuthorityRef.current;
       const historyUpdatedAtMs = privateHistoryUpdatedAtMsRef.current;
-      const refreshDelayMs =
-        !privateAuthority.ready ||
-        privateAuthority.expiresAtMs === null ||
-        historyUpdatedAtMs === null
-          ? CONTRACT_PRIVATE_RETRY_MS
-          : Math.max(
-              0,
-              Math.min(
-                privateAuthority.expiresAtMs,
-                historyUpdatedAtMs + CONTRACT_PRIVATE_DATA_TTL_MS,
-              ) -
-                Date.now() -
-                CONTRACT_PRIVATE_REFRESH_LEAD_MS,
+      const freshUntilMs =
+        privateAuthority.expiresAtMs === null || historyUpdatedAtMs === null
+          ? null
+          : Math.min(
+              privateAuthority.expiresAtMs,
+              historyUpdatedAtMs + CONTRACT_PRIVATE_DATA_TTL_MS,
             );
+      const freshRemainingMs =
+        freshUntilMs === null ? null : Math.max(0, freshUntilMs - Date.now());
+      const refreshDelayMs =
+        !privateAuthority.ready || freshRemainingMs === null
+          ? CONTRACT_PRIVATE_RETRY_MS
+          : freshRemainingMs > CONTRACT_PRIVATE_REFRESH_LEAD_MS
+          ? freshRemainingMs - CONTRACT_PRIVATE_REFRESH_LEAD_MS
+          : Math.min(CONTRACT_PRIVATE_RETRY_MS, freshRemainingMs);
       timer = setTimeout(refresh, refreshDelayMs);
     };
     const refresh = async () => {
@@ -2901,13 +2927,65 @@ export default function ContractScreen() {
     [clearFeedback],
   );
 
-  const handleSubmit = useCallback(() => {
+  const acquireFreshExecutionAuthority = useCallback(
+    async (
+      expectedLifecycleGeneration: number,
+      expectedInstrumentKey: string,
+    ): Promise<ContractExecutionAuthority | null> => {
+      const currentAuthority = executionAuthorityRef.current;
+      if (
+        currentAuthority.ready &&
+        currentAuthority.expiresAtMs !== null &&
+        currentAuthority.expiresAtMs > Date.now() &&
+        currentAuthority.bid !== null &&
+        currentAuthority.ask !== null &&
+        currentAuthority.bid > 0 &&
+        currentAuthority.ask >= currentAuthority.bid
+      ) {
+        return currentAuthority;
+      }
+      if (waitingForExecutionLeaseRef.current) return null;
+
+      waitingForExecutionLeaseRef.current = true;
+      setWaitingForExecutionLease(true);
+      try {
+        const grant = await getContractMarketRealtimeStore(
+          symbol,
+        ).waitForExecutionLease();
+        if (
+          !grant ||
+          !screenMountedRef.current ||
+          !marketScreenActiveRef.current ||
+          executionLifecycleGenerationRef.current !==
+            expectedLifecycleGeneration ||
+          activeInstrumentKeyRef.current !== expectedInstrumentKey ||
+          grant.lease.expiresAtMs <= Date.now()
+        ) {
+          return null;
+        }
+        return {
+          ready: true,
+          bid: grant.lease.executionBid,
+          ask: grant.lease.executionAsk,
+          expiresAtMs: grant.lease.expiresAtMs,
+          generation: grant.executionGeneration,
+        };
+      } finally {
+        waitingForExecutionLeaseRef.current = false;
+        if (screenMountedRef.current) setWaitingForExecutionLease(false);
+      }
+    },
+    [symbol],
+  );
+
+  const handleSubmit = useCallback(async () => {
     const skipConfirmation =
       skipNextOrderConfirmRef.current?.instrumentKey === instrumentKey &&
       skipNextOrderConfirmRef.current?.orderIntentScope === orderIntentScope;
     skipNextOrderConfirmRef.current = null;
     if (
       submittingRef.current ||
+      waitingForExecutionLeaseRef.current ||
       (confirmOpenRef.current && !skipConfirmation)
     ) {
       return;
@@ -2960,15 +3038,22 @@ export default function ContractScreen() {
     const openingLifecycleGeneration = executionLifecycleGenerationRef.current;
     const openingOrderIntentScope = orderIntentScope;
     const openingInstrumentKey = instrumentKey;
-    const openingAuthority = executionAuthorityRef.current;
+    let openingAuthority = executionAuthorityRef.current;
     if (
       !marketScreenActiveRef.current ||
       !openingAuthority.ready ||
       openingAuthority.expiresAtMs === null ||
       openingAuthority.expiresAtMs <= Date.now()
     ) {
-      reject(tRef.current('contract.executionUnavailable'));
-      return;
+      openingAuthority =
+        (await acquireFreshExecutionAuthority(
+          openingLifecycleGeneration,
+          openingInstrumentKey,
+        )) || unavailableExecutionAuthority();
+      if (!openingAuthority.ready) {
+        reject(tRef.current('contract.executionUnavailable'));
+        return;
+      }
     }
     if (!Number.isSafeInteger(leverage) || leverage < CONTRACT_MIN_LEVERAGE) {
       reject(tRef.current('contract.invalidLeverage'));
@@ -3134,7 +3219,13 @@ export default function ContractScreen() {
     setOrderConfirmVisible(false);
     (async () => {
       if (submittingRef.current) return;
-      const currentAuthority = executionAuthorityRef.current;
+      const refAuthority = executionAuthorityRef.current;
+      const currentAuthority =
+        refAuthority.ready &&
+        refAuthority.expiresAtMs !== null &&
+        refAuthority.expiresAtMs > Date.now()
+          ? refAuthority
+          : openingAuthority;
       const lifecycleCurrent =
         marketScreenActiveRef.current &&
         executionLifecycleGenerationRef.current ===
@@ -3409,6 +3500,7 @@ export default function ContractScreen() {
     })().catch(() => undefined);
   }, [
     actionMode,
+    acquireFreshExecutionAuthority,
     availableMargin,
     baseAsset,
     contractConfirmHidden,
@@ -3975,11 +4067,11 @@ export default function ContractScreen() {
             quoteAsset={quoteAsset}
             spreadFeePrice={quote?.spreadFeePrice}
             submitDisabled={
-              !executionReady ||
+              (!executionReady && !contractMarket.executionRecovering) ||
               !privateSubmissionReady ||
               Boolean(orderIntentGuardMessage)
             }
-            submitting={submitting}
+            submitting={submitting || waitingForExecutionLease}
             onActionModeChange={handleActionModeChange}
             onBboPress={handleBboPress}
             onDirectionChange={handleDirectionChange}

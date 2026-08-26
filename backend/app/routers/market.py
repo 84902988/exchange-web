@@ -4,6 +4,7 @@ from typing import Optional
 
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Depends,
     HTTPException,
     Query,
@@ -23,11 +24,18 @@ from app.services.market import (
     get_depth,
     get_klines,
     get_mobile_market_overview,
+    get_mobile_overview_symbol_config,
     get_market_pairs,
     get_market_tickers,
     get_trades,
 )
-from app.services.market_cache import cache_fetch_json, cache_get_json, market_cache_key
+from app.services.market_cache import (
+    cache_fetch_json,
+    cache_get_json,
+    cache_get_last_good_json,
+    cache_set_json,
+    market_cache_key,
+)
 from app.services.market_ws import market_ws_manager
 from app.services.spot_market_view import get_spot_market_view
 from app.services.reference_overlay_service import get_reference_overlay_for_symbol
@@ -41,8 +49,10 @@ logger = logging.getLogger(__name__)
 MARKET_TICKER_CACHE_VERSION = "1"
 MARKET_TICKER_FIELD_VERSION = "ticker_fields_v2"
 MARKET_TICKER_PROVIDER_VERSION = "default"
-MARKET_MOBILE_OVERVIEW_CACHE_VERSION = "1"
-MARKET_MOBILE_OVERVIEW_FIELD_VERSION = "mobile_overview_v1"
+MARKET_MOBILE_OVERVIEW_CACHE_VERSION = "4"
+MARKET_MOBILE_OVERVIEW_FIELD_VERSION = "mobile_overview_v4_admin_shortcuts"
+MARKET_MOBILE_OVERVIEW_CACHE_TTL_SECONDS = 10
+MARKET_MOBILE_OVERVIEW_LAST_GOOD_TTL_SECONDS = 24 * 60 * 60
 
 
 @router.get(
@@ -174,23 +184,82 @@ def get_pairs(
         raise HTTPException(status_code=500, detail="get pairs failed")
 
 
+def _refresh_mobile_overview_cache(
+    cache_key: str,
+    preferred_symbols: list[str],
+) -> None:
+    """Refresh the mobile-only aggregate without holding the request DB session."""
+    db = SessionLocal()
+    try:
+        payload = get_mobile_market_overview(
+            db=db,
+            preferred_symbols=preferred_symbols,
+        )
+        cache_set_json(
+            cache_key,
+            payload,
+            MARKET_MOBILE_OVERVIEW_CACHE_TTL_SECONDS,
+            last_good_ttl_seconds=MARKET_MOBILE_OVERVIEW_LAST_GOOD_TTL_SECONDS,
+        )
+    except Exception:
+        logger.exception("refresh mobile market overview cache failed")
+    finally:
+        db.close()
+
+
 @router.get("/mobile/overview", summary="Get mobile market overview snapshot")
-def mobile_overview(db: Session = Depends(get_db)):
+def mobile_overview(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    preferred_symbols = get_mobile_overview_symbol_config(db)
     cache_key = market_cache_key(
         "market:mobile_overview",
         version=MARKET_MOBILE_OVERVIEW_CACHE_VERSION,
         market_type="all",
         category="mobile",
         field_version=MARKET_MOBILE_OVERVIEW_FIELD_VERSION,
+        query_params={"shortcut_symbols": preferred_symbols},
     )
     try:
-        active_cached = cache_get_json(cache_key) is not None
-        payload = cache_fetch_json(
-            cache_key,
-            10,
-            lambda: get_mobile_market_overview(db=db),
-            last_good_ttl_seconds=24 * 60 * 60,
-        )
+        active_payload = cache_get_json(cache_key)
+        active_cached = active_payload is not None
+        if active_cached:
+            payload = active_payload
+        else:
+            last_good = cache_get_last_good_json(cache_key)
+            if isinstance(last_good, dict):
+                # The homepage must not wait several seconds for a third-party
+                # quote fan-out whenever this short cache expires. Promote the
+                # bounded last-good snapshot, report it as stale, and refresh
+                # with an independent DB session after the response is sent.
+                payload = {
+                    **last_good,
+                    "is_stale": True,
+                    "stale": True,
+                    "stale_reason": "revalidating",
+                    "source": "last_good",
+                }
+                cache_set_json(
+                    cache_key,
+                    payload,
+                    MARKET_MOBILE_OVERVIEW_CACHE_TTL_SECONDS,
+                    last_good_ttl_seconds=MARKET_MOBILE_OVERVIEW_LAST_GOOD_TTL_SECONDS,
+                )
+                background_tasks.add_task(
+                    _refresh_mobile_overview_cache,
+                    cache_key,
+                    preferred_symbols,
+                )
+            else:
+                # A fresh installation/server still performs one authoritative
+                # load so an empty or invented market snapshot is never shown.
+                payload = cache_fetch_json(
+                    cache_key,
+                    MARKET_MOBILE_OVERVIEW_CACHE_TTL_SECONDS,
+                    lambda: get_mobile_market_overview(
+                        db=db,
+                        preferred_symbols=preferred_symbols,
+                    ),
+                    last_good_ttl_seconds=MARKET_MOBILE_OVERVIEW_LAST_GOOD_TTL_SECONDS,
+                )
         payload = filter_active_mobile_market_overview(db, payload)
         if isinstance(payload, dict) and payload.get("is_stale"):
             payload = {

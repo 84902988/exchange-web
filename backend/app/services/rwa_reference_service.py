@@ -29,6 +29,10 @@ class RwaReferenceConfigError(RwaReferenceServiceError):
     pass
 
 
+class RwaReferenceAuthenticationError(RwaReferenceConfigError):
+    pass
+
+
 class RwaReferenceUpstreamError(RwaReferenceServiceError):
     pass
 
@@ -60,6 +64,7 @@ _DEBUG_SYMBOL_CANDIDATES = ("IRON62", "IRON", "XIRON62", "IO62", "IRON_ORE")
 _DEBUG_LOG_PATH = Path(__file__).resolve().parents[2] / "rwa_symbol_debug.log"
 _IRON62_SYMBOL = "IRON62"
 _DAILY_CACHE_KEY = "rwa:iron62:daily"
+_FAILED_REFRESH_RETRY_SECONDS = 300
 _cache_expires_at = 0.0
 _cache_date: Optional[str] = None
 _cache_value: Optional[Dict[str, Any]] = None
@@ -120,6 +125,16 @@ def _clear_daily_memory_cache() -> None:
     _cache_expires_at = 0.0
 
 
+def _failed_refresh_retry_due(record: RwaReferencePrice, *, now: Optional[datetime] = None) -> bool:
+    if str(record.status or "").upper() != "FAILED":
+        return False
+    fetched_at = record.fetched_at
+    if fetched_at is None:
+        return True
+    current = now or _utc_now()
+    return (current - fetched_at).total_seconds() >= _FAILED_REFRESH_RETRY_SECONDS
+
+
 def _mask_url_access_key(url: str) -> str:
     parsed = urlparse(url)
     query = [
@@ -165,12 +180,13 @@ def _with_kline_summary(result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _response_sample(payload: Any) -> Any:
-    if isinstance(payload, dict):
+    provider_payload = _provider_payload(payload)
+    if isinstance(provider_payload, dict):
         sample: Dict[str, Any] = {}
         for key in ("success", "base", "date", "timestamp", "rates", "error"):
-            if key not in payload:
+            if key not in provider_payload:
                 continue
-            value = payload.get(key)
+            value = provider_payload.get(key)
             if key == "rates" and isinstance(value, dict):
                 sample[key] = {
                     "keys": list(value.keys())[:10],
@@ -179,7 +195,15 @@ def _response_sample(payload: Any) -> Any:
             else:
                 sample[key] = value
         return sample
-    return payload
+    return provider_payload
+
+
+def _provider_payload(payload: Any) -> Any:
+    """Return the provider body for both legacy and data-wrapped responses."""
+    if not isinstance(payload, dict):
+        return payload
+    data = payload.get("data")
+    return data if isinstance(data, dict) else payload
 
 
 def _endpoint_debug_summary(
@@ -226,7 +250,8 @@ def _endpoint_debug_summary(
     except ValueError:
         payload = {"raw_text": body_preview}
 
-    rates = payload.get("rates") if isinstance(payload, dict) else None
+    provider_payload = _provider_payload(payload)
+    rates = provider_payload.get("rates") if isinstance(provider_payload, dict) else None
     has_rate = False
     if endpoint == "latest":
         has_rate = isinstance(rates, dict) and symbol in rates
@@ -239,7 +264,7 @@ def _endpoint_debug_summary(
         "symbol": symbol,
         "url": masked_url,
         "http_status": response.status_code,
-        "success": bool(isinstance(payload, dict) and payload.get("success") is True),
+        "success": bool(isinstance(provider_payload, dict) and provider_payload.get("success") is True),
         "has_rate": has_rate,
         "response_keys": response_keys,
         "sample": _response_sample(payload),
@@ -375,11 +400,16 @@ def _build_manual_iron62_kline(limit: int) -> Optional[Dict[str, Any]]:
 
 
 def _classify_unsupported_payload(payload: Any, rates: Any = None) -> RwaReferenceServiceError:
-    error = payload.get("error") if isinstance(payload, dict) else None
+    provider_payload = _provider_payload(payload)
+    error = provider_payload.get("error") if isinstance(provider_payload, dict) else None
     error_code = str(error.get("code") or "") if isinstance(error, dict) else ""
     error_type = str(error.get("type") or "").lower() if isinstance(error, dict) else ""
     error_info = str(error.get("info") or "").lower() if isinstance(error, dict) else ""
-    combined = f"{error_code} {error_type} {error_info}"
+    error_text = str(error or "").lower() if not isinstance(error, dict) else ""
+    message = str(provider_payload.get("message") or "").lower() if isinstance(provider_payload, dict) else ""
+    combined = f"{error_code} {error_type} {error_info} {error_text} {message}"
+    if any(token in combined for token in ("unauthorized", "api key", "access key", "invalid key", "key is invalid", "key has expired")):
+        return RwaReferenceAuthenticationError("commodities-api key is invalid or expired")
     if any(token in combined for token in ("request_limit", "rate_limit", "too_many", "quota", "free_trial_50")):
         return RwaReferenceRateLimitedError("commodities-api request limit reached")
     if any(token in combined for token in ("plan", "subscription", "access_restricted", "not_allowed")):
@@ -536,6 +566,9 @@ def _extract_supported_symbol_entries(payload: Any) -> Dict[str, Any]:
     if raw_symbols is None:
         raw_symbols = payload.get("data")
 
+    if raw_symbols is None and "error" not in payload and "success" not in payload:
+        return {str(key): value for key, value in payload.items()}
+
     if isinstance(raw_symbols, dict):
         return {str(key): value for key, value in raw_symbols.items()}
 
@@ -617,7 +650,7 @@ def debug_supported_symbols() -> Dict[str, Any]:
         "hostname": parsed.netloc,
         "url": masked_url,
         "http_status": response.status_code,
-        "success": bool(isinstance(payload, dict) and payload.get("success") is True),
+        "success": response.status_code < 400 and bool(entries),
         "matched_symbols": matched_symbols,
         "total_symbols": len(entries),
         "has_iron62": has_iron62,
@@ -723,7 +756,7 @@ def _cached_iron62_reference_without_external(
                 latest_record.trade_date.isoformat(),
                 int(latest_record.id),
             )
-            return _store_daily_memory_cache(result, cache_date)
+            return _with_daily_cache_fields(result, cache_date)
 
         result = _build_manual_iron62_reference(fallback_reason)
         if result is None:
@@ -734,7 +767,7 @@ def _cached_iron62_reference_without_external(
             cache_date,
             fallback_reason,
         )
-        return _store_daily_memory_cache(result, cache_date)
+        return _with_daily_cache_fields(result, cache_date)
     except (ProgrammingError, OperationalError) as exc:
         if not _is_missing_rwa_reference_table_error(exc):
             raise
@@ -830,7 +863,11 @@ def _refresh_iron62_reference_price_unlocked(db: Session, *, trade_date: Optiona
             "trade_date": target_date.isoformat(),
             "price_usd_per_ton": manual["iron62_usd_per_ton"],
         }
-    if existing_today and str(existing_today.source or "").upper() == "COMMODITIES_API":
+    if (
+        existing_today
+        and str(existing_today.source or "").upper() == "COMMODITIES_API"
+        and not _failed_refresh_retry_due(existing_today)
+    ):
         logger.info(
             "[RWA_CACHE_HIT] key=%s cache_date=%s source=db_today_attempt status=%s record_id=%s",
             _DAILY_CACHE_KEY,
@@ -845,7 +882,18 @@ def _refresh_iron62_reference_price_unlocked(db: Session, *, trade_date: Optiona
             "status": existing_today.status,
             "trade_date": target_date.isoformat(),
             "record_id": int(existing_today.id),
+            "error_message": existing_today.error_message,
         }
+
+    if existing_today is not None:
+        logger.info(
+            "[RWA_CACHE_RETRY] key=%s cache_date=%s previous_status=%s record_id=%s",
+            _DAILY_CACHE_KEY,
+            cache_date,
+            existing_today.status,
+            int(existing_today.id),
+        )
+        _clear_daily_memory_cache()
 
     logger.info("[RWA_CACHE_REFRESH] key=%s cache_date=%s source=commodities-api", _DAILY_CACHE_KEY, cache_date)
     _upsert_rwa_reference_record(
@@ -944,11 +992,13 @@ def get_iron62_reference_price(db: Session) -> Dict[str, Any]:
                 )
                 return _store_daily_memory_cache(result, cache_date)
 
-            return _cached_iron62_reference_without_external(
-                db,
-                target_date=target_date,
-                fallback_reason=f"already_attempted_today_status_{today_record.status}",
-            )
+            if not _failed_refresh_retry_due(today_record):
+                return _cached_iron62_reference_without_external(
+                    db,
+                    target_date=target_date,
+                    fallback_reason=f"retry_wait_status_{today_record.status}",
+                )
+            _clear_daily_memory_cache()
 
         refresh_result = refresh_iron62_reference_price(db, trade_date=target_date)
         try:
@@ -990,20 +1040,26 @@ def _get_iron62_reference_price_live() -> Dict[str, Any]:
     for symbol in _IRON_SYMBOL_CANDIDATES:
         try:
             payload = _request_latest_payload(base_url, api_key, symbol)
+        except RwaReferenceAuthenticationError:
+            raise
         except RwaReferenceRateLimitedError:
             raise
         except RwaReferenceServiceError as exc:
             last_error = exc
             continue
 
-        if payload.get("success") is False:
+        provider_payload = _provider_payload(payload)
+        if not isinstance(provider_payload, dict):
+            last_error = RwaReferenceUpstreamError("commodities-api response was not an object")
+            continue
+        if provider_payload.get("success") is False:
             logger.warning("rwa_iron62_reference_unsuccessful symbol=%s payload=%s", symbol, payload)
-            last_error = _classify_unsupported_payload(payload)
+            last_error = _classify_unsupported_payload(provider_payload)
             if isinstance(last_error, RwaReferenceRateLimitedError):
                 raise last_error
             continue
 
-        rates = payload.get("rates")
+        rates = provider_payload.get("rates")
         logger.info(
             "rwa_iron62_reference_rates_keys symbol=%s keys=%s",
             symbol,
@@ -1013,7 +1069,7 @@ def _get_iron62_reference_price_live() -> Dict[str, Any]:
             used_symbol = symbol
             raw_rate_value = rates[symbol]
             break
-        last_error = _classify_unsupported_payload(payload, rates)
+        last_error = _classify_unsupported_payload(provider_payload, rates)
     else:
         if last_error is not None:
             raise last_error
@@ -1035,7 +1091,7 @@ def _get_iron62_reference_price_live() -> Dict[str, Any]:
         "unit": "USD/吨",
         "source": "commodities-api",
         "source_status": "live",
-        "updated_at": _timestamp_to_iso(payload.get("timestamp")),
+        "updated_at": _timestamp_to_iso(provider_payload.get("timestamp")),
         "debug_note": debug_note if used_symbol == "IRON62" else f"{debug_note}:symbol_fallback_{used_symbol}",
         "_raw_payload": payload,
     }
@@ -1044,7 +1100,8 @@ def _get_iron62_reference_price_live() -> Dict[str, Any]:
 
 
 def _parse_timeseries_items(payload: Dict[str, Any]) -> List[Dict[str, str]]:
-    rates = payload.get("rates")
+    provider_payload = _provider_payload(payload)
+    rates = provider_payload.get("rates") if isinstance(provider_payload, dict) else None
     if not isinstance(rates, dict):
         return []
 
@@ -1069,7 +1126,8 @@ def _is_timeframe_too_long(response: requests.Response) -> bool:
         return False
     if not isinstance(payload, dict):
         return False
-    error = payload.get("error")
+    provider_payload = _provider_payload(payload)
+    error = provider_payload.get("error") if isinstance(provider_payload, dict) else None
     if not isinstance(error, dict):
         return False
     return str(error.get("type") or "").strip().lower() == "timeframe_too_long"
@@ -1125,12 +1183,13 @@ def _request_timeseries_chunk(
         return []
 
     payload = response.json()
-    rates = payload.get("rates") if isinstance(payload, dict) else None
+    provider_payload = _provider_payload(payload)
+    rates = provider_payload.get("rates") if isinstance(provider_payload, dict) else None
     logger.info(
         "rwa_iron62_kline_rates_keys_sample=%s",
         list(sorted(str(key) for key in rates.keys())[:5]) if isinstance(rates, dict) else None,
     )
-    if not isinstance(payload, dict) or payload.get("success") is False:
+    if not isinstance(provider_payload, dict) or provider_payload.get("success") is False:
         return []
     return _parse_timeseries_items(payload)
 

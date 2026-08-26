@@ -1,16 +1,29 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field, root_validator, validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    root_validator,
+    validator,
+)
 
 
 class CreateOrderRequest(BaseModel):
     symbol: str = Field(..., min_length=2, max_length=50, description="Trading pair symbol, for example BTCUSDT")
     side: str = Field(..., description="Order side: BUY / SELL")
     order_type: str = Field(..., description="Order type: LIMIT / MARKET")
+    client_order_id: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        description="Optional client-generated idempotency key for this order request.",
+    )
 
     price: Optional[Decimal] = Field(
         default=None,
@@ -45,6 +58,22 @@ class CreateOrderRequest(BaseModel):
         if v not in {"LIMIT", "MARKET"}:
             raise ValueError("order_type only supports LIMIT or MARKET")
         return v
+
+    @field_validator("client_order_id", mode="before")
+    @classmethod
+    def validate_client_order_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            raise ValueError("client_order_id must be a string")
+        normalized = v.strip().lower()
+        if not normalized:
+            raise ValueError("client_order_id cannot be empty")
+        if not re.fullmatch(r"[a-z0-9:_-]+", normalized):
+            raise ValueError(
+                "client_order_id only supports lowercase letters, numbers, colon, underscore, and hyphen"
+            )
+        return normalized
 
     @validator("price")
     def validate_price_positive(cls, v: Optional[Decimal]) -> Optional[Decimal]:
@@ -105,6 +134,11 @@ class CreateOrderResponse(BaseModel):
 
     status: str
     created_at: datetime
+    client_order_id: Optional[str] = Field(
+        default=None,
+        max_length=64,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class CancelOrderResponse(BaseModel):

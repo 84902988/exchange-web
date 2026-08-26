@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 from app.schemas.market import DepthResponse
@@ -437,6 +438,9 @@ def test_spot_ws_metrics_snapshot_tracks_connections_subscriptions_fanout_and_cl
             and failing_state.cleanup_completed
         )
         await asyncio.sleep(0)
+        sent_ticker = json.loads(healthy.sent[0])
+        assert sent_ticker["type"] == "spot_ticker_update"
+        assert sent_ticker["server_time_ms"] > 0
         after_fanout = await manager.get_metrics_snapshot()
         assert after_fanout["connections"]["active"] == 1
         assert after_fanout["fanout_summary"]["count"] == 1
@@ -1099,7 +1103,15 @@ def test_spot_ws_trade_backlog_full_evicts_only_slow_client_and_records_reason()
     asyncio.run(run())
 
 
-def test_spot_ws_expired_trade_backlog_disconnects_instead_of_dropping() -> None:
+def test_spot_ws_expired_trade_backlog_disconnects_instead_of_dropping(monkeypatch) -> None:
+    # This test exercises backlog expiry, not the independent blocked-send
+    # watchdog. Keep the watchdog outside the test's scheduling window so a
+    # loaded full-suite run cannot race the intended cleanup reason.
+    monkeypatch.setattr(
+        "app.services.market_ws.SPOT_WS_CLIENT_SEND_TIMEOUT_SECONDS",
+        30.0,
+    )
+
     async def run() -> None:
         manager = MarketWsManager()
 
@@ -1124,7 +1136,11 @@ def test_spot_ws_expired_trade_backlog_disconnects_instead_of_dropping() -> None
             "BTCUSDT",
             {"type": "spot_trade", "symbol": "BTCUSDT", "trade": {"trade_id": 1}},
         )
-        await asyncio.sleep(0.01)
+        oldest_trade = state.mailbox.trade_queue[0]
+        state.mailbox.trade_queue[0] = replace(
+            oldest_trade,
+            enqueue_monotonic=oldest_trade.enqueue_monotonic - 1.0,
+        )
         await manager._send_payload(
             "BTCUSDT",
             {"type": "spot_trade", "symbol": "BTCUSDT", "trade": {"trade_id": 2}},
@@ -1376,7 +1392,9 @@ def test_spot_ws_targeted_snapshot_and_pong_only_reach_current_client() -> None:
         await _wait_until(lambda: len(current.sent) == 2)
         await asyncio.sleep(0)
 
-        assert json.loads(current.sent[0])["type"] == "spot_market_snapshot"
+        current_snapshot = json.loads(current.sent[0])
+        assert current_snapshot["type"] == "spot_market_snapshot"
+        assert current_snapshot["server_time_ms"] > 0
         assert current.sent[1] == "pong"
         assert other.sent == []
 
@@ -1435,6 +1453,11 @@ def test_spot_market_router_queues_initial_snapshot_and_pong(monkeypatch) -> Non
     websocket = FakeWebSocket()
     monkeypatch.setattr(market_router, "SessionLocal", lambda: fake_db)
     monkeypatch.setattr(market_router, "market_ws_manager", fake_manager)
+    monkeypatch.setattr(
+        market_router,
+        "_get_active_pair",
+        lambda _db, symbol: _pair(symbol=symbol),
+    )
 
     asyncio.run(market_router.spot_market_ws(websocket))
 

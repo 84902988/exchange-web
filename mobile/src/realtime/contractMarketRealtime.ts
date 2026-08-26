@@ -22,6 +22,10 @@ import {shouldYieldRealtimeForMainTabTransition} from '../performance/mainTabTra
 
 const CONTRACT_REST_FALLBACK_INTERVAL_MS = 5_000;
 const CONTRACT_EXECUTION_REST_FALLBACK_GRACE_MS = 500;
+// Atomic market-state frames can legitimately pause for several seconds while
+// the public socket remains open. Keep the visible action stable through that
+// bounded renewal gap; confirmation still requires a newly minted strict lease.
+const CONTRACT_EXECUTION_RECOVERY_WINDOW_MS = 6_000;
 const CONTRACT_MARKET_STATE_TIMEOUT_MS = 5_000;
 const CONTRACT_UI_NOTIFICATION_WINDOW_MS = 250;
 const CONTRACT_MARKET_INTERVAL = '1m';
@@ -54,6 +58,7 @@ export type ContractMarketRealtimeState = {
   symbol: string;
   marketView: ContractMarketView | null;
   lease: ContractExecutionLease | null;
+  executionRecovering: boolean;
   loading: boolean;
   error: string | null;
   phase: ContractMarketRealtimePhase;
@@ -61,6 +66,12 @@ export type ContractMarketRealtimeState = {
   sessionGeneration: number;
   executionGeneration: number;
   revision: number;
+};
+
+export type ContractExecutionLeaseGrant = {
+  lease: ContractExecutionLease;
+  executionGeneration: number;
+  sessionGeneration: number;
 };
 
 export type ContractRealtimeTransport = {
@@ -402,6 +413,8 @@ export class ContractMarketRealtimeStore {
     null;
   private executionExpiryTimer: ReturnType<typeof setTimeout> | null =
     null;
+  private executionRecoveryTimer: ReturnType<typeof setTimeout> | null =
+    null;
   private uiNotificationTimer: ReturnType<typeof setTimeout> | null =
     null;
   private restController: AbortController | null = null;
@@ -439,6 +452,7 @@ export class ContractMarketRealtimeStore {
       symbol: this.symbol,
       marketView: null,
       lease: null,
+      executionRecovering: false,
       loading: false,
       error: null,
       phase: 'idle',
@@ -483,6 +497,54 @@ export class ContractMarketRealtimeStore {
       }
     };
   };
+
+  waitForExecutionLease(
+    timeoutMs = CONTRACT_EXECUTION_RECOVERY_WINDOW_MS,
+  ) {
+    const readGrant = (): ContractExecutionLeaseGrant | null => {
+      const snapshot = this.state;
+      const lease = snapshot.lease;
+      if (
+        lease === null ||
+        !isContractExecutionLeaseActive(lease, this.now()) ||
+        !snapshot.marketView ||
+        !isContractExecutionReady(snapshot.marketView.quote, this.symbol)
+      ) {
+        return null;
+      }
+      return {
+        lease,
+        executionGeneration: snapshot.executionGeneration,
+        sessionGeneration: snapshot.sessionGeneration,
+      };
+    };
+    const currentGrant = readGrant();
+    if (currentGrant) return Promise.resolve(currentGrant);
+    if (this.activeMarketOwnerCount() === 0) return Promise.resolve(null);
+
+    return new Promise<ContractExecutionLeaseGrant | null>(resolve => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      let unsubscribe: () => void = () => undefined;
+      const finish = (grant: ContractExecutionLeaseGrant | null) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) clearTimeout(timer);
+        unsubscribe();
+        resolve(grant);
+      };
+      const check = () => {
+        const grant = readGrant();
+        if (grant) finish(grant);
+      };
+      unsubscribe = this.subscribe(check);
+      timer = setTimeout(() => finish(null), Math.max(0, timeoutMs));
+      if (this.transportStatus === 'open') {
+        this.transport.send(buildContractMarketSubscribeMessage(this.symbol));
+      }
+      check();
+    });
+  }
 
   acquire(owner: string) {
     const normalizedOwner = String(owner || '').trim();
@@ -714,6 +776,7 @@ export class ContractMarketRealtimeStore {
     this.commit({
       ...this.state,
       lease: null,
+      executionRecovering: false,
       loading: this.state.marketView === null,
       error: null,
       phase: 'bootstrapping',
@@ -743,6 +806,7 @@ export class ContractMarketRealtimeStore {
     if (
       this.state.phase === 'paused' &&
       this.state.lease === null &&
+      !this.state.executionRecovering &&
       !this.state.loading
     ) {
       return;
@@ -750,6 +814,7 @@ export class ContractMarketRealtimeStore {
     this.commit({
       ...this.state,
       lease: null,
+      executionRecovering: false,
       loading: false,
       phase: 'paused',
       executionGeneration: this.state.executionGeneration + 1,
@@ -832,12 +897,17 @@ export class ContractMarketRealtimeStore {
 
   private invalidateExecution(phase = this.state.phase) {
     this.clearExecutionExpiry();
-    if (this.state.lease === null && this.state.phase === phase) {
+    if (
+      this.state.lease === null &&
+      !this.state.executionRecovering &&
+      this.state.phase === phase
+    ) {
       return;
     }
     this.commit({
       ...this.state,
       lease: null,
+      executionRecovering: false,
       phase,
       executionGeneration:
         this.state.executionGeneration +
@@ -889,6 +959,10 @@ export class ContractMarketRealtimeStore {
         ...this.state,
         marketView: view,
         lease: null,
+        executionRecovering:
+          this.state.executionRecovering &&
+          this.transportStatus === 'open' &&
+          this.state.phase === 'live',
         loading: false,
         error: null,
         source: 'REST',
@@ -1160,11 +1234,23 @@ export class ContractMarketRealtimeStore {
     }
     const executionWasRevoked =
       this.state.lease !== null && lease === null;
+    const executionFrameSourceAgeMs = this.wsExecutionFrameSourceAgeMs(
+      view,
+      payload,
+      envelopeTimeMs,
+    );
     this.commit(
       {
         ...this.state,
         marketView: view,
         lease,
+        executionRecovering:
+          lease === null &&
+          (this.state.executionRecovering || this.state.lease !== null) &&
+          mayMintLease &&
+          !cursorResult.transitioned &&
+          this.transportStatus === 'open' &&
+          executionFrameSourceAgeMs !== null,
         loading: false,
         error: null,
         phase:
@@ -1511,6 +1597,29 @@ export class ContractMarketRealtimeStore {
     this.executionExpiryTimer = null;
   }
 
+  private reconcileExecutionRecoveryExpiry() {
+    if (!this.state.executionRecovering) {
+      if (this.executionRecoveryTimer !== null) {
+        clearTimeout(this.executionRecoveryTimer);
+        this.executionRecoveryTimer = null;
+      }
+      return;
+    }
+    if (this.executionRecoveryTimer !== null) return;
+    this.executionRecoveryTimer = setTimeout(() => {
+      this.executionRecoveryTimer = null;
+      if (
+        this.state.executionRecovering &&
+        this.state.lease === null
+      ) {
+        this.commit({
+          ...this.state,
+          executionRecovering: false,
+        });
+      }
+    }, CONTRACT_EXECUTION_RECOVERY_WINDOW_MS);
+  }
+
   private scheduleExecutionExpiry() {
     this.clearExecutionExpiry();
     const lease = this.state.lease;
@@ -1530,6 +1639,8 @@ export class ContractMarketRealtimeStore {
         this.commit({
           ...this.state,
           lease: null,
+          executionRecovering:
+            this.transportStatus === 'open' && this.state.phase === 'live',
           executionGeneration: this.state.executionGeneration + 1,
         });
       }
@@ -1571,6 +1682,7 @@ export class ContractMarketRealtimeStore {
       revision: this.state.revision + 1,
     };
     this.scheduleExecutionExpiry();
+    this.reconcileExecutionRecoveryExpiry();
     const executionRevoked =
       this.lastUiNotifiedState.lease !== null &&
       this.state.lease === null;

@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.datetime_utils import spot_trade_utc_isoformat, spot_trade_utc_timestamp_ms
 from app.db.models.contract_symbol import ContractSymbol
 from app.db.models.market_kline import MarketKline
+from app.db.models.mobile_content import MobileContentSettings
 from app.db.models.order import Order
 from app.db.models.trade import Trade
 from app.db.models.trading_pair import TradingPair
@@ -118,6 +119,8 @@ from app.services.market_ticker_cache import (
     SPOT_TICKER_SHARED_CACHE_TTL_MS,
     SpotTickerCacheHit,
 )
+from app.services.mobile_content_service import normalize_mobile_home_config
+from app.services.contract_market_service import get_contract_tickers
 from app.services.market_trades_cache import (
     SPOT_TRADES_SHARED_CACHE_TTL_MS,
     SpotTradesCacheHit,
@@ -205,8 +208,16 @@ MAINSTREAM_PAIR_BASES = {"BTC", "ETH", "BNB", "SOL", "XRP", "DOGE", "ADA", "AVAX
 PLATFORM_PAIR_BASES = {"MFC", "RCB"}
 RWA_PAIR_BASES = {"MFC", "IGC", "CREG", "BON"}
 CONTRACT_PAIR_CATEGORIES = {"CONTRACT", "FOREX", "METAL", "COMMODITY", "INDEX", "ETF"}
+MOBILE_CFD_CONTRACT_CATEGORIES = {"GOLD", "FUTURES", "INDEX", "FOREX", "METAL", "COMMODITY"}
 MOBILE_OVERVIEW_SYMBOLS = ["BTCUSDT", "RCBUSDT", "NAS100", "XAUUSD", "ETHUSDT", "EURUSD"]
 MOBILE_OVERVIEW_SECTION_LIMIT = 5
+MOBILE_STOCK_OVERVIEW_SYMBOLS = [
+    "NVDAUSDT_PERP",
+    "TSLAUSDT_PERP",
+    "AAPLUSDT_PERP",
+    "MSFTUSDT_PERP",
+    "AMZNUSDT_PERP",
+]
 
 
 def _decimal_to_str(v) -> str:
@@ -737,6 +748,11 @@ def _ticker_metadata(pair: TradingPair) -> Dict[str, Any]:
         "price_precision": int(getattr(pair, "price_precision", 8) or 8),
         **price_precision_metadata,
         "amount_precision": int(getattr(pair, "amount_precision", 8) or 8),
+        # Execution already enforces these limits in order_service. Expose the
+        # same authoritative values so mobile/web clients can reject an
+        # undersized order before a mutation request is sent.
+        "min_amount": str(getattr(pair, "min_amount", 0) or 0),
+        "min_notional": str(getattr(pair, "min_notional", 0) or 0),
         "asset_type": _normalize_asset_type(pair),
         "data_source": _normalize_data_source(pair),
         "market_mode": _normalize_market_mode(pair),
@@ -4368,11 +4384,39 @@ def filter_active_mobile_market_overview(
         for row in active_rows
     }
 
-    def keep_active(row: Any) -> bool:
-        return (
-            isinstance(row, dict)
-            and str(row.get("symbol") or "").upper().strip() in active_symbols
+    contract_candidates = {
+        str(row.get("trade_symbol") or "").upper().strip()
+        for row in rows
+        if str(row.get("trade_market") or "").lower().strip() == "contract"
+        and str(row.get("trade_symbol") or "").strip()
+    }
+    active_contract_symbols: set[str] = set()
+    if contract_candidates:
+        contract_rows = (
+            db.query(ContractSymbol.symbol)
+            .filter(
+                ContractSymbol.symbol.in_(contract_candidates),
+                ContractSymbol.status == 1,
+            )
+            .all()
         )
+        active_contract_symbols = {
+            str(getattr(row, "symbol", None) or row[0]).upper().strip()
+            for row in contract_rows
+        }
+
+    def keep_active(row: Any) -> bool:
+        if not isinstance(row, dict):
+            return False
+        symbol = str(row.get("symbol") or "").upper().strip()
+        trade_symbol = str(row.get("trade_symbol") or "").upper().strip()
+        contract_route_active = (
+            str(row.get("trade_market") or "").lower().strip() == "contract"
+            and trade_symbol in active_contract_symbols
+        )
+        if str(row.get("category") or "").lower().strip() == "contract_cfd":
+            return contract_route_active and symbol == trade_symbol
+        return symbol in active_symbols or contract_route_active
 
     next_payload = dict(payload)
     if isinstance(overview_cards, list):
@@ -4409,7 +4453,9 @@ def _mobile_market_category(pair_data: Dict[str, Any]) -> str:
     ):
         return "onchain"
     if (
-        values.intersection({"CONTRACT", "CFD", "INDEX", "FOREX", "METAL", "COMMODITY", "ETF"})
+        values.intersection(
+            MOBILE_CFD_CONTRACT_CATEGORIES | {"CONTRACT", "CFD", "ETF"}
+        )
         or symbol in {"NAS100", "XAUUSD", "XAGUSD", "EURUSD", "USOUSD"}
     ):
         return "contract_cfd"
@@ -4450,26 +4496,142 @@ def _mobile_market_name(pair_data: Dict[str, Any]) -> str:
     ).strip()
 
 
-def _mobile_market_item(pair_data: Dict[str, Any]) -> Dict[str, Any]:
+def _mobile_contract_trade_routes(
+    db: Session,
+    pair_rows: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    contract_rows = [
+        row
+        for row in pair_rows
+        if isinstance(row, dict)
+        and _mobile_market_category(row) in {"stocks", "contract_cfd"}
+    ]
+    if not contract_rows:
+        return {}
+
+    symbol_candidates: set[str] = set()
+    provider_candidates: set[str] = set()
+    for row in contract_rows:
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if symbol:
+            symbol_candidates.add(symbol)
+            symbol_candidates.add(symbol if symbol.endswith("_PERP") else f"{symbol}_PERP")
+        provider_symbol = str(
+            row.get("external_symbol") or _mobile_display_symbol(row) or ""
+        ).upper().strip()
+        if provider_symbol:
+            provider_candidates.add(provider_symbol)
+
+    clauses = []
+    if symbol_candidates:
+        clauses.append(ContractSymbol.symbol.in_(symbol_candidates))
+    if provider_candidates:
+        clauses.append(ContractSymbol.provider_symbol.in_(provider_candidates))
+    if not clauses:
+        return {}
+
+    catalog_rows = (
+        db.query(
+            ContractSymbol.symbol,
+            ContractSymbol.provider_symbol,
+            ContractSymbol.status,
+        )
+        .filter(or_(*clauses))
+        .order_by(ContractSymbol.symbol.asc())
+        .all()
+    )
+    by_symbol: Dict[str, Dict[str, Any]] = {}
+    by_provider: Dict[str, Dict[str, Any]] = {}
+    for row in catalog_rows:
+        symbol = _contract_symbol_row_value(row, "symbol", 0)
+        provider_symbol = _contract_symbol_row_value(row, "provider_symbol", 1)
+        enabled = _contract_symbol_row_value(row, "status", 2) == "1"
+        if not symbol:
+            continue
+        route = {"symbol": symbol, "enabled": enabled}
+        by_symbol[symbol] = route
+        if provider_symbol:
+            current = by_provider.get(provider_symbol)
+            if current is None or (not current["enabled"] and enabled):
+                by_provider[provider_symbol] = route
+
+    routes: Dict[str, Dict[str, Any]] = {}
+    for row in contract_rows:
+        market_symbol = str(row.get("symbol") or "").upper().strip()
+        if not market_symbol:
+            continue
+        symbol_candidate = (
+            market_symbol
+            if market_symbol.endswith("_PERP")
+            else f"{market_symbol}_PERP"
+        )
+        exact = by_symbol.get(symbol_candidate) or by_symbol.get(market_symbol)
+        provider_symbol = str(
+            row.get("external_symbol") or _mobile_display_symbol(row) or ""
+        ).upper().strip()
+        match = exact if exact is not None else by_provider.get(provider_symbol)
+        enabled = bool(match and match.get("enabled"))
+        routes[market_symbol] = {
+            "tradable": enabled,
+            "trade_market": "contract",
+            "trade_symbol": str(match.get("symbol") or "") if enabled else None,
+            "trade_status": "ENABLED" if enabled else "MARKET_DATA_ONLY",
+        }
+    return routes
+
+
+def _mobile_market_item(
+    pair_data: Dict[str, Any],
+    contract_routes: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     symbol = str(pair_data.get("symbol") or "").upper().strip()
+    category = _mobile_market_category(pair_data)
+    if category == "spot":
+        trade_route = {
+            "tradable": True,
+            "trade_market": "spot",
+            "trade_symbol": symbol,
+            "trade_status": "ENABLED",
+        }
+    elif category in {"stocks", "contract_cfd"}:
+        trade_route = (contract_routes or {}).get(
+            symbol,
+            {
+                "tradable": False,
+                "trade_market": "contract",
+                "trade_symbol": None,
+                "trade_status": "MARKET_DATA_ONLY",
+            },
+        )
+    else:
+        trade_route = {
+            "tradable": False,
+            "trade_market": None,
+            "trade_symbol": None,
+            "trade_status": "UNSUPPORTED",
+        }
+    raw_price = pair_data.get("last_price")
+    if raw_price is None:
+        raw_price = pair_data.get("price")
+    raw_change = pair_data.get("price_change_percent_24h")
+    if raw_change is None:
+        raw_change = pair_data.get("change_24h")
+    if raw_change is None:
+        raw_change = pair_data.get("price_change_percent")
     return {
         "symbol": symbol,
         "display_symbol": _mobile_display_symbol(pair_data),
         "name": _mobile_market_name(pair_data),
-        "category": _mobile_market_category(pair_data),
-        "price": str(pair_data.get("last_price") or pair_data.get("price") or "0"),
-        "change_pct": str(
-            pair_data.get("price_change_percent_24h")
-            or pair_data.get("change_24h")
-            or pair_data.get("price_change_percent")
-            or "0"
-        ),
+        "category": category,
+        "price": str(raw_price) if raw_price is not None else None,
+        "change_pct": str(raw_change) if raw_change is not None else None,
         "volume": str(pair_data.get("quote_volume_24h") or pair_data.get("volume_24h") or "0"),
         "price_precision": int(pair_data.get("price_precision") or 8),
         "amount_precision": int(pair_data.get("amount_precision") or 8),
         "source": str(pair_data.get("source") or pair_data.get("data_source") or "api"),
         "stale": bool(pair_data.get("stale") or pair_data.get("is_stale")),
         "updated_at": pair_data.get("updated_at") or pair_data.get("cache_updated_at"),
+        **trade_route,
     }
 
 
@@ -4479,11 +4641,216 @@ def _mobile_sort_key(item: Dict[str, Any]) -> Tuple[int, int, str]:
         change_weight = int(abs(_to_decimal(item.get("change_pct"))) * Decimal("100"))
     except Exception:
         change_weight = 0
-    priority = MOBILE_OVERVIEW_SYMBOLS.index(symbol) if symbol in MOBILE_OVERVIEW_SYMBOLS else 999
+    if symbol in MOBILE_OVERVIEW_SYMBOLS:
+        priority = MOBILE_OVERVIEW_SYMBOLS.index(symbol)
+    elif symbol in MOBILE_STOCK_OVERVIEW_SYMBOLS:
+        priority = len(MOBILE_OVERVIEW_SYMBOLS) + MOBILE_STOCK_OVERVIEW_SYMBOLS.index(symbol)
+    else:
+        priority = 999
     return (priority, -change_weight, symbol)
 
 
-def get_mobile_market_overview(db: Session) -> Dict[str, Any]:
+def _mobile_stock_contract_pair_rows(
+    catalog_rows: List[ContractSymbol],
+    ticker_rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    ticker_by_symbol = {
+        str(item.get("symbol") or "").upper().strip(): item
+        for item in ticker_rows
+        if isinstance(item, dict) and str(item.get("symbol") or "").strip()
+    }
+    company_names = {
+        "AAPL": "Apple",
+        "AMZN": "Amazon",
+        "MSFT": "Microsoft",
+        "NVDA": "NVIDIA",
+        "TSLA": "Tesla",
+    }
+    rows: list[dict[str, Any]] = []
+    for item in catalog_rows:
+        symbol = str(getattr(item, "symbol", "") or "").upper().strip()
+        if not symbol:
+            continue
+        ticker = ticker_by_symbol.get(symbol, {})
+        display_symbol = str(
+            getattr(item, "base_asset", None)
+            or getattr(item, "provider_symbol", None)
+            or symbol.replace("USDT_PERP", "")
+        ).upper().strip()
+        source = str(ticker.get("source") or "CONTRACT_MARKET")
+        rows.append(
+            {
+                "symbol": symbol,
+                "external_symbol": str(getattr(item, "provider_symbol", None) or display_symbol),
+                "display_symbol": display_symbol,
+                "display_name": company_names.get(display_symbol)
+                or str(getattr(item, "display_name", None) or display_symbol),
+                "asset_type": "STOCK",
+                "market_category": "STOCK",
+                "last_price": ticker.get("last_price"),
+                "price_change_percent_24h": ticker.get("price_change_percent_24h"),
+                "quote_volume_24h": ticker.get("quote_volume_24h"),
+                "price_precision": int(getattr(item, "price_precision", None) or 2),
+                "amount_precision": int(getattr(item, "quantity_precision", None) or 6),
+                "source": source,
+                "stale": (
+                    str(ticker.get("quote_freshness") or "").upper()
+                    in {"STALE", "LAST_VALID", "FALLBACK"}
+                    or source.upper() in {"LAST_VALID", "CFD_FALLBACK"}
+                ),
+                "updated_at": ticker.get("ts"),
+            }
+        )
+    return rows
+
+
+def _mobile_cfd_contract_pair_rows(
+    catalog_rows: List[ContractSymbol],
+    ticker_rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    ticker_by_symbol = {
+        str(item.get("symbol") or "").upper().strip(): item
+        for item in ticker_rows
+        if isinstance(item, dict) and str(item.get("symbol") or "").strip()
+    }
+    rows: list[dict[str, Any]] = []
+    for item in catalog_rows:
+        symbol = str(getattr(item, "symbol", "") or "").upper().strip()
+        if not symbol:
+            continue
+        ticker = ticker_by_symbol.get(symbol, {})
+        provider_symbol = str(
+            getattr(item, "provider_symbol", None)
+            or symbol.removesuffix("_PERP")
+        ).upper().strip()
+        category = str(getattr(item, "category", None) or "").upper().strip()
+        source = str(ticker.get("source") or "CONTRACT_MARKET")
+        rows.append(
+            {
+                "symbol": symbol,
+                "external_symbol": provider_symbol,
+                "display_symbol": provider_symbol,
+                "display_name": str(
+                    getattr(item, "display_name", None) or provider_symbol
+                ),
+                "asset_type": category,
+                "market_category": category,
+                "last_price": ticker.get("last_price"),
+                "price_change_percent_24h": ticker.get("price_change_percent_24h"),
+                "quote_volume_24h": ticker.get("quote_volume_24h"),
+                "price_precision": int(getattr(item, "price_precision", None) or 2),
+                "amount_precision": int(getattr(item, "quantity_precision", None) or 6),
+                "source": source,
+                "stale": (
+                    str(ticker.get("quote_freshness") or "").upper()
+                    in {"STALE", "LAST_VALID", "FALLBACK"}
+                    or source.upper() in {"LAST_VALID", "CFD_FALLBACK"}
+                ),
+                "updated_at": ticker.get("ts"),
+            }
+        )
+    return rows
+
+
+def get_mobile_overview_symbol_config(db: Session) -> List[str]:
+    settings_row = (
+        db.query(MobileContentSettings)
+        .order_by(MobileContentSettings.id.asc())
+        .first()
+    )
+    return list(
+        normalize_mobile_home_config(
+            settings_row.home_config if settings_row else None
+        )["market_shortcut_symbols"]
+    )
+
+
+def _mobile_stock_contract_rows(
+    db: Session,
+    preferred_symbols: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    catalog_rows = (
+        db.query(ContractSymbol)
+        .filter(
+            ContractSymbol.status == 1,
+            ContractSymbol.category == "STOCK",
+        )
+        .all()
+    )
+    if not catalog_rows:
+        return []
+    priority_symbols = list(
+        dict.fromkeys(
+            [
+                *(preferred_symbols or []),
+                *MOBILE_STOCK_OVERVIEW_SYMBOLS,
+            ]
+        )
+    )
+    rank = {symbol: index for index, symbol in enumerate(priority_symbols)}
+    preferred_stock_count = sum(
+        1
+        for item in catalog_rows
+        if str(getattr(item, "symbol", "") or "").upper()
+        in set(preferred_symbols or [])
+    )
+    selected = sorted(
+        catalog_rows,
+        key=lambda item: (
+            rank.get(str(getattr(item, "symbol", "") or "").upper(), 999),
+            str(getattr(item, "symbol", "") or "").upper(),
+        ),
+    )[:max(MOBILE_OVERVIEW_SECTION_LIMIT, preferred_stock_count)]
+    symbols = [str(item.symbol or "").upper() for item in selected if str(item.symbol or "").strip()]
+    ticker_rows = get_contract_tickers(db, symbols=symbols, limit=len(symbols))
+    return _mobile_stock_contract_pair_rows(selected, ticker_rows)
+
+
+def _mobile_cfd_contract_rows(db: Session) -> List[Dict[str, Any]]:
+    catalog_rows = (
+        db.query(ContractSymbol)
+        .filter(
+            ContractSymbol.status == 1,
+            ContractSymbol.category.in_(MOBILE_CFD_CONTRACT_CATEGORIES),
+        )
+        .order_by(ContractSymbol.category.asc(), ContractSymbol.symbol.asc())
+        .all()
+    )
+    if not catalog_rows:
+        return []
+    symbols = [
+        str(item.symbol or "").upper()
+        for item in catalog_rows
+        if str(item.symbol or "").strip()
+    ]
+    ticker_rows = get_contract_tickers(db, symbols=symbols, limit=len(symbols))
+    return _mobile_cfd_contract_pair_rows(catalog_rows, ticker_rows)
+
+
+def _mobile_filter_pc_contract_catalog(
+    items: List[Dict[str, Any]],
+    catalog_symbols: set[str],
+) -> List[Dict[str, Any]]:
+    return [
+        item
+        for item in items
+        if item.get("category") != "contract_cfd"
+        or (
+            str(item.get("symbol") or "").upper().strip() in catalog_symbols
+            and item.get("tradable") is True
+        )
+    ]
+
+
+def get_mobile_market_overview(
+    db: Session,
+    preferred_symbols: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    configured_symbols = (
+        list(preferred_symbols)
+        if preferred_symbols is not None
+        else get_mobile_overview_symbol_config(db)
+    )
     pair_payload = get_market_pairs(
         db=db,
         market_type="all",
@@ -4511,11 +4878,44 @@ def get_mobile_market_overview(db: Session) -> Dict[str, Any]:
             continue
         by_symbol[symbol] = {**by_symbol.get(symbol, {}), **row}
 
-    items = [_mobile_market_item(item) for item in by_symbol.values()]
+    for row in _mobile_stock_contract_rows(db, configured_symbols):
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if symbol:
+            by_symbol[symbol] = row
+
+    cfd_catalog_rows = _mobile_cfd_contract_rows(db)
+    cfd_catalog_symbols = {
+        str(row.get("symbol") or "").upper().strip()
+        for row in cfd_catalog_rows
+        if str(row.get("symbol") or "").strip()
+    }
+    for row in cfd_catalog_rows:
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if symbol:
+            by_symbol[symbol] = row
+
+    pair_rows = list(by_symbol.values())
+    contract_routes = _mobile_contract_trade_routes(db, pair_rows)
+    items = [_mobile_market_item(item, contract_routes) for item in pair_rows]
     items = [item for item in items if item.get("symbol")]
+    items = _mobile_filter_pc_contract_catalog(items, cfd_catalog_symbols)
     items.sort(key=_mobile_sort_key)
 
-    overview_cards = [item for symbol in MOBILE_OVERVIEW_SYMBOLS for item in items if item["symbol"] == symbol]
+    overview_priority = list(
+        dict.fromkeys(
+            [
+                *configured_symbols,
+                *MOBILE_OVERVIEW_SYMBOLS,
+                *MOBILE_STOCK_OVERVIEW_SYMBOLS,
+            ]
+        )
+    )
+    overview_cards = [
+        item
+        for symbol in overview_priority
+        for item in items
+        if item["symbol"] == symbol
+    ]
     if len(overview_cards) < 6:
         seen = {item["symbol"] for item in overview_cards}
         overview_cards.extend(item for item in items if item["symbol"] not in seen)
@@ -4530,7 +4930,9 @@ def get_mobile_market_overview(db: Session) -> Dict[str, Any]:
     sections = []
     for key, title in section_configs:
         section_items = [item for item in items if item.get("category") == key]
-        section_items = sorted(section_items, key=_mobile_sort_key)[:MOBILE_OVERVIEW_SECTION_LIMIT]
+        section_items = sorted(section_items, key=_mobile_sort_key)
+        if key != "contract_cfd":
+            section_items = section_items[:MOBILE_OVERVIEW_SECTION_LIMIT]
         sections.append({"key": key, "title": title, "items": section_items})
 
     now = datetime.utcnow().replace(microsecond=0)

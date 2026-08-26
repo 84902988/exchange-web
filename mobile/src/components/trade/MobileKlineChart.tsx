@@ -213,6 +213,10 @@ function MobileKlineChart({
       }),
     [chartWidth, overlayValues, paneTop, visibleCandles],
   );
+  const referencePriceLineLayouts = useMemo(
+    () => buildReferencePriceLineLayouts(validReferencePriceLines, scales),
+    [scales, validReferencePriceLines],
+  );
   const timeTicks = useMemo(
     () => buildTimeTicks(visibleCandles, interval),
     [interval, visibleCandles],
@@ -521,23 +525,14 @@ function MobileKlineChart({
               />
             ),
           )}
-          {validReferencePriceLines.map((line, index) => {
-            const edge = referenceLineEdge(line.price, scales);
-            const edgeStackIndex = validReferencePriceLines
-              .slice(0, index)
-              .filter(candidate => referenceLineEdge(candidate.price, scales) === edge)
-              .length;
-            return (
-              <ReferencePriceLine
-                edge={edge}
-                edgeStackIndex={edge === null ? 0 : edgeStackIndex}
-                key={line.key}
-                line={line}
-                pricePrecision={pricePrecision}
-                scales={scales}
-              />
-            );
-          })}
+          {referencePriceLineLayouts.map(layout => (
+            <ReferencePriceLine
+              key={layout.line.key}
+              layout={layout}
+              pricePrecision={pricePrecision}
+              scales={scales}
+            />
+          ))}
           {currentPriceLinePrice !== null ? (
             <CurrentPriceLabel
               price={currentPriceLinePrice}
@@ -599,34 +594,101 @@ const REFERENCE_LINE_COLORS: Record<KlineReferencePriceLineKind, string> = {
 
 type ReferenceLineEdge = 'above' | 'below' | null;
 
+type ReferencePriceLineLayout = {
+  edge: ReferenceLineEdge;
+  labelY: number;
+  line: KlineReferencePriceLine;
+  lineY: number;
+};
+
+const REFERENCE_LABEL_HALF_HEIGHT = 7;
+const REFERENCE_LABEL_GAP = 15;
+
 function referenceLineEdge(price: number, scales: ScaleLike): ReferenceLineEdge {
   if (price > scales.maxPrice) return 'above';
   if (price < scales.minPrice) return 'below';
   return null;
 }
 
+function buildReferencePriceLineLayouts(
+  lines: readonly KlineReferencePriceLine[],
+  scales: ScaleLike,
+): ReferencePriceLineLayout[] {
+  if (lines.length === 0) return [];
+
+  const top = scales.top + REFERENCE_LABEL_HALF_HEIGHT + 1;
+  const bottom = scales.bottom - REFERENCE_LABEL_HALF_HEIGHT - 1;
+  const gap =
+    lines.length <= 1
+      ? 0
+      : Math.min(
+          REFERENCE_LABEL_GAP,
+          Math.max(0, (bottom - top) / (lines.length - 1)),
+        );
+  const layouts = lines
+    .map((line, originalIndex) => {
+      const edge = referenceLineEdge(line.price, scales);
+      const rawY = scales.yForPrice(line.price);
+      const lineY =
+        edge === 'above'
+          ? top
+          : edge === 'below'
+          ? bottom
+          : Math.max(top, Math.min(bottom, rawY));
+      return {
+        edge,
+        labelY: lineY,
+        line,
+        lineY,
+        originalIndex,
+      };
+    })
+    .sort(
+      (left, right) =>
+        left.labelY - right.labelY || left.originalIndex - right.originalIndex,
+    );
+
+  for (let index = 1; index < layouts.length; index += 1) {
+    layouts[index].labelY = Math.max(
+      layouts[index].labelY,
+      layouts[index - 1].labelY + gap,
+    );
+  }
+  if (layouts[layouts.length - 1].labelY > bottom) {
+    layouts[layouts.length - 1].labelY = bottom;
+    for (let index = layouts.length - 2; index >= 0; index -= 1) {
+      layouts[index].labelY = Math.min(
+        layouts[index].labelY,
+        layouts[index + 1].labelY - gap,
+      );
+    }
+  }
+  if (layouts[0].labelY < top) {
+    layouts[0].labelY = top;
+    for (let index = 1; index < layouts.length; index += 1) {
+      layouts[index].labelY = Math.max(
+        layouts[index].labelY,
+        layouts[index - 1].labelY + gap,
+      );
+    }
+  }
+
+  return layouts
+    .sort((left, right) => left.originalIndex - right.originalIndex)
+    .map(({originalIndex: _originalIndex, ...layout}) => layout);
+}
+
 function ReferencePriceLine({
-  edge,
-  edgeStackIndex,
-  line,
+  layout,
   pricePrecision,
   scales,
 }: {
-  edge: ReferenceLineEdge;
-  edgeStackIndex: number;
-  line: KlineReferencePriceLine;
+  layout: ReferencePriceLineLayout;
   pricePrecision: number;
   scales: ScaleLike;
 }) {
+  const {edge, labelY, line, lineY} = layout;
   const color = REFERENCE_LINE_COLORS[line.kind];
-  const rawY = scales.yForPrice(line.price);
-  const edgeOffset = Math.min(edgeStackIndex, 2) * 15;
-  const y =
-    edge === 'above'
-      ? scales.top + 8 + edgeOffset
-      : edge === 'below'
-      ? scales.bottom - 8 - edgeOffset
-      : Math.max(scales.top + 8, Math.min(scales.bottom - 8, rawY));
   const direction = edge === 'above' ? '↑ ' : edge === 'below' ? '↓ ' : '';
   const text = `${direction}${line.label} ${formatPrice(
     line.price,
@@ -645,11 +707,22 @@ function ReferencePriceLine({
         stroke={color}
         strokeDasharray={line.kind === 'ENTRY' ? '4 3' : '2 2'}
         strokeWidth="0.9"
+        testID={`kline-reference-price-line-${line.key}`}
         x1={scales.left}
         x2={scales.right}
-        y1={y}
-        y2={y}
+        y1={lineY}
+        y2={lineY}
       />
+      {Math.abs(labelY - lineY) > 0.5 ? (
+        <Line
+          stroke={color}
+          strokeWidth="0.7"
+          x1={scales.left + 3}
+          x2={scales.left + 3}
+          y1={lineY}
+          y2={labelY}
+        />
+      ) : null}
       <Rect
         fill={color}
         height={labelHeight}
@@ -657,14 +730,15 @@ function ReferencePriceLine({
         rx="3"
         width={labelWidth}
         x={labelX}
-        y={y - labelHeight / 2}
+        y={labelY - labelHeight / 2}
       />
       <SvgText
         fill={colors.black}
         fontSize="7.5"
         fontWeight="700"
+        testID={`kline-reference-label-${line.key}`}
         x={labelX + 5}
-        y={y + 2.8}
+        y={labelY + 2.8}
       >
         {text}
       </SvgText>

@@ -84,6 +84,7 @@ export type LatestAnnouncement = {
   is_pinned?: boolean;
   status?: string;
   publish_at?: string | null;
+  created_at?: string | null;
 };
 
 export type AboutPageSectionItem = {

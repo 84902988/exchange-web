@@ -2424,6 +2424,10 @@ export default function TradeScreen() {
         navigation.navigate('Assets');
         return;
       }
+      if (action === 'rcbFee') {
+        navigation.navigate('VipCenter');
+        return;
+      }
       if (action === 'deposit') {
         navigation.navigate('AssetDeposit');
         return;

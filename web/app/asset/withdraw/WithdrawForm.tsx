@@ -10,6 +10,11 @@ import NetworkSelect from "@/components/asset/NetworkSelect";
 import { useLocaleContext } from "@/contexts/LocaleContext";
 import WithdrawAPI, { type WithdrawRecord } from "@/lib/api/modules/assets_withdraw";
 import UserTransferAPI, { type UserTransferRecipient } from "@/lib/api/modules/user_transfer";
+import {
+  reuseOrCreateUserTransferIntent,
+  submitUserTransferWithRecovery,
+  type UserTransferRequestIntent,
+} from "@/lib/userTransferIntent";
 import type { Language } from "@/utils/language";
 import {
   getWithdrawFailureReason,
@@ -230,6 +235,7 @@ export default function WithdrawForm(props: Props) {
   const [finalFeeLoading, setFinalFeeLoading] = useState(false);
   const [result, setResult] = useState<ResultState | null>(null);
   const [internalError, setInternalError] = useState("");
+  const internalTransferIntentRef = useRef<UserTransferRequestIntent | null>(null);
 
   const optionItems = useMemo(
     () =>
@@ -483,6 +489,7 @@ export default function WithdrawForm(props: Props) {
 
   const resetAll = () => {
     resetFlow();
+    internalTransferIntentRef.current = null;
     setToAddress("");
     setAmount("");
     setRecipientEmail("");
@@ -545,18 +552,38 @@ export default function WithdrawForm(props: Props) {
         if (!resolvedRecipient || resolvedRecipientEmail !== email || !resolvedRecipient.can_transfer) {
           throw new Error("confirm recipient");
         }
-        const requestId =
-          typeof crypto !== "undefined" && "randomUUID" in crypto
-            ? crypto.randomUUID()
-            : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-        const res = await UserTransferAPI.createTransfer({
-          request_id: requestId,
-          recipient_email: email,
-          symbol: normUpper(coinSymbol),
-          amount: amount.trim(),
-          remark: recipientRemark.trim() || undefined,
+        const intentPayload = {
+          recipientEmail: email,
+          symbol: coinSymbol,
+          amount,
+          remark: recipientRemark,
+        };
+        const intent = reuseOrCreateUserTransferIntent(
+          internalTransferIntentRef.current,
+          intentPayload,
+          () =>
+            typeof crypto !== "undefined" && "randomUUID" in crypto
+              ? crypto.randomUUID()
+              : `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        );
+        internalTransferIntentRef.current = intent;
+        const record = await submitUserTransferWithRecovery({
+          intent,
+          payload: intentPayload,
+          expectedRecipientUserId: resolvedRecipient.user_id,
+          submit: async () => {
+            const response = await UserTransferAPI.createTransfer({
+              request_id: intent.requestId,
+              recipient_email: email,
+              symbol: normUpper(coinSymbol),
+              amount: amount.trim(),
+              remark: recipientRemark.trim() || undefined,
+            });
+            return response.record;
+          },
+          getStatus: () => UserTransferAPI.getRequestStatus(intent.requestId),
         });
-        const record = res.record;
+        internalTransferIntentRef.current = null;
         setResult({
           ok: true,
           kind: "user_transfer",

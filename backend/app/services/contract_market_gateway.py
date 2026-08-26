@@ -472,7 +472,10 @@ class ContractMarketGateway:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._locks: dict[str, threading.Lock] = {}
         self._kline_locks: dict[tuple[str, str], threading.Lock] = {}
-        self._task_lock = asyncio.Lock()
+        # These maps are only mutated in short, non-awaiting critical sections.
+        # A threading lock avoids binding the process-wide gateway to whichever
+        # asyncio loop happened to exist during module import (or a prior test).
+        self._task_lock = threading.RLock()
         self._last_full_refresh_at: dict[str, float] = {}
         self._last_depth_broadcast_at: dict[str, float] = {}
         self._last_depth_signature: dict[str, str] = {}
@@ -503,7 +506,7 @@ class ContractMarketGateway:
         loop = asyncio.get_running_loop()
         with self._state_lock:
             self._provider_ws_allowed_symbols.add(normalized_symbol)
-        async with self._task_lock:
+        with self._task_lock:
             self._kline_event_loop = loop
             self._kline_wakeup_events.setdefault(normalized_symbol, asyncio.Event())
             self._kline_refresh_locks.setdefault(normalized_symbol, asyncio.Lock())
@@ -565,7 +568,7 @@ class ContractMarketGateway:
         cancelled_task = False
         with self._state_lock:
             self._provider_ws_allowed_symbols.discard(normalized_symbol)
-        async with self._task_lock:
+        with self._task_lock:
             task = self._tasks.pop(normalized_symbol, None)
             if task is not None and not task.done():
                 task.cancel()
@@ -854,7 +857,7 @@ class ContractMarketGateway:
                 exc_info=True,
             )
         finally:
-            async with self._task_lock:
+            with self._task_lock:
                 if self._kline_event_tasks.get(symbol) is current_task:
                     self._kline_event_tasks.pop(symbol, None)
 
@@ -902,7 +905,7 @@ class ContractMarketGateway:
         except asyncio.CancelledError:
             raise
         finally:
-            async with self._task_lock:
+            with self._task_lock:
                 task = self._tasks.get(symbol)
                 if task is current_task:
                     self._tasks.pop(symbol, None)
@@ -917,7 +920,7 @@ class ContractMarketGateway:
                 )
                 with self._state_lock:
                     self._provider_ws_allowed_symbols.discard(symbol)
-                async with self._task_lock:
+                with self._task_lock:
                     event_task = self._kline_event_tasks.pop(symbol, None)
                     if event_task is not None and not event_task.done():
                         event_task.cancel()

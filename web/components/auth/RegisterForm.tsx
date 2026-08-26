@@ -125,11 +125,6 @@ const getErrorMessage = (
   return fallback;
 };
 
-const isInviteNotBdError = (error: unknown) => {
-  const code = getErrorCode(error);
-  return code === 'INVITE_CODE_NOT_FOUND' || code === 'INVITER_NOT_ACTIVE_BD';
-};
-
 const formatText = (template: string, values: Record<string, string | number>) => (
   Object.entries(values).reduce((text, [key, value]) => text.replaceAll(`{${key}}`, String(value)), template)
 );
@@ -143,31 +138,15 @@ const getInviteValidationMessage = (error: unknown, t: (key: string, namespace?:
   return t('inviteInvalid', 'auth');
 };
 
-const resolveInviteInfo = async (inviteCode: string, inviteType: string): Promise<InviteInfo> => {
-  if (inviteType === 'user') {
-    const userInvite = await validateUserInvite(inviteCode);
-    if (!userInvite.valid) throw { code: 'INVITE_CODE_NOT_FOUND' };
-    return {
-      type: 'user',
-      invite_code: (userInvite.invite_code || inviteCode).trim(),
-      inviter_name: userInvite.inviter_name,
-    };
-  }
-
+export const resolveInviteInfo = async (inviteCode: string, inviteType: string): Promise<InviteInfo> => {
   if (inviteType === 'bd') {
     const bdInvite = await validateBdInvite(inviteCode);
     if (!bdInvite.valid) throw { code: 'INVITE_CODE_NOT_FOUND' };
     return { type: 'bd', invite_code: (bdInvite.invite_code || inviteCode).trim() };
   }
 
-  try {
-    const bdInvite = await validateBdInvite(inviteCode);
-    if (!bdInvite.valid) throw { code: 'INVITE_CODE_NOT_FOUND' };
-    return { type: 'bd', invite_code: (bdInvite.invite_code || inviteCode).trim() };
-  } catch (bdError) {
-    if (!isInviteNotBdError(bdError)) throw bdError;
-  }
-
+  // A link without an explicit type is an ordinary invite. BD attribution is
+  // irreversible and must only come from a link that explicitly says type=bd.
   const userInvite = await validateUserInvite(inviteCode);
   if (!userInvite.valid) throw { code: 'INVITE_CODE_NOT_FOUND' };
   return {

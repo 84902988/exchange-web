@@ -165,42 +165,10 @@ export function getReferenceOverlayConfig(
   symbol: string,
   t: ReferenceOverlayTranslator,
 ): ReferenceOverlayConfig | null {
-  const normalizedSymbol = normalizeReferenceOverlaySymbol(symbol);
-
-  if (normalizedSymbol === 'MFCUSDT') {
-    const copy = localizedReferenceCopy({
-      kind: 'IRON',
-      symbol: 'IRON62',
-      displayPrice: 0.108,
-      t,
-    });
-    return {
-      enabled: true,
-      kind: 'IRON',
-      symbol: 'MFCUSDT',
-      title: copy.title,
-      valueLabel: copy.valueLabel,
-      sourceLabel: copy.sourceLabel,
-      sourcePriceLabel: formatReferenceText(t('spotReferenceIronValueLabel', 'asset'), {
-        price: '108',
-        unit: t('spotReferenceUnitUsdPerTon', 'asset'),
-      }),
-      description: copy.description,
-      lineTitle: copy.lineTitle,
-      lineColor: '#f0b90b',
-      badgeColor: '#f0b90b',
-      displayPrice: 0.108,
-      displayUnit: 'USDT',
-      priceSource: 'MANUAL',
-      stale: false,
-      syncError: null,
-    };
-  }
-
-  // Reference mappings:
-  // IGCUSDT: XAUUSD -> USDT/g
-  // BON-2USDT: stock quote -> token reference
-  // IMAA-2USDT: stock quote -> token reference
+  void symbol;
+  void t;
+  // Reference prices are server-authoritative. An API failure must not restore
+  // a hard-coded quote that can be mistaken for a current market value.
   return null;
 }
 

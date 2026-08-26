@@ -26,6 +26,7 @@ const mockFetchContractSymbolRules = jest.fn();
 const mockFetchContractTrades = jest.fn();
 const mockUseContractKlineRealtime = jest.fn();
 const mockUseContractMarketRealtime = jest.fn();
+const mockWaitForExecutionLease = jest.fn();
 const mockFetchTradeIdempotencyStatus = jest.fn();
 
 let mockMarketScreenActive = true;
@@ -74,6 +75,13 @@ jest.mock('../src/hooks/useContractMarketRealtime', () => ({
 jest.mock('../src/hooks/useContractKlineRealtime', () => ({
   useContractKlineRealtime: (...args: unknown[]) =>
     mockUseContractKlineRealtime(...args),
+}));
+
+jest.mock('../src/realtime/contractMarketRealtime', () => ({
+  getContractMarketRealtimeStore: () => ({
+    waitForExecutionLease: (...args: unknown[]) =>
+      mockWaitForExecutionLease(...args),
+  }),
 }));
 
 jest.mock('../src/hooks/usePrivateTradingRealtime', () => ({
@@ -295,6 +303,7 @@ function executableMarketState() {
       receivedAtMs: 10_000,
       expiresAtMs: 11_000,
     },
+    executionRecovering: false,
     loading: false,
     error: null,
     executionGeneration: 1,
@@ -403,6 +412,7 @@ describe('ContractScreen execution confirmation lifecycle', () => {
     mockIsLoggedIn = true;
     mockUserId = 7;
     mockContractMarketState = executableMarketState();
+    mockWaitForExecutionLease.mockResolvedValue(null);
     mockRouteParams = undefined;
     mockOrderFormProps = null;
     mockBottomTabsProps = null;
@@ -554,7 +564,7 @@ describe('ContractScreen execution confirmation lifecycle', () => {
     expect(mockOrderFormProps?.submitDisabled).toBe(true);
   });
 
-  it('keeps the header tradable during a transient lease gap while submission remains fail-closed', async () => {
+  it('keeps the buy action stable during a transient live lease renewal', async () => {
     renderer = await renderReadyContractScreen();
 
     expect(mockSymbolHeaderProps?.marketStatus).toBe('可交易');
@@ -564,6 +574,7 @@ describe('ContractScreen execution confirmation lifecycle', () => {
     mockContractMarketState = {
       ...executableMarketState(),
       lease: null,
+      executionRecovering: true,
       executionGeneration: 2,
     };
     await act(async () => {
@@ -571,7 +582,39 @@ describe('ContractScreen execution confirmation lifecycle', () => {
     });
 
     expect(mockSymbolHeaderProps?.marketStatus).toBe('可交易');
-    expect(mockOrderFormProps?.submitDisabled).toBe(true);
+    expect(mockOrderFormProps?.submitDisabled).toBe(false);
+  });
+
+  it('waits for a fresh execution lease before opening confirmation from a renewal gap', async () => {
+    mockContractMarketState = {
+      ...executableMarketState(),
+      lease: null,
+      executionRecovering: true,
+      executionGeneration: 2,
+    };
+    mockWaitForExecutionLease.mockResolvedValue({
+      lease: {
+        executionBid: 100,
+        executionAsk: 101,
+        priceAgeMs: 100,
+        executionTtlMs: 1_500,
+        receivedAtMs: 10_000,
+        expiresAtMs: 11_000,
+      },
+      executionGeneration: 2,
+      sessionGeneration: 1,
+    });
+    renderer = await renderReadyContractScreen();
+    await act(async () => {
+      mockOrderFormProps?.onPriceChange('100');
+    });
+    await act(async () => {
+      await mockOrderFormProps?.onSubmitPress();
+    });
+
+    expect(mockWaitForExecutionLease).toHaveBeenCalledTimes(1);
+    expect(mockOrderConfirmProps).toMatchObject({visible: true});
+    expect(mockOpenContractOrder).not.toHaveBeenCalled();
   });
 
   it('passes the complete authoritative depth to the order-book aggregator', async () => {
@@ -1570,6 +1613,50 @@ describe('ContractScreen execution confirmation lifecycle', () => {
     });
 
     expect(mockOrderFormProps?.submitDisabled).toBe(false);
+  });
+
+  it('does not flicker the submit gate on a failed background refresh before the snapshot really expires', async () => {
+    renderer = await renderReadyContractScreen();
+    const longLeaseState = executableMarketState();
+    mockContractMarketState = {
+      ...longLeaseState,
+      lease: {
+        ...(longLeaseState.lease as Record<string, unknown>),
+        expiresAtMs: 100_000,
+      },
+    };
+    await act(async () => {
+      renderer?.update(<ContractScreen />);
+    });
+    mockFetchContractAccountSummary.mockRejectedValue(
+      new Error('temporary private refresh failure'),
+    );
+
+    await act(async () => {
+      jest.advanceTimersByTime(20_000);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(mockFetchContractAccountSummary).toHaveBeenCalledTimes(2);
+    expect(mockOrderFormProps?.submitDisabled).toBe(false);
+
+    await act(async () => {
+      jest.advanceTimersByTime(5_000);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(mockFetchContractAccountSummary).toHaveBeenCalledTimes(3);
+    expect(mockOrderFormProps?.submitDisabled).toBe(false);
+
+    await act(async () => {
+      jest.advanceTimersByTime(5_000);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(mockOrderFormProps?.submitDisabled).toBe(true);
   });
 
   it('keeps the quantity and reports failure when the open response cannot be verified', async () => {

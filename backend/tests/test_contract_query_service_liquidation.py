@@ -76,3 +76,32 @@ def test_multi_position_summary_liquidation_price_uses_group_margin_and_average_
     )
 
     assert liquidation_price == Decimal("268.4460000000000000000000000")
+
+
+def test_contract_trade_close_reasons_are_loaded_from_the_authoritative_orders():
+    class QueryStub:
+        def filter(self, *_args):
+            return self
+
+        def all(self):
+            return [
+                (11, "liquidation"),
+                (12, " TAKE_PROFIT "),
+                (13, None),
+            ]
+
+    class DbStub:
+        def query(self, *_args):
+            return QueryStub()
+
+    trades = [
+        SimpleNamespace(order_id=11, action="CLOSE"),
+        SimpleNamespace(order_id=12, action="CLOSE"),
+        SimpleNamespace(order_id=13, action="CLOSE"),
+        SimpleNamespace(order_id=14, action="OPEN"),
+    ]
+
+    assert service._contract_trade_close_reasons_by_order_id(DbStub(), trades) == {
+        11: "LIQUIDATION",
+        12: "TAKE_PROFIT",
+    }

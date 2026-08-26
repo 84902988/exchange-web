@@ -34,7 +34,9 @@ def _db_with_rows(rows):
     pair_query.filter.return_value.first.return_value = pair
 
     order_query = MagicMock()
-    order_query.options.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = rows
+    filtered_order_query = order_query.options.return_value.filter.return_value
+    filtered_order_query.filter.return_value = filtered_order_query
+    filtered_order_query.order_by.return_value.limit.return_value.all.return_value = rows
 
     db = MagicMock()
 
@@ -46,6 +48,7 @@ def _db_with_rows(rows):
         raise AssertionError(f"unexpected query model: {model}")
 
     db.query.side_effect = query
+    db.filtered_order_query = filtered_order_query
     return db
 
 
@@ -76,3 +79,37 @@ def test_history_exposes_zero_remaining_open_status_as_effectively_filled() -> N
     assert result["total"] == 1
     assert result["items"][0]["remaining_amount"] == "0"
     assert result["items"][0]["status"] == "FILLED"
+
+
+def test_history_orders_exposes_stable_cursor_metadata() -> None:
+    newest = _order(order_id=3, amount="1", filled_amount="1", status="FILLED")
+    older = _order(order_id=2, amount="1", filled_amount="1", status="FILLED")
+    db = _db_with_rows([newest, older])
+
+    result = spot_query.get_history_orders(
+        db,
+        user_id=5,
+        symbol="MFCUSDT",
+        limit=1,
+        before_id=4,
+    )
+
+    assert result["total"] == 1
+    assert result["items"][0]["id"] == 3
+    assert result["has_more"] is True
+    assert result["next_cursor"] == 3
+    db.filtered_order_query.filter.assert_called_once()
+
+
+def test_current_orders_omit_cursor_when_page_is_terminal() -> None:
+    active = _order(order_id=2, amount="2", filled_amount="1", status="PARTIALLY_FILLED")
+
+    result = spot_query.get_current_orders(
+        _db_with_rows([active]),
+        user_id=5,
+        symbol="MFCUSDT",
+        limit=1,
+    )
+
+    assert result["has_more"] is False
+    assert result["next_cursor"] is None

@@ -66,7 +66,18 @@ def _generate_ticket_no(db: Session) -> str:
     return f"{prefix}{uuid.uuid4().hex[:12].upper()}"
 
 
-def serialize_support_ticket(ticket: SupportTicket, include_messages: bool = False) -> dict[str, Any]:
+def _has_unread_admin_reply(ticket: SupportTicket, latest_admin_message_id: Optional[int]) -> bool:
+    return bool(
+        latest_admin_message_id
+        and int(latest_admin_message_id) > int(ticket.user_last_read_message_id or 0)
+    )
+
+
+def serialize_support_ticket(
+    ticket: SupportTicket,
+    include_messages: bool = False,
+    latest_admin_message_id: Optional[int] = None,
+) -> dict[str, Any]:
     status = str(ticket.status or "OPEN").upper()
     category = str(ticket.category or "OTHER").upper()
     priority = str(ticket.priority or "NORMAL").upper()
@@ -86,9 +97,24 @@ def serialize_support_ticket(ticket: SupportTicket, include_messages: bool = Fal
         "created_at": ticket.created_at.isoformat() if ticket.created_at else None,
         "updated_at": ticket.updated_at.isoformat() if ticket.updated_at else None,
         "last_reply_at": ticket.last_reply_at.isoformat() if ticket.last_reply_at else None,
+        "has_unread_admin_reply": _has_unread_admin_reply(
+            ticket,
+            latest_admin_message_id,
+        ),
     }
     if include_messages:
         data["messages"] = [serialize_support_ticket_message(message) for message in ticket.messages]
+        data["has_unread_admin_reply"] = _has_unread_admin_reply(
+            ticket,
+            max(
+                (
+                    int(message.id)
+                    for message in ticket.messages
+                    if str(message.sender_type or "").upper() == "ADMIN"
+                ),
+                default=0,
+            ),
+        )
     return data
 
 
@@ -125,14 +151,93 @@ def list_user_support_tickets(
         .limit(page_size)
         .all()
     )
+    ticket_ids = [int(item.id) for item in items]
+    latest_admin_message_ids = {
+        int(ticket_id): int(message_id)
+        for ticket_id, message_id in (
+            db.query(
+                SupportTicketMessage.ticket_id,
+                func.max(SupportTicketMessage.id),
+            )
+            .filter(
+                SupportTicketMessage.ticket_id.in_(ticket_ids),
+                SupportTicketMessage.sender_type == "ADMIN",
+            )
+            .group_by(SupportTicketMessage.ticket_id)
+            .all()
+            if ticket_ids
+            else []
+        )
+    }
     return {
-        "items": [serialize_support_ticket(item) for item in items],
+        "items": [
+            serialize_support_ticket(
+                item,
+                latest_admin_message_id=latest_admin_message_ids.get(int(item.id)),
+            )
+            for item in items
+        ],
         "total": total,
         "page": page,
         "page_size": page_size,
         "pages": pages,
         "categories": list(SUPPORT_TICKET_CATEGORIES),
         "statuses": list(SUPPORT_TICKET_STATUS_OPTIONS),
+        "unread_reply_count": get_unread_support_reply_count(db, user_id),
+    }
+
+
+def get_unread_support_reply_count(db: Session, user_id: int) -> int:
+    return int(
+        db.query(func.count(func.distinct(SupportTicket.id)))
+        .join(
+            SupportTicketMessage,
+            SupportTicketMessage.ticket_id == SupportTicket.id,
+        )
+        .filter(
+            SupportTicket.user_id == int(user_id),
+            SupportTicketMessage.sender_type == "ADMIN",
+            SupportTicketMessage.id
+            > func.coalesce(SupportTicket.user_last_read_message_id, 0),
+        )
+        .scalar()
+        or 0
+    )
+
+
+def mark_user_support_ticket_read(
+    db: Session,
+    user_id: int,
+    ticket_id: int,
+    last_seen_message_id: int,
+) -> dict[str, Any]:
+    ticket = get_user_support_ticket(db, user_id, ticket_id)
+    cursor = int(last_seen_message_id)
+    message_exists = (
+        db.query(SupportTicketMessage.id)
+        .filter(
+            SupportTicketMessage.ticket_id == int(ticket.id),
+            SupportTicketMessage.id == cursor,
+        )
+        .first()
+    )
+    if message_exists is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "SUPPORT_TICKET_READ_CURSOR_INVALID",
+                "message": "Support ticket read cursor is invalid",
+            },
+        )
+    current_cursor = int(ticket.user_last_read_message_id or 0)
+    if cursor > current_cursor:
+        ticket.user_last_read_message_id = cursor
+        ticket.user_last_read_at = _now()
+        db.flush()
+    return {
+        "ok": True,
+        "last_read_message_id": int(ticket.user_last_read_message_id or cursor),
+        "unread_reply_count": get_unread_support_reply_count(db, user_id),
     }
 
 

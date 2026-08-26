@@ -16,6 +16,7 @@ Environment=DB_MAX_OVERFLOW=10
 Environment=EMBED_BACKGROUND_LOOPS_IN_API=0
 Environment=ENABLE_SPOT_AUTO_MATCH_IN_API=0
 Environment=ENABLE_CONTRACT_LIMIT_ORDER_JOB=0
+Environment=ENABLE_RWA_REFERENCE_JOB=1
 User=exchange
 Group=exchange
 ExecStart=/opt/exchange-web/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --access-log

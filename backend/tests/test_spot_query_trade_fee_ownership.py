@@ -8,9 +8,9 @@ from app.db.models.trading_pair import TradingPair
 from app.services import spot_query
 
 
-def _trade() -> SimpleNamespace:
+def _trade(trade_id: int = 141205) -> SimpleNamespace:
     return SimpleNamespace(
-        id=141205,
+        id=trade_id,
         buyer_user_id=100000029,
         seller_user_id=992000018,
         buy_order_id=141264,
@@ -28,13 +28,18 @@ def _trade() -> SimpleNamespace:
     )
 
 
-def _db_with_trade(row: SimpleNamespace) -> MagicMock:
+def _db_with_trade(row: SimpleNamespace, *extra_rows: SimpleNamespace) -> MagicMock:
     pair = SimpleNamespace(id=11, symbol="MFCUSDT")
     pair_query = MagicMock()
     pair_query.filter.return_value.first.return_value = pair
 
     trade_query = MagicMock()
-    trade_query.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [row]
+    filtered_trade_query = trade_query.filter.return_value
+    filtered_trade_query.filter.return_value = filtered_trade_query
+    filtered_trade_query.order_by.return_value.limit.return_value.all.return_value = [
+        row,
+        *extra_rows,
+    ]
 
     db = MagicMock()
 
@@ -46,6 +51,7 @@ def _db_with_trade(row: SimpleNamespace) -> MagicMock:
         raise AssertionError(f"unexpected query model: {model}")
 
     db.query.side_effect = query
+    db.filtered_trade_query = filtered_trade_query
     return db
 
 
@@ -75,3 +81,21 @@ def test_seller_string_user_id_receives_seller_fee_snapshot() -> None:
     assert item["role"] == "MAKER"
     assert item["fee_amount"] == "0.00648"
     assert item["fee_asset_symbol"] == "USDT"
+
+
+def test_my_trades_exposes_stable_cursor_metadata() -> None:
+    db = _db_with_trade(_trade(141205), _trade(141204))
+
+    result = spot_query.get_my_trades(
+        db,
+        user_id="100000029",
+        symbol="MFCUSDT",
+        limit=1,
+        before_id=141206,
+    )
+
+    assert result["total"] == 1
+    assert result["items"][0]["trade_id"] == 141205
+    assert result["has_more"] is True
+    assert result["next_cursor"] == 141205
+    db.filtered_trade_query.filter.assert_called_once()

@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { useLocaleContext } from "@/contexts/LocaleContext";
 import { useAuth } from "@/lib/authContext";
+import { parseApiDateTime } from "@/lib/displayTimeZone";
 import {
   getAnnouncement,
   markAnnouncementRead,
@@ -13,9 +14,8 @@ import {
 } from "@/lib/api/modules/announcements";
 
 function formatTime(value: string | null | undefined, locale: string) {
-  if (!value) return "--";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
+  const date = parseApiDateTime(value);
+  if (!date) return "--";
   return date.toLocaleString(locale, {
     year: "numeric",
     month: "2-digit",
@@ -143,7 +143,9 @@ export default function NoticeDetailPage() {
             >
               {noticeCategoryLabel(notice.category, t)}
             </span>
-            <span className="text-xs text-white/45">{formatTime(notice.publish_at, locale)}</span>
+            <span className="text-xs text-white/45">
+              {formatTime(notice.publish_at || notice.created_at, locale)}
+            </span>
           </div>
           <h1 className="text-2xl font-bold leading-tight text-white sm:text-3xl">{notice.title}</h1>
           {notice.summary ? <p className="mt-3 text-sm leading-relaxed text-white/55">{notice.summary}</p> : null}

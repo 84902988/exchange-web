@@ -50,16 +50,18 @@ class UserTransferRecordItem(BaseModel):
     fee_amount: str
     net_amount: str
     status: str
-    sender_available_before: str
-    sender_available_after: str
-    receiver_available_before: str
-    receiver_available_after: str
     remark: Optional[str] = None
     created_at: str
 
 
 class UserTransferSubmitData(BaseModel):
     record: UserTransferRecordItem
+
+
+class UserTransferRequestStatusData(BaseModel):
+    request_id: str
+    state: Literal["COMPLETED", "NOT_FOUND"]
+    record: Optional[UserTransferRecordItem] = None
 
 
 class UserTransferRecordsData(BaseModel):

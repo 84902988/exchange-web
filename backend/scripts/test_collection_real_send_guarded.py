@@ -27,7 +27,7 @@ ENV_NAMES = {
 
 
 class _Request:
-    cookies = {"admin_auth": "test"}
+    pass
 
 
 class _FakeQuery:

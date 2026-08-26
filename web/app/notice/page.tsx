@@ -8,6 +8,7 @@ import EmptyState from "@/components/ui/EmptyState";
 import LoadingSkeleton from "@/components/ui/LoadingSkeleton";
 import { useLocaleContext } from "@/contexts/LocaleContext";
 import { useAuth } from "@/lib/authContext";
+import { parseApiDateTime } from "@/lib/displayTimeZone";
 import {
   getAnnouncements,
   markAllAnnouncementsRead,
@@ -30,9 +31,8 @@ const CATEGORY_STYLES: Record<string, string> = {
 };
 
 function formatTime(value: string | null | undefined, locale: string) {
-  if (!value) return "--";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
+  const date = parseApiDateTime(value);
+  if (!date) return "--";
   return date.toLocaleString(locale, {
     year: "numeric",
     month: "2-digit",
@@ -238,7 +238,9 @@ function NoticePageContent() {
                         {notice.title}
                       </h2>
                     </div>
-                    <span className="shrink-0 text-xs text-white/50">{formatTime(notice.publish_at, locale)}</span>
+                    <span className="shrink-0 text-xs text-white/50">
+                      {formatTime(notice.publish_at || notice.created_at, locale)}
+                    </span>
                   </div>
                   <p className={`mt-3 line-clamp-2 text-sm leading-relaxed ${isUnread ? "text-white/80" : "text-white/70"}`}>
                     {summaryOf(notice)}

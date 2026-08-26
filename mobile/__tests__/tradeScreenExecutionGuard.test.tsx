@@ -1049,6 +1049,7 @@ describe('TradeScreen execution confirmation lifecycle', () => {
       ['transfer', 'AssetTransfer'],
       ['fundHistory', 'AssetHistory'],
       ['assets', 'Assets'],
+      ['rcbFee', 'VipCenter'],
     ] as const;
     for (const [action, destination] of destinations) {
       act(() => {

@@ -71,7 +71,6 @@ function ContractOrderForm({
   lastPrice,
   markPrice,
   spreadFeePrice,
-  pricePrecision,
   baseAsset,
   quoteAsset,
   isLoggedIn,
@@ -108,8 +107,13 @@ function ContractOrderForm({
     orderType === 'MARKET'
       ? markPrice ?? lastPrice
       : Number(price.replace(/,/g, ''));
-  const quantityNumber = Number(quantity);
+  const quantityNumber = Number(quantity.replace(/,/g, ''));
   const referenceValue = referencePrice ?? NaN;
+  const orderDraftValid =
+    Number.isFinite(referenceValue) &&
+    referenceValue > 0 &&
+    Number.isFinite(quantityNumber) &&
+    quantityNumber > 0;
   const notional =
     Number.isFinite(referenceValue) && Number.isFinite(quantityNumber)
       ? referenceValue * quantityNumber
@@ -137,7 +141,8 @@ function ContractOrderForm({
     : buySelected
     ? styles.longButton
     : styles.shortButton;
-  const tradeDisabled = isLoggedIn && (submitting || submitDisabled);
+  const tradeDisabled =
+    isLoggedIn && (submitting || submitDisabled || !orderDraftValid);
   const leverageControlDisabled = submitting || maxLeverage === null;
   const reviewLabel = pendingIntentReviewLabel || t('trading.reviewOrder');
 
@@ -405,10 +410,7 @@ function ContractOrderForm({
           />
           <Metric
             label={t('contract.feeHint')}
-            value={`${formatContractNumber(
-              estimatedSpreadCost,
-              pricePrecision,
-            )} ${quoteAsset}`}
+            value={`${formatContractNumber(estimatedSpreadCost, 2)} ${quoteAsset}`}
           />
         </View>
 

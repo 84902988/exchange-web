@@ -1145,6 +1145,11 @@ class MarketWsManager:
         if not symbol:
             return
 
+        payload = {
+            **payload,
+            "server_time_ms": int(time.time() * 1000),
+        }
+
         async with self._fanout_lock:
             states = await self._get_payload_recipient_states(symbol, payload)
             if not states:
@@ -1237,6 +1242,11 @@ class MarketWsManager:
                 if state is None or state.closing:
                     return False
 
+            if isinstance(payload, dict):
+                payload = {
+                    **payload,
+                    "server_time_ms": int(time.time() * 1000),
+                }
             text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
             normalized_event_type = str(
                 event_type

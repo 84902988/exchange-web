@@ -11,6 +11,10 @@ import React, {
 } from 'react';
 import Script from 'next/script';
 import type { ChartPropertiesOverrides } from '../../public/tradingview/charting_library/charting_library';
+import {
+  MOBILE_TRADINGVIEW_DISABLED_FEATURES,
+  MOBILE_TRADINGVIEW_ENABLED_FEATURES,
+} from '@/components/tradingview/mobileEmbedFeatures';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import {
   getReferenceOverlay,
@@ -92,6 +96,7 @@ import {
   bindTradingViewDisplayTimeZone,
   type TradingViewTimezoneChart,
 } from '@/lib/tradingview/displayTimeZoneSync';
+import type { TradingViewCustomIndicatorsGetter } from '@/components/tradingview/customIndicators';
 
 type TradingViewVisibleRange = {
   from: number;
@@ -106,6 +111,13 @@ type TradingViewVisibleRangeOptions = {
 
 type TradingViewTimeScaleApi = {
   setRightOffset?: (offset: number) => void;
+};
+
+type MobileTradingViewStudyInstanceApi = {
+  getInputValues: () => readonly {
+    id: string;
+    value: string | number | boolean;
+  }[];
 };
 
 type TradingViewChartApi = {
@@ -126,9 +138,24 @@ type TradingViewChartApi = {
   createShape?: SpotTradingViewOverlayChart['createShape'];
   getShapeById?: SpotTradingViewOverlayChart['getShapeById'];
   removeEntity?: SpotTradingViewOverlayChart['removeEntity'];
+  createStudy?: (
+    name: string,
+    forceOverlay?: boolean,
+    lock?: boolean,
+    inputs?: Readonly<Record<string, string | number | boolean>>,
+    overrides?: Readonly<Record<string, string | number | boolean>>,
+    options?: Readonly<{ disableUndo?: boolean }>,
+  ) => Promise<string | number | null>;
+  getAllStudies?: () => readonly { id: string | number; name: string }[];
+  getStudyById?: (entityId: string | number) => MobileTradingViewStudyInstanceApi;
   getPanes?: SpotTradingViewReferenceOverlayChart['getPanes'];
   getTimezoneApi?: TradingViewTimezoneChart['getTimezoneApi'];
 };
+
+type MobileTradingViewStudyChartApi = TradingViewChartApi & Required<Pick<
+  TradingViewChartApi,
+  'createStudy' | 'removeEntity' | 'getAllStudies' | 'getStudyById'
+>>;
 
 type TradingViewWidgetInstance = {
   remove: () => void;
@@ -153,6 +180,7 @@ type TradingViewLoadError = {
 
 type SpotTradingViewChartProps = Omit<SpotChartProps, 'isLoading'> & {
   bootstrapReady?: boolean;
+  mobileEmbed?: boolean;
   chartMode?: 'time' | 'candle';
   intervalSwitchLoading?: boolean;
   onIntervalChange?: (value: string) => void;
@@ -161,6 +189,8 @@ type SpotTradingViewChartProps = Omit<SpotChartProps, 'isLoading'> & {
   onIntervalResolutionCommit?: (value: string) => void;
   onIntervalResolutionFailure?: (rollbackValue: string) => void;
   onNativeCandleDisplay?: (value: SpotNativeCandleDisplayPrice) => void;
+  onMobileChartApiReady?: (chart: MobileTradingViewStudyChartApi | null) => void;
+  customIndicatorsGetter?: TradingViewCustomIndicatorsGetter;
   spotLogoUrl?: string | null;
   spotLogoAlt?: string | null;
 };
@@ -400,6 +430,7 @@ export default function SpotTradingViewChart({
   pricePrecision,
   amountPrecision,
   bootstrapReady = true,
+  mobileEmbed = false,
   showRwaReference = false,
   chartMode = 'candle',
   intervalSwitchLoading = false,
@@ -409,6 +440,8 @@ export default function SpotTradingViewChart({
   onIntervalResolutionCommit,
   onIntervalResolutionFailure,
   onNativeCandleDisplay,
+  onMobileChartApiReady,
+  customIndicatorsGetter,
   spotLogoUrl,
   spotLogoAlt,
 }: SpotTradingViewChartProps) {
@@ -451,6 +484,7 @@ export default function SpotTradingViewChart({
   const referenceOverlayConfigRef = useRef<ReferenceOverlayConfig | null>(null);
   const activeReferenceOverlayRef = useRef<SpotTradingViewReferenceOverlayValue | null>(null);
   const onNativeCandleDisplayRef = useRef(onNativeCandleDisplay);
+  const onMobileChartApiReadyRef = useRef(onMobileChartApiReady);
   const onIntervalSwitchLoadCompleteRef = useRef(onIntervalSwitchLoadComplete);
   const onIntervalResolutionCommitRef = useRef(onIntervalResolutionCommit);
   const onIntervalResolutionFailureRef = useRef(onIntervalResolutionFailure);
@@ -1902,6 +1936,10 @@ export default function SpotTradingViewChart({
     onNativeCandleDisplayRef.current = onNativeCandleDisplay;
   }, [onNativeCandleDisplay]);
 
+  useEffect(() => {
+    onMobileChartApiReadyRef.current = onMobileChartApiReady;
+  }, [onMobileChartApiReady]);
+
   useEffect(() => () => {
     cancelSubscriberReadinessGrace();
     resolutionRequestCancelRef.current?.();
@@ -1943,6 +1981,7 @@ export default function SpotTradingViewChart({
       resolutionRequestCancelRef.current = null;
       resolutionRequestSeqRef.current += 1;
       chartReadyRef.current = false;
+      if (mobileEmbed) onMobileChartApiReadyRef.current?.(null);
       const retireReason = normalizedSymbolRef.current !== normalizedSymbol
         ? 'SYMBOL_SWITCH'
         : 'WIDGET_DESTROY';
@@ -2074,11 +2113,14 @@ export default function SpotTradingViewChart({
       container: containerId,
       datafeed,
       library_path: TRADINGVIEW_LIBRARY_PATH,
+      ...(customIndicatorsGetter
+        ? { custom_indicators_getter: customIndicatorsGetter }
+        : {}),
       locale: resolveTradingViewLocale(locale),
       timezone: getDisplayTimeZone(),
       theme: 'dark',
       style: widgetStyle,
-      header_widget_buttons_mode: 'compact',
+      header_widget_buttons_mode: mobileEmbed ? 'adaptive' : 'compact',
       disabled_features: [
         'use_localstorage_for_settings',
         'header_symbol_search',
@@ -2087,8 +2129,13 @@ export default function SpotTradingViewChart({
         'symbol_search_hot_key',
         'display_market_status',
         'volume_force_overlay',
+        ...(mobileEmbed ? MOBILE_TRADINGVIEW_DISABLED_FEATURES : []),
       ],
-      enabled_features: ['iframe_loading_same_origin', 'custom_resolutions'],
+      enabled_features: [
+        'iframe_loading_same_origin',
+        'custom_resolutions',
+        ...(mobileEmbed ? MOBILE_TRADINGVIEW_ENABLED_FEATURES : []),
+      ],
       overrides: {
         ...SPOT_TV_PRICE_LABEL_OVERRIDES,
         'paneProperties.background': '#12161c',
@@ -2140,6 +2187,15 @@ export default function SpotTradingViewChart({
           && activeWidgetGenerationRef.current === widgetGeneration
         ),
       });
+      if (
+        mobileEmbed
+        && chart?.createStudy
+        && chart.removeEntity
+        && chart.getAllStudies
+        && chart.getStudyById
+      ) {
+        onMobileChartApiReadyRef.current?.(chart as MobileTradingViewStudyChartApi);
+      }
       releaseDisplayTimeZoneSync();
       releaseDisplayTimeZoneSync = bindTradingViewDisplayTimeZone(chart);
       if (
@@ -2187,6 +2243,10 @@ export default function SpotTradingViewChart({
         || widgetRef.current !== widget
         || activeWidgetGenerationRef.current !== widgetGeneration
       ) return;
+      if (mobileEmbed) {
+        restoreToolbarInteractionAfterReady(widgetGeneration);
+        return;
+      }
       const toolbarSlot = widget.createButton({ align: 'left', useTradingViewStyle: false });
       toolbarSlotRef.current = toolbarSlot;
       toolbarSlot.setAttribute('title', '');
@@ -2403,8 +2463,10 @@ export default function SpotTradingViewChart({
     clearScheduledKlinePreload,
     chartMode,
     containerId,
+    customIndicatorsGetter,
     displayName,
     locale,
+    mobileEmbed,
     normalizedSymbol,
     onChartModeChange,
     onIntervalChange,
@@ -2445,10 +2507,14 @@ export default function SpotTradingViewChart({
 
   return (
     <div
-      className="relative flex h-full min-h-[420px] w-full flex-col bg-[#12161c]"
-      style={{ minHeight: height }}
+      className={mobileEmbed
+        ? 'relative flex h-full min-h-0 w-full flex-col bg-[#12161c]'
+        : 'relative flex h-full min-h-[420px] w-full flex-col bg-[#12161c]'}
+      style={mobileEmbed ? undefined : { minHeight: height }}
       data-spot-chart-realtime-sync={realtimeBootstrapPending ? 'pending' : 'ready'}
       data-spot-chart-bootstrap={bootstrapReady ? 'ready' : 'pending'}
+      data-spot-chart-loading={showChartLoading ? 'pending' : 'ready'}
+      data-spot-chart-error={activeLoadError}
       data-spot-reference-overlay={visibleReferenceOverlayConfig ? 'ready' : 'disabled'}
       data-spot-reference-price={visibleReferenceOverlayConfig?.displayPrice ?? ''}
     >

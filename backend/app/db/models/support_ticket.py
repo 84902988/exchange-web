@@ -34,6 +34,11 @@ class SupportTicket(Base):
         onupdate=datetime.utcnow,
     )
     last_reply_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    user_last_read_message_id: Mapped[Optional[int]] = mapped_column(
+        MySQL_BIGINT(unsigned=True),
+        nullable=True,
+    )
+    user_last_read_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     messages: Mapped[list["SupportTicketMessage"]] = relationship(
         "SupportTicketMessage",
@@ -47,6 +52,12 @@ class SupportTicketMessage(Base):
     __tablename__ = "support_ticket_messages"
     __table_args__ = (
         Index("ix_support_ticket_messages_ticket_created", "ticket_id", "created_at"),
+        Index(
+            "ix_support_ticket_messages_ticket_sender_id",
+            "ticket_id",
+            "sender_type",
+            "id",
+        ),
         {"extend_existing": True},
     )
 

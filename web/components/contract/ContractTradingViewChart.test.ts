@@ -106,6 +106,10 @@ const lifecycleRuntimeModule = loadTypeScriptModule(
     },
   },
 );
+const mobileEmbedFeaturesModule = loadTypeScriptModule(
+  resolveWebTestFile('components/tradingview/mobileEmbedFeatures.ts'),
+  {},
+);
 const chartModule = loadTypeScriptModule(
   resolveContractTestFile('ContractTradingViewChart.tsx'),
   {
@@ -127,6 +131,7 @@ const chartModule = loadTypeScriptModule(
     '@/contexts/LocaleContext': {
       useLocaleContext: () => ({ locale: 'en', t: (key: string) => key }),
     },
+    '@/components/tradingview/mobileEmbedFeatures': mobileEmbedFeaturesModule,
     '@/lib/displayTimeZone': {
       getDisplayTimeZone: () => 'Etc/UTC',
     },

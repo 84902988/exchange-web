@@ -8,6 +8,8 @@
 
 {% block content %}
   {% set current_url = request.url.path ~ ('?' ~ request.url.query if request.url.query else '') %}
+  {% set permissions = current_admin_permissions|default([]) %}
+  {% set can_manage_kyc = is_super_admin|default(false) or 'kyc.manage' in permissions %}
 
   <style>
     .kyc-tabs{
@@ -460,6 +462,7 @@
             <tbody>
               {% for item in items %}
                 {% set doc_number = item.id_number or '' %}
+                {% set masked_doc_number = item.id_number_masked or '' %}
                 <tr>
                   <td>
                     <div class="kyc-cell-main">用户ID {{ item.user_id }}</div>
@@ -468,14 +471,16 @@
                   <td>
                     <div class="kyc-cell-main">{{ item.country_code or '-' }} · {{ id_type_labels.get(item.id_type, item.id_type or '-') }}</div>
                     <div class="kyc-cell-sub mono">
-                      {% if doc_number %}
+                      {% if doc_number and can_manage_kyc %}
                         <button
                           type="button"
                           class="kyc-doc-number"
-                          title="{{ doc_number }}"
+                          title="点击复制完整证件号码"
                           data-full-id="{{ doc_number }}"
                           data-copy-id-number
-                        >{{ doc_number }}</button>
+                        >{{ masked_doc_number }}</button>
+                      {% elif masked_doc_number %}
+                        <span class="kyc-doc-number">{{ masked_doc_number }}</span>
                       {% else %}
                         <span class="kyc-doc-number">-</span>
                       {% endif %}
@@ -531,7 +536,7 @@
                         {% endif %}
                       </div>
 
-                      {% if item.can_review %}
+                      {% if item.can_review and can_manage_kyc %}
                         <form method="post" action="/admin/kyc/{{ item.id }}/approve" class="kyc-action-form" onsubmit="return confirm('确认通过该用户的 KYC 审核？');">
                           <input type="hidden" name="next_path" value="{{ current_url }}" />
                           <button type="submit" class="btn admin-btn admin-btn-primary admin-btn-sm">通过</button>
@@ -603,7 +608,7 @@
         <input type="hidden" name="next_path" value="{{ current_url }}" />
         <div class="field">
           <label for="kyc-reject-note">拒绝原因</label>
-          <textarea id="kyc-reject-note" name="review_note" required placeholder="请输入拒绝原因"></textarea>
+          <textarea id="kyc-reject-note" name="review_note" required maxlength="500" placeholder="请输入拒绝原因"></textarea>
         </div>
         <div class="kyc-reject-actions">
           <button type="button" class="btn secondary admin-btn admin-btn-secondary" data-kyc-reject-close>取消</button>

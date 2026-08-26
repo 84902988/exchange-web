@@ -43,6 +43,10 @@ def _subject(scene: str, code: str) -> str:
         return f"Exchange login code: {code}"
     if scene == "reset":
         return f"Exchange password reset code: {code}"
+    if scene == "verify_email":
+        return f"Exchange email verification code: {code}"
+    if scene == "change_email":
+        return f"Exchange email change code: {code}"
     return f"Exchange verification code: {code}"
 
 
@@ -62,6 +66,10 @@ def _bodies(scene: str, code: str, expire_minutes: int) -> tuple[str, str]:
         title = "Password reset code"
     elif scene == "register":
         title = "Sign-up code"
+    elif scene == "verify_email":
+        title = "Email verification code"
+    elif scene == "change_email":
+        title = "Email change code"
 
     html_body = f"""
     <div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;color:#111">

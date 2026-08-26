@@ -1,3 +1,5 @@
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
@@ -103,12 +105,13 @@ def spot_balances(
 )
 def spot_current_orders(
     symbol: str = Query(..., description="交易对，例如：BTCUSDT"),
-    limit: int = Query(50, description="返回数量，默认50"),
+    limit: int = Query(50, ge=1, le=100, description="返回数量，默认50，最大100"),
+    before_id: Optional[int] = Query(None, ge=1, description="按订单 ID 向前翻页"),
     db: Session = Depends(get_db),
     user_id: int = Depends(get_current_user_id),
 ):
     try:
-        return get_current_orders(db, user_id, symbol, limit)
+        return get_current_orders(db, user_id, symbol, limit, before_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -140,12 +143,13 @@ def spot_current_orders(
 )
 def spot_history_orders(
     symbol: str = Query(..., description="交易对，例如：BTCUSDT"),
-    limit: int = Query(100, description="返回数量，默认100"),
+    limit: int = Query(100, ge=1, le=100, description="返回数量，默认100，最大100"),
+    before_id: Optional[int] = Query(None, ge=1, description="按订单 ID 向前翻页"),
     db: Session = Depends(get_db),
     user_id: int = Depends(get_current_user_id),
 ):
     try:
-        return get_history_orders(db, user_id, symbol, limit)
+        return get_history_orders(db, user_id, symbol, limit, before_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -177,11 +181,12 @@ def spot_history_orders(
 )
 def spot_my_trades(
     symbol: str = Query(..., description="交易对，例如：BTCUSDT"),
-    limit: int = Query(100, description="返回数量，默认100"),
+    limit: int = Query(100, ge=1, le=100, description="返回数量，默认100，最大100"),
+    before_id: Optional[int] = Query(None, ge=1, description="按成交 ID 向前翻页"),
     db: Session = Depends(get_db),
     user_id: int = Depends(get_current_user_id),
 ):
     try:
-        return get_my_trades(db, user_id, symbol, limit)
+        return get_my_trades(db, user_id, symbol, limit, before_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

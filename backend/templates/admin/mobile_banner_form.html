@@ -1,0 +1,109 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}{% if is_edit %}编辑手机端 Banner{% else %}新增手机端 Banner{% endif %}{% endblock %}
+{% block page_title %}{% if is_edit %}编辑手机端 Banner{% else %}新增手机端 Banner{% endif %}{% endblock %}
+{% block page_subtitle %}
+  <div class="page-subtitle">HERO 使用 16:9（建议 1200×675）；PROMO 使用 3:1（建议 1200×400），后台会校验比例和最低清晰度。</div>
+{% endblock %}
+{% block page_actions %}<a class="btn secondary" href="/admin/mobile-content/banners">返回列表</a>{% endblock %}
+
+{% block content %}
+  {% if errors %}<div class="card">{% for item in errors %}<p class="muted">{{ item }}</p>{% endfor %}</div>{% endif %}
+  <section class="page-section">
+    <div class="filter-card">
+      <form method="post" action="{{ form_action }}" class="form-grid">
+        <div class="field" style="grid-column:1 / -1">
+          <label>标题与副标题（四语言）</label>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px">
+            {% for suffix, label in [('zh','简体中文'),('en','English'),('zh_TW','繁體中文'),('ja','日本語')] %}
+              <div class="card" style="padding:12px">
+                <strong>{{ label }}</strong>
+                <label>标题<input name="title_i18n_{{ suffix }}" value="{{ form['title_i18n_' ~ suffix] or '' }}" required maxlength="120" /></label>
+                <label>副标题<input class="localized-subtitle" name="subtitle_i18n_{{ suffix }}" value="{{ form['subtitle_i18n_' ~ suffix] or '' }}" maxlength="220" /></label>
+              </div>
+            {% endfor %}
+          </div>
+          <input type="hidden" name="title" value="{{ form.title or '' }}" />
+          <input type="hidden" name="subtitle" value="{{ form.subtitle or '' }}" />
+        </div>
+        <div class="field">
+          <label>展示位置</label>
+          <select id="placement" name="placement">
+            <option value="HERO" {% if form.placement == 'HERO' %}selected{% endif %}>首页主视觉 HERO</option>
+            <option value="PROMO" {% if form.placement != 'HERO' %}selected{% endif %}>首页活动卡 PROMO</option>
+          </select>
+        </div>
+        <div class="field" style="grid-column:1 / -1">
+          <label>图片地址</label>
+          <div style="display:flex;gap:10px">
+            <input id="image_url" name="image_url" value="{{ form.image_url or '' }}" required maxlength="500" readonly style="flex:1" />
+            <input id="image_file" type="file" accept="image/png,image/jpeg,image/webp" hidden />
+            <button id="upload_button" type="button" class="btn secondary">上传图片</button>
+          </div>
+          <span id="variant_spec" class="muted">当前要求 {{ form.aspect_ratio or '3:1' }}；建议 {{ form.recommended_size or '1200x400' }}，压缩后不超过 2MB。请把文字和人物放在中间安全区。</span>
+        </div>
+        <input id="image_width" name="image_width" type="hidden" value="{{ form.image_width or '' }}" />
+        <input id="image_height" name="image_height" type="hidden" value="{{ form.image_height or '' }}" />
+        <input id="image_byte_size" name="image_byte_size" type="hidden" value="{{ form.image_byte_size or '' }}" />
+        <input id="image_mime_type" name="image_mime_type" type="hidden" value="{{ form.image_mime_type or '' }}" />
+        <div class="field">
+          <label>点击跳转</label>
+          <select name="action_route">
+            <option value="">无跳转</option>
+            {% for route in ['LOGIN','REGISTER','MARKETS','SPOT','CONTRACT','ASSETS'] %}
+              <option value="{{ route }}" {% if form.action_route == route %}selected{% endif %}>{{ route }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field"><label>排序</label><input name="sort_order" type="number" value="{{ form.sort_order or 0 }}" /></div>
+        <div class="field">
+          <label>状态</label>
+          <select name="status">
+            <option value="ACTIVE" {% if form.status == 'ACTIVE' %}selected{% endif %}>启用</option>
+            <option value="DISABLED" {% if form.status == 'DISABLED' %}selected{% endif %}>停用</option>
+          </select>
+        </div>
+        <div class="field"><label>开始时间（UTC）</label><input name="start_at" type="datetime-local" value="{{ form.start_at_input or '' }}" /></div>
+        <div class="field"><label>结束时间（UTC）</label><input name="end_at" type="datetime-local" value="{{ form.end_at_input or '' }}" /></div>
+        <div style="grid-column:1 / -1"><button class="btn" type="submit">保存 Banner</button></div>
+      </form>
+    </div>
+  </section>
+  <script>
+    const uploadButton = document.getElementById("upload_button");
+    const imageFile = document.getElementById("image_file");
+    const imageUrl = document.getElementById("image_url");
+    const placement = document.getElementById("placement");
+    const subtitles = document.querySelectorAll(".localized-subtitle");
+    const variantSpec = document.getElementById("variant_spec");
+    function refreshVariantSpec() {
+      subtitles.forEach((subtitle) => { subtitle.maxLength = placement.value === "HERO" ? 220 : 180; });
+      variantSpec.textContent = placement.value === "HERO"
+        ? "HERO 要求接近 16:9，最低 720×405，建议 1200×675，压缩后不超过 2MB。"
+        : "PROMO 要求接近 3:1，最低 720×240，建议 1200×400，压缩后不超过 2MB。";
+    }
+    placement.addEventListener("change", refreshVariantSpec);
+    refreshVariantSpec();
+    uploadButton.addEventListener("click", () => imageFile.click());
+    imageFile.addEventListener("change", async () => {
+      if (!imageFile.files.length) return;
+      uploadButton.disabled = true;
+      const data = new FormData();
+      data.append("file", imageFile.files[0]);
+      try {
+        const response = await fetch("/admin/uploads/image?scope=mobile", {method:"POST", body:data, credentials:"same-origin"});
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.detail || "上传失败");
+        imageUrl.value = body.url;
+        ["width", "height", "byte_size", "mime_type"].forEach((field) => {
+          document.getElementById(`image_${field}`).value = body[field] || "";
+        });
+      } catch (error) {
+        window.alert(error.message || "上传失败");
+      } finally {
+        uploadButton.disabled = false;
+        imageFile.value = "";
+      }
+    });
+  </script>
+{% endblock %}

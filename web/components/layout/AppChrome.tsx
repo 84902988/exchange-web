@@ -9,7 +9,7 @@ import Footer from "@/components/layout/Footer";
 export default function AppChrome({ children }: { children: ReactNode }) {
   const pathname = usePathname();
 
-  if (pathname === "/restricted") {
+  if (pathname === "/restricted" || pathname === "/mobile/advanced-chart") {
     return <>{children}</>;
   }
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -10,6 +10,7 @@ from app.schemas.user_transfer import UserTransferRequest
 from app.services.user_withdraw_lock_service import assert_user_withdraw_unlocked
 from app.services.user_transfer_service import (
     UserTransferBadRequest,
+    UserTransferIdempotencyConflict,
     UserTransferInsufficientBalance,
     UserTransferNotFound,
     user_transfer_service,
@@ -50,6 +51,9 @@ def create_user_transfer(
     except UserTransferNotFound as exc:
         db.rollback()
         raise HTTPException(status_code=404, detail={"code": exc.code, "message": str(exc)})
+    except UserTransferIdempotencyConflict as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={"code": exc.code, "message": str(exc)})
     except (UserTransferBadRequest, UserTransferInsufficientBalance) as exc:
         db.rollback()
         raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)})
@@ -83,6 +87,27 @@ def list_user_transfer_records(
             page=page,
             page_size=page_size,
             symbol=symbol,
+        )
+        return ok(data=data.model_dump(), trace_id=trace_id)
+    except UserTransferBadRequest as exc:
+        raise HTTPException(status_code=400, detail={"code": exc.code, "message": str(exc)})
+
+
+@router.get("/request-status")
+def get_user_transfer_request_status(
+    request: Request,
+    response: Response,
+    request_id: str = Query(..., min_length=1, max_length=64),
+    db: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+):
+    trace_id = getattr(request.state, "trace_id", None)
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        data = user_transfer_service.get_request_status(
+            db,
+            from_user_id=user_id,
+            request_id=request_id,
         )
         return ok(data=data.model_dump(), trace_id=trace_id)
     except UserTransferBadRequest as exc:

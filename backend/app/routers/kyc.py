@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from app.deps.auth import get_current_user_id
 from app.db.models import KycSubmission, User, UserProfile
 from app.db.session import get_db
-from app.services.kyc_storage import build_kyc_file_response, save_kyc_upload
+from app.services.kyc_storage import build_kyc_file_response, remove_kyc_upload, save_kyc_upload
 
 router = APIRouter(tags=["kyc"])
 
@@ -37,10 +37,12 @@ KYC_STATUS_BADGES = {
     "APPROVED": "success",
     "REJECTED": "danger",
 }
-# The current RBAC catalog has no KYC-specific permission. Keep KYC review
-# access aligned with the existing Admin KYC page until a narrower permission
-# is introduced in a dedicated RBAC change.
-ADMIN_KYC_PERMISSION = "users.view"
+ADMIN_KYC_VIEW_PERMISSION = "kyc.view"
+ADMIN_KYC_MANAGE_PERMISSION = "kyc.manage"
+KYC_FULL_NAME_MAX_LENGTH = 128
+KYC_COUNTRY_CODE_LENGTH = 2
+KYC_ID_NUMBER_MAX_LENGTH = 128
+KYC_REVIEW_NOTE_MAX_LENGTH = 500
 KYC_MATERIAL_FIELDS = {
     "front": "front_image_url",
     "back": "back_image_url",
@@ -61,6 +63,15 @@ def _material_read_url(item: KycSubmission, material_kind: str, *, admin: bool =
     return f"/me/kyc/submissions/{int(item.id)}/materials/{material_kind}"
 
 
+def _mask_id_number(value: str) -> str:
+    text = str(value or "").strip()
+    if len(text) <= 4:
+        return "*" * len(text)
+    if len(text) <= 8:
+        return f"{text[:2]}****{text[-2:]}"
+    return f"{text[:3]}{'*' * min(10, len(text) - 7)}{text[-4:]}"
+
+
 def _serialize_submission(item: KycSubmission | None) -> Optional[dict]:
     if item is None:
         return None
@@ -71,7 +82,7 @@ def _serialize_submission(item: KycSubmission | None) -> Optional[dict]:
         "full_name": item.full_name,
         "country_code": item.country_code,
         "id_type": item.id_type,
-        "id_number": item.id_number,
+        "id_number": _mask_id_number(item.id_number),
         "front_image_url": _material_read_url(item, "front"),
         "back_image_url": _material_read_url(item, "back"),
         "selfie_image_url": _material_read_url(item, "selfie"),
@@ -86,9 +97,10 @@ def _serialize_submission(item: KycSubmission | None) -> Optional[dict]:
 
 def _ensure_profile(db: Session, user: User) -> UserProfile:
     if user.profile is None:
-        db.add(UserProfile(user_id=user.id, kyc_level=0, kyc_status="NONE", updated_at=datetime.utcnow()))
-        db.commit()
-        db.refresh(user)
+        profile = UserProfile(user_id=user.id, kyc_level=0, kyc_status="NONE", updated_at=datetime.utcnow())
+        db.add(profile)
+        db.flush()
+        return profile
     return user.profile
 
 
@@ -105,13 +117,19 @@ def _has_upload_file(file: Optional[UploadFile]) -> bool:
     return bool(file and file.filename)
 
 
-def _admin_required(request: Request, db: Session) -> Optional[Response]:
+def _admin_read_required(request: Request, db: Session) -> Optional[Response]:
     from app.routers.admin_pages import require_admin, require_admin_permission
 
     redirect = require_admin(request)
     if redirect:
         return redirect
-    return require_admin_permission(request, db, ADMIN_KYC_PERMISSION)
+    return require_admin_permission(request, db, ADMIN_KYC_VIEW_PERMISSION)
+
+
+def _admin_review_required(request: Request, db: Session) -> Optional[Response]:
+    from app.routers.admin_pages import require_admin_post_permission
+
+    return require_admin_post_permission(request, db, ADMIN_KYC_MANAGE_PERMISSION)
 
 
 def _admin_reviewer_id(request: Request) -> str:
@@ -184,6 +202,7 @@ def _serialize_admin_submission(item: KycSubmission) -> dict:
         "country_code": item.country_code,
         "id_type": item.id_type,
         "id_number": item.id_number,
+        "id_number_masked": _mask_id_number(item.id_number),
         "front_image_read_url": _material_read_url(item, "front", admin=True),
         "back_image_read_url": _material_read_url(item, "back", admin=True),
         "selfie_image_read_url": _material_read_url(item, "selfie", admin=True),
@@ -208,12 +227,12 @@ def get_my_kyc(
     user = db.query(User).filter(User.id == int(user_id)).first()
     if not user:
         raise HTTPException(status_code=401, detail={"code": "UNAUTHORIZED", "message": "User not found"})
-    profile = _ensure_profile(db, user)
+    profile = user.profile
     latest = _latest_submission(db, int(user.id))
     return _ok(
         {
-            "kyc_status": getattr(user, "kyc_status", None) or profile.kyc_status or "NONE",
-            "kyc_level": int(getattr(user, "kyc_level", None) or profile.kyc_level or 0),
+            "kyc_status": getattr(user, "kyc_status", None) or getattr(profile, "kyc_status", None) or "NONE",
+            "kyc_level": int(getattr(user, "kyc_level", None) or getattr(profile, "kyc_level", None) or 0),
             "latest_submission": _serialize_submission(latest),
         },
         trace_id,
@@ -255,7 +274,7 @@ async def submit_my_kyc(
     db: Session = Depends(get_db),
 ):
     trace_id = getattr(request.state, "trace_id", None)
-    user = db.query(User).filter(User.id == int(user_id)).first()
+    user = db.query(User).filter(User.id == int(user_id)).with_for_update().first()
     if not user:
         raise HTTPException(status_code=401, detail={"code": "UNAUTHORIZED", "message": "User not found"})
 
@@ -265,7 +284,18 @@ async def submit_my_kyc(
         raise HTTPException(status_code=400, detail={"code": "INVALID_KYC_LEVEL", "message": "Invalid KYC level"})
     if doc_type not in VALID_ID_TYPES:
         raise HTTPException(status_code=400, detail={"code": "INVALID_ID_TYPE", "message": "Invalid ID type"})
-    if not full_name.strip() or not country_code.strip() or not id_number.strip():
+    normalized_full_name = full_name.strip()
+    normalized_country_code = country_code.strip().upper()
+    normalized_id_number = id_number.strip()
+    if (
+        not normalized_full_name
+        or len(normalized_full_name) > KYC_FULL_NAME_MAX_LENGTH
+        or len(normalized_country_code) != KYC_COUNTRY_CODE_LENGTH
+        or not normalized_country_code.isalpha()
+        or not normalized_country_code.isascii()
+        or not normalized_id_number
+        or len(normalized_id_number) > KYC_ID_NUMBER_MAX_LENGTH
+    ):
         raise HTTPException(status_code=400, detail={"code": "VALIDATION_ERROR", "message": "Required fields are missing"})
     if not _has_upload_file(front_image):
         raise HTTPException(status_code=400, detail={"code": "IMAGE_REQUIRED", "message": "Front image is required"})
@@ -294,31 +324,42 @@ async def submit_my_kyc(
     if approved_same_level:
         raise HTTPException(status_code=400, detail={"code": "KYC_LEVEL_APPROVED", "message": "KYC level is already approved"})
 
-    front_url = await save_kyc_upload(front_image, "front")
-    back_url = await save_kyc_upload(back_image, "back") if _has_upload_file(back_image) else None
-    selfie_url = await save_kyc_upload(selfie_image, "selfie")
+    saved_references: list[str] = []
+    try:
+        front_url = await save_kyc_upload(front_image, "front")
+        saved_references.append(front_url)
+        back_url = await save_kyc_upload(back_image, "back") if _has_upload_file(back_image) else None
+        if back_url:
+            saved_references.append(back_url)
+        selfie_url = await save_kyc_upload(selfie_image, "selfie")
+        saved_references.append(selfie_url)
 
-    now = datetime.utcnow()
-    item = KycSubmission(
-        user_id=int(user.id),
-        kyc_level=level,
-        full_name=full_name.strip(),
-        country_code=country_code.strip().upper(),
-        id_type=doc_type,
-        id_number=id_number.strip(),
-        front_image_url=front_url,
-        back_image_url=back_url,
-        selfie_image_url=selfie_url,
-        review_status="PENDING",
-        created_at=now,
-        updated_at=now,
-    )
-    db.add(item)
-    profile = _ensure_profile(db, user)
-    user.kyc_status = "PENDING"
-    profile.kyc_status = "PENDING"
-    profile.updated_at = now
-    db.commit()
+        now = datetime.utcnow()
+        item = KycSubmission(
+            user_id=int(user.id),
+            kyc_level=level,
+            full_name=normalized_full_name,
+            country_code=normalized_country_code,
+            id_type=doc_type,
+            id_number=normalized_id_number,
+            front_image_url=front_url,
+            back_image_url=back_url,
+            selfie_image_url=selfie_url,
+            review_status="PENDING",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(item)
+        profile = _ensure_profile(db, user)
+        user.kyc_status = "PENDING"
+        profile.kyc_status = "PENDING"
+        profile.updated_at = now
+        db.commit()
+    except BaseException:
+        db.rollback()
+        for reference in saved_references:
+            remove_kyc_upload(reference)
+        raise
     db.refresh(item)
     return _ok({"submission": _serialize_submission(item)}, trace_id)
 
@@ -339,7 +380,7 @@ def admin_kyc_submissions(
     error: str = Query(""),
     db: Session = Depends(get_db),
 ):
-    redirect = _admin_required(request, db)
+    redirect = _admin_read_required(request, db)
     if redirect:
         return redirect
 
@@ -435,7 +476,7 @@ def read_admin_kyc_material(
     material_kind: str,
     db: Session = Depends(get_db),
 ):
-    blocked = _admin_required(request, db)
+    blocked = _admin_read_required(request, db)
     if blocked:
         return blocked
     item = db.query(KycSubmission).filter(KycSubmission.id == int(submission_id)).first()
@@ -466,10 +507,10 @@ def approve_kyc_submission(
     next_path: str = Form("/admin/kyc/submissions"),
     db: Session = Depends(get_db),
 ):
-    redirect = _admin_required(request, db)
+    redirect = _admin_review_required(request, db)
     if redirect:
         return redirect
-    item = db.query(KycSubmission).filter(KycSubmission.id == submission_id).first()
+    item = db.query(KycSubmission).filter(KycSubmission.id == submission_id).with_for_update().first()
     if not item:
         raise HTTPException(status_code=404, detail="KYC submission not found")
     if str(item.review_status or "").upper() != "PENDING":
@@ -478,11 +519,14 @@ def approve_kyc_submission(
     user = db.query(User).filter(User.id == int(item.user_id)).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    normalized_review_note = review_note.strip()
+    if len(normalized_review_note) > KYC_REVIEW_NOTE_MAX_LENGTH:
+        return _admin_review_redirect(next_path, error="审核说明不能超过 500 个字符")
     profile = _ensure_profile(db, user)
     level_value = KYC_LEVEL_VALUE.get(item.kyc_level, 1)
     now = datetime.utcnow()
     item.review_status = "APPROVED"
-    item.review_note = review_note.strip() or None
+    item.review_note = normalized_review_note or None
     item.reviewed_by = _admin_reviewer_id(request)
     item.reviewed_at = now
     item.updated_at = now
@@ -503,19 +547,24 @@ def reject_kyc_submission(
     next_path: str = Form("/admin/kyc/submissions"),
     db: Session = Depends(get_db),
 ):
-    redirect = _admin_required(request, db)
+    redirect = _admin_review_required(request, db)
     if redirect:
         return redirect
-    item = db.query(KycSubmission).filter(KycSubmission.id == submission_id).first()
+    item = db.query(KycSubmission).filter(KycSubmission.id == submission_id).with_for_update().first()
     if not item:
         raise HTTPException(status_code=404, detail="KYC submission not found")
     if str(item.review_status or "").upper() != "PENDING":
         return _admin_review_redirect(next_path, error="该 KYC 记录已审核，不能重复操作")
+    normalized_review_note = review_note.strip()
+    if not normalized_review_note:
+        return _admin_review_redirect(next_path, error="请填写拒绝原因")
+    if len(normalized_review_note) > KYC_REVIEW_NOTE_MAX_LENGTH:
+        return _admin_review_redirect(next_path, error="拒绝原因不能超过 500 个字符")
     user = db.query(User).filter(User.id == int(item.user_id)).first()
     profile = _ensure_profile(db, user) if user else None
     now = datetime.utcnow()
     item.review_status = "REJECTED"
-    item.review_note = review_note.strip() or "资料未通过审核"
+    item.review_note = normalized_review_note
     item.reviewed_by = _admin_reviewer_id(request)
     item.reviewed_at = now
     item.updated_at = now

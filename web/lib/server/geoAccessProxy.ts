@@ -41,6 +41,8 @@ function isStaticOrSystemPath(pathname: string) {
     pathname.startsWith('/assets/') ||
     pathname.startsWith('/icons/') ||
     pathname.startsWith('/images/') ||
+    pathname === '/downloads' ||
+    pathname.startsWith('/downloads/') ||
     pathname.startsWith('/static/') ||
     pathname.startsWith('/health') ||
     pathname === '/favicon.ico' ||

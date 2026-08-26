@@ -282,8 +282,8 @@
             </div>
             <div class="field">
               <label for="liquidation_threshold">强平阈值</label>
-              <div class="field-help">预留参数，当前仅用于后台配置展示。</div>
-              <input id="liquidation_threshold" type="text" name="liquidation_threshold" value="{{ form.liquidation_threshold or '' }}" placeholder="例如 0.8" />
+              <div class="field-help">实际风控参数：仓位权益（保证金 + 未实现盈亏）小于等于“初始保证金 × 阈值”时触发强平。0 表示权益归零时强平；0.1 表示剩余 10% 保证金时强平。请勿填写负数。</div>
+              <input id="liquidation_threshold" type="text" name="liquidation_threshold" value="{{ form.liquidation_threshold or '' }}" placeholder="例如 0 或 0.1" />
             </div>
             <div class="field">
               <label for="warning_threshold">预警阈值</label>

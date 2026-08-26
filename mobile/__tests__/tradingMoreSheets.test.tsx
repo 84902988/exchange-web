@@ -49,6 +49,9 @@ describe('trading More sheets', () => {
 
     const labels = getTextLabels(renderer);
     expect(labels).toEqual(expect.arrayContaining(expectedLabels));
+    if (_name === 'Trade') {
+      expect(labels).toContain('RCB手续费抵扣');
+    }
     for (const placeholder of placeholderLabels) {
       expect(labels).not.toContain(placeholder);
     }

@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from app.routers import contract_market
+from app.schemas.contract_market import ContractSymbolItem
 
 
 class _AssetLogoQuery:
@@ -44,6 +45,8 @@ def _contract_symbol(symbol: str, quote_asset: str = "USDT"):
         extended_hours_execution_mode="DISPLAY_ONLY",
         price_precision=2,
         quantity_precision=3,
+        min_quantity="0.001",
+        max_quantity="250",
         max_leverage=100,
         status=1,
     )
@@ -83,3 +86,8 @@ def test_contract_symbol_payload_exposes_base_asset_logo(monkeypatch) -> None:
 
     assert payload["base_asset"] == "BTC"
     assert payload["base_asset_logo_url"] == "/static/uploads/assets/btc.svg"
+    assert payload["min_quantity"] == "0.001"
+    assert payload["max_quantity"] == "250"
+    serialized = ContractSymbolItem.model_validate(payload).model_dump()
+    assert serialized["min_quantity"] == "0.001"
+    assert serialized["max_quantity"] == "250"

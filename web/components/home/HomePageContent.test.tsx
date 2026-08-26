@@ -32,7 +32,9 @@ jest.mock('@/components/home/PromoCards', () => ({
 
 jest.mock('@/components/home/HomeNotice', () => ({
   __esModule: true,
-  default: () => <div data-testid="home-notice" />,
+  default: ({ items }: { items?: Array<{ publishedAt?: string | null }> }) => (
+    <div data-testid="home-notice" data-published-at={items?.[0]?.publishedAt || ''} />
+  ),
 }));
 
 jest.mock('@/lib/api/modules/site', () => {
@@ -97,5 +99,31 @@ describe('HomePageContent loading order', () => {
       announcementResult.resolve({ items: [] });
       await Promise.all([bannerResult.promise, announcementResult.promise]);
     });
+  });
+
+  test('uses the persisted creation time when a legacy announcement has no publish time', async () => {
+    mockLocaleInitialized = true;
+    jest.mocked(getSiteConfig).mockResolvedValue(fallbackSiteConfig);
+    jest.mocked(getHomeBanners).mockResolvedValue({ items: [] });
+    jest.mocked(getLatestAnnouncements).mockResolvedValue({
+      items: [
+        {
+          id: 2,
+          title: 'Exchange 将于 8月3日 正式上线',
+          slug: 'launch',
+          publish_at: null,
+          created_at: '2026-07-30 11:26:49',
+        },
+      ],
+    });
+
+    render(<HomePageContent />);
+
+    await waitFor(() =>
+      expect(screen.getByTestId('home-notice')).toHaveAttribute(
+        'data-published-at',
+        '2026-07-30 11:26:49',
+      ),
+    );
   });
 });

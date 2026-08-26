@@ -49,7 +49,7 @@ function mapAnnouncement(item: LatestAnnouncement): NoticeItem {
     id: item.slug || String(item.id),
     title: item.title,
     url: item.slug ? `/notice/${item.slug}` : `/notice/${item.id}`,
-    publishedAt: item.publish_at || new Date().toISOString(),
+    publishedAt: item.publish_at || item.created_at || null,
     type: item.is_pinned ? "pinned" : "platform",
   };
 }

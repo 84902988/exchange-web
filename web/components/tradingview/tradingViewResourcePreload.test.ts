@@ -7,7 +7,11 @@ function readSource(path: string) {
 }
 
 describe('TradingView route resource preload', () => {
-  test.each(['app/trade/layout.tsx', 'app/contract/layout.tsx'])(
+  test.each([
+    'app/trade/layout.tsx',
+    'app/contract/layout.tsx',
+    'app/mobile/advanced-chart/layout.tsx',
+  ])(
     '%s starts the chart library request during route render',
     (path) => {
       const source = readSource(path);
@@ -17,9 +21,14 @@ describe('TradingView route resource preload', () => {
     },
   );
 
-  test('TradingView static resources receive a reusable browser cache window', () => {
+  test('TradingView hashed bundles are immutable while the unhashed entry revalidates', () => {
     const source = readSource('next.config.ts');
     expect(source).toContain('/tradingview/charting_library/:path*');
-    expect(source).toContain('max-age=3600, stale-while-revalidate=86400');
+    expect(source).toContain('max-age=31536000, immutable');
+    expect(source).toContain('/tradingview/charting_library/charting_library.js');
+    expect(source).toContain('max-age=0, must-revalidate');
+    expect(source.indexOf('max-age=31536000, immutable')).toBeLessThan(
+      source.indexOf('max-age=0, must-revalidate'),
+    );
   });
 });

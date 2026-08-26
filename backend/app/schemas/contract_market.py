@@ -127,6 +127,8 @@ class ContractSymbolItem(BaseModel):
     extended_hours_execution_mode: str = "DISPLAY_ONLY"
     price_precision: int = 8
     quantity_precision: int = 8
+    min_quantity: str = "0"
+    max_quantity: str = "0"
     max_leverage: int = 1
     status: int = 1
     market_status: str = "UNKNOWN"

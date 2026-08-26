@@ -87,9 +87,9 @@ def _quote_time(payload: Any, fallback: datetime) -> datetime:
     data = _quote_data(payload)
     candidates: list[Any] = []
     if data:
-        candidates.extend(data.get(key) for key in ("price_time", "time", "datetime", "ts", "t", "tu"))
+        candidates.extend(data.get(key) for key in ("price_time", "updated_at", "time", "datetime", "ts", "t", "tu"))
     if isinstance(payload, dict):
-        candidates.extend(payload.get(key) for key in ("price_time", "time", "datetime", "ts", "t", "tu"))
+        candidates.extend(payload.get(key) for key in ("price_time", "updated_at", "time", "datetime", "ts", "t", "tu"))
 
     for raw_value in candidates:
         if raw_value in (None, ""):
@@ -131,16 +131,26 @@ def _quote_time(payload: Any, fallback: datetime) -> datetime:
     return fallback
 
 
-def _mark_failed(db: Session, overlay_id: int, error_message: str) -> dict[str, Any]:
+def _mark_failed(
+    db: Session,
+    overlay_id: int,
+    error_message: str,
+    *,
+    rollback_first: bool = True,
+) -> dict[str, Any]:
+    if rollback_first:
+        db.rollback()
     overlay = db.query(ReferenceOverlay).filter(ReferenceOverlay.id == overlay_id).first()
     if overlay is None:
-        db.rollback()
         return {"status": "skipped", "reason": "not_found"}
 
     now = datetime.utcnow()
     overlay.sync_status = "FAILED"
     overlay.sync_error = error_message[:500]
     overlay.last_sync_at = now
+    overlay.market_status = "UNKNOWN"
+    overlay.market_status_text = "数据延迟"
+    overlay.is_realtime = False
     overlay.updated_at = now
     db.commit()
     return {
@@ -151,6 +161,23 @@ def _mark_failed(db: Session, overlay_id: int, error_message: str) -> dict[str, 
     }
 
 
+def mark_reference_overlay_sync_failed(db: Session, symbol: str, error_message: str) -> dict[str, Any]:
+    normalized_symbol = _normalize_symbol(symbol)
+    if not normalized_symbol:
+        return {"status": "skipped", "reason": "empty_symbol"}
+
+    overlay = (
+        db.query(ReferenceOverlay)
+        .filter(ReferenceOverlay.symbol == normalized_symbol)
+        .first()
+    )
+    if overlay is None:
+        return {"status": "skipped", "reason": "not_found", "symbol": normalized_symbol}
+    if int(overlay.enabled or 0) != 1 or _normalize_text(overlay.price_source) != "AUTO":
+        return {"status": "skipped", "reason": "not_auto", "symbol": normalized_symbol}
+    return _mark_failed(db, int(overlay.id), error_message, rollback_first=False)
+
+
 def _sync_iron_overlay(db: Session, overlay: ReferenceOverlay, normalized_symbol: str) -> dict[str, Any]:
     if normalized_symbol != "MFCUSDT":
         return {"status": "skipped", "reason": "unsupported_symbol", "symbol": normalized_symbol}
@@ -158,6 +185,9 @@ def _sync_iron_overlay(db: Session, overlay: ReferenceOverlay, normalized_symbol
     overlay_id = int(overlay.id)
     try:
         reference = get_iron62_reference_price(db)
+        source_status = _normalize_text(reference.get("source_status"))
+        if source_status in {"LAST_GOOD", "MANUAL_FALLBACK"}:
+            raise ValueError(f"IRON62 live refresh unavailable: {source_status.lower()}")
         usd_per_ton = _decimal_from_payload(
             reference.get("iron62_usd_per_ton") or reference.get("usd_per_ton")
         )
@@ -166,7 +196,7 @@ def _sync_iron_overlay(db: Session, overlay: ReferenceOverlay, normalized_symbol
         )
         display_label = f"{_decimal_text(display_price)} USD/公斤"
         source_label = f"{_decimal_text(usd_per_ton)} USD/吨"
-        price_time = datetime.utcnow()
+        price_time = _quote_time(reference, datetime.utcnow())
     except Exception as exc:
         db.rollback()
         return _mark_failed(db, overlay_id, _error_text(exc))
@@ -179,6 +209,9 @@ def _sync_iron_overlay(db: Session, overlay: ReferenceOverlay, normalized_symbol
         display_label=display_label,
         source_label=source_label,
         price_time=price_time,
+        market_status_text="每日更新",
+        is_realtime=False,
+        data_source="COMMODITIES_API",
     )
 
 
@@ -209,6 +242,7 @@ def _sync_gold_overlay(db: Session, overlay: ReferenceOverlay, normalized_symbol
         source_label=source_label,
         price_time=price_time,
         display_unit="USD/g",
+        data_source="ITICK",
     )
 
 
@@ -239,6 +273,7 @@ def _sync_stock_overlay(db: Session, overlay: ReferenceOverlay, normalized_symbo
         market_status="OPEN",
         market_status_text="实时",
         is_realtime=True,
+        data_source="ITICK",
     )
 
 
@@ -255,6 +290,7 @@ def _mark_success(
     market_status: str = "OPEN",
     market_status_text: str = "实时",
     is_realtime: bool = True,
+    data_source: str | None = None,
 ) -> dict[str, Any]:
     overlay = db.query(ReferenceOverlay).filter(ReferenceOverlay.id == overlay_id).first()
     if overlay is None:
@@ -272,6 +308,8 @@ def _mark_success(
     overlay.price_time = price_time
     overlay.display_price = display_price
     overlay.display_value_label = display_label
+    if data_source:
+        overlay.data_source = data_source
     if display_unit:
         overlay.display_unit = display_unit
     overlay.updated_at = now

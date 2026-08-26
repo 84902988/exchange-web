@@ -371,6 +371,7 @@ Set-Location -LiteralPath $safeWorkingDirectory
 `$env:EMBED_BACKGROUND_LOOPS_IN_API = '0'
 `$env:ENABLE_SPOT_AUTO_MATCH_IN_API = '0'
 `$env:ENABLE_CONTRACT_LIMIT_ORDER_JOB = '0'
+`$env:ENABLE_RWA_REFERENCE_JOB = '1'
 Write-Host "[api] starting on $ApiHost`:$ApiPort..." -ForegroundColor Cyan
 try {
     & $quotedPython -m uvicorn app.main:app --host $ApiHost --port $ApiPort --access-log$reloadArgs

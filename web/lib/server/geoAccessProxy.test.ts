@@ -18,3 +18,11 @@ test('public user navigation is owned by the client auth guard instead of cross-
   expect(loginFormSource).toContain('router.replace(getRedirectTarget())');
   expect(loginClientSource).toContain('if (isLoggedIn) router.replace(redirectTarget)');
 });
+
+test('download artifacts bypass geo access checks without opening user or api routes', () => {
+  const proxySource = readSource('lib/server/geoAccessProxy.ts');
+
+  expect(proxySource).toContain("pathname.startsWith('/downloads/')");
+  expect(proxySource).not.toContain("pathname.startsWith('/user')");
+  expect(proxySource).toContain("pathname === '/api' || pathname.startsWith('/api/')");
+});

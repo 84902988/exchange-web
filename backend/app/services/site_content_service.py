@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, load_only
 
 from app.core.content_locale import DEFAULT_CONTENT_LOCALE, localize_i18n_value
+from app.core.datetime_utils import utc_isoformat
 from app.db.models.announcement_read import AnnouncementRead
 from app.db.models.site_content import Announcement, HomeBanner, SiteSettings
 
@@ -428,6 +429,11 @@ def _sanitize_announcement_content(value: Any) -> Optional[str]:
     parser.close()
     cleaned = parser.get_html().strip()
     return cleaned or None
+
+
+def sanitize_announcement_html(value: Any) -> Optional[str]:
+    """Return the same allowlisted HTML used by the PC announcement editor."""
+    return _sanitize_announcement_content(value)
 
 
 def _parse_int(value: Any, default: int = 0) -> int:
@@ -1430,6 +1436,7 @@ def serialize_announcement(
     summary = _localize_row_field(row, "summary", "summary_i18n", locale, row.summary or "") if include_i18n else row.summary or ""
     raw_content = _localize_row_field(row, "content", "content_i18n", locale, row.content or "") if include_i18n else row.content or ""
     content = _sanitize_announcement_content(raw_content) or ""
+    effective_publish_at = row.publish_at or row.created_at
     data = {
         "id": int(row.id),
         "title": title,
@@ -1443,7 +1450,7 @@ def serialize_announcement(
         "status": row.status or DISABLED_STATUS,
         "status_label": _status_label(row.status or DISABLED_STATUS, active_value=PUBLISHED_ANNOUNCEMENT_STATUS),
         "status_badge": _status_badge(row.status or DISABLED_STATUS, active_value=PUBLISHED_ANNOUNCEMENT_STATUS),
-        "publish_at": _format_datetime(row.publish_at),
+        "publish_at": utc_isoformat(effective_publish_at),
         "publish_at_admin": _format_admin_datetime(row.publish_at),
         "publish_at_input": _format_datetime_local(row.publish_at),
         "created_at": _format_admin_datetime(row.created_at),
@@ -1675,6 +1682,8 @@ def admin_create_announcement(db: Session, payload: dict[str, Any]) -> dict[str,
     include_category = _announcement_category_available(db)
     include_i18n = _announcement_i18n_available(db)
     write_form = dict(form)
+    if write_form["status"] == PUBLISHED_ANNOUNCEMENT_STATUS and write_form["publish_at"] is None:
+        write_form["publish_at"] = _now()
     if not include_category:
         write_form.pop("category", None)
     if include_i18n:
@@ -1717,10 +1726,17 @@ def admin_update_announcement(db: Session, announcement_id: int, payload: dict[s
             "not_found": False,
         }
 
+    previous_status = row.status
     for key, value in form.items():
         if key == "category" and not include_category:
             continue
         setattr(row, key, value)
+    if (
+        row.status == PUBLISHED_ANNOUNCEMENT_STATUS
+        and previous_status != PUBLISHED_ANNOUNCEMENT_STATUS
+        and row.publish_at is None
+    ):
+        row.publish_at = _now()
     if include_i18n:
         for key, value in _normalize_i18n_payload(
             payload,
@@ -1747,6 +1763,8 @@ def admin_toggle_announcement_status(db: Session, announcement_id: int) -> dict[
         return {"ok": False, "message": "公告不存在"}
     new_status = DISABLED_STATUS if row.status == PUBLISHED_ANNOUNCEMENT_STATUS else PUBLISHED_ANNOUNCEMENT_STATUS
     row.status = new_status
+    if new_status == PUBLISHED_ANNOUNCEMENT_STATUS and row.publish_at is None:
+        row.publish_at = _now()
     row.updated_at = _now()
     db.commit()
     return {

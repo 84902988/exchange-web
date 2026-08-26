@@ -17,6 +17,9 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $MobileRoot = Join-Path $RepoRoot "mobile"
+$AndroidRoot = Join-Path $MobileRoot "android"
+$GradleWrapperPath = Join-Path $AndroidRoot "gradlew.bat"
+$DebugApkPath = Join-Path $AndroidRoot "app\build\outputs\apk\debug\app-debug.apk"
 $WebRoot = Join-Path $RepoRoot "web"
 $AndroidSdkRoot = Join-Path $env:LOCALAPPDATA "Android\Sdk"
 $AdbPath = Join-Path $AndroidSdkRoot "platform-tools\adb.exe"
@@ -235,7 +238,9 @@ function Ensure-ChartWeb {
 }
 
 Require-Directory -Path $MobileRoot -Name "Mobile project"
+Require-Directory -Path $AndroidRoot -Name "Android project"
 Require-Directory -Path $WebRoot -Name "Web project"
+Require-File -Path $GradleWrapperPath -Name "Gradle wrapper"
 Require-File -Path $AdbPath -Name "adb.exe"
 Require-File -Path $EmulatorPath -Name "emulator.exe"
 
@@ -278,15 +283,57 @@ if (Test-MetroRunning -Port $MetroPort) {
 }
 
 Write-Host "Starting Android app without starting another packager..."
-Push-Location -LiteralPath $MobileRoot
+Push-Location -LiteralPath $AndroidRoot
+$OriginalJavaToolOptions = [Environment]::GetEnvironmentVariable("JAVA_TOOL_OPTIONS", "Process")
+$JavaChildTemp = Join-Path $env:SystemRoot "Temp"
 try {
-    # ANDROID_SERIAL alone is not honored consistently by the React Native CLI
-    # when another emulator (for example MuMu) is attached. Pass the serial
-    # explicitly so install/launch never spills into a non-development device.
-    npm.cmd run android -- `
-        --no-packager `
-        --appId $DebugApplicationId `
-        --device $Device
+    # On affected Windows 11 builds, Java NIO's AF_UNIX selector wakeup pipe
+    # can fail with EINVAL when it inherits the user's virtualized temp path.
+    # OpenJDK exposes jdk.net.unixdomain.tmpdir specifically for this socket.
+    # Scope the override to the Android build and restore the caller below.
+    Require-Directory -Path $JavaChildTemp -Name "Java child temp directory"
+    $UnixDomainTempOption = "-Djdk.net.unixdomain.tmpdir=$JavaChildTemp"
+    if ([string]::IsNullOrWhiteSpace($OriginalJavaToolOptions)) {
+        $ScopedJavaToolOptions = $UnixDomainTempOption
+    } else {
+        $ScopedJavaToolOptions = "$OriginalJavaToolOptions $UnixDomainTempOption"
+    }
+    [Environment]::SetEnvironmentVariable("JAVA_TOOL_OPTIONS", $ScopedJavaToolOptions, "Process")
+
+    # Invoke Gradle directly. The React Native CLI's Node -> Gradle environment
+    # forwarding can corrupt java.io.tmpdir on the affected Windows host.
+    Write-Host "Building the Android debug APK..."
+    & $GradleWrapperPath `
+        app:assembleDebug `
+        -x lint `
+        "-PreactNativeDevServerPort=$MetroPort" `
+        --no-daemon
+    if ($LASTEXITCODE -ne 0) {
+        throw "Android debug build failed with exit code $LASTEXITCODE."
+    }
+
+    Require-File -Path $DebugApkPath -Name "Android debug APK"
+
+    Write-Host "Installing the Android debug APK on $Device..."
+    & $AdbPath -s $Device install -r $DebugApkPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Android debug APK installation failed on $Device with exit code $LASTEXITCODE."
+    }
+
+    Write-Host "Launching $DebugApplicationId on $Device..."
+    & $AdbPath -s $Device shell am force-stop $DebugApplicationId
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to stop the previous Android debug app process on $Device."
+    }
+
+    & $AdbPath -s $Device shell monkey `
+        -p $DebugApplicationId `
+        -c android.intent.category.LAUNCHER `
+        1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Android debug app launch failed on $Device with exit code $LASTEXITCODE."
+    }
 } finally {
+    [Environment]::SetEnvironmentVariable("JAVA_TOOL_OPTIONS", $OriginalJavaToolOptions, "Process")
     Pop-Location
 }

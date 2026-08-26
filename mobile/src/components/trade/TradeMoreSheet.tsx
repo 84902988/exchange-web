@@ -4,6 +4,7 @@ import {
   ArrowDownToLine,
   ArrowRightLeft,
   ArrowUpFromLine,
+  Crown,
   FileText,
   ReceiptText,
   Wallet,
@@ -24,7 +25,8 @@ export type TradeMoreAction =
   | 'transfer'
   | 'fundHistory'
   | 'assets'
-  | 'orders';
+  | 'orders'
+  | 'rcbFee';
 
 type Props = {
   visible: boolean;
@@ -39,6 +41,7 @@ const actions: Action[] = [
   { key: 'fundHistory', labelKey: 'assets.quick.history', Icon: ReceiptText },
   { key: 'assets', labelKey: 'nav.assets', Icon: Wallet },
   { key: 'orders', labelKey: 'trading.orders', Icon: FileText },
+  { key: 'rcbFee', labelKey: 'trading.rcbFeeSettings', Icon: Crown },
 ];
 
 function TradeMoreSheet({ visible, onClose, onActionPress }: Props) {

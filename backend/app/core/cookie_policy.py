@@ -113,6 +113,11 @@ def _cookie_options(request: Request) -> dict[str, Any]:
     }
 
 
+def get_cookie_options(request: Request) -> dict[str, Any]:
+    """Return a copy of the shared, proxy-aware cookie policy."""
+    return dict(_cookie_options(request))
+
+
 def set_refresh_cookie(response: Response, request: Request, token: str, *, remember_me: bool = False) -> None:
     options = _cookie_options(request)
     cookie_args: dict[str, Any] = {}

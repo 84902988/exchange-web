@@ -10,6 +10,10 @@ import {
   useState,
 } from 'react';
 import Script from 'next/script';
+import {
+  MOBILE_TRADINGVIEW_DISABLED_FEATURES,
+  MOBILE_TRADINGVIEW_ENABLED_FEATURES,
+} from '@/components/tradingview/mobileEmbedFeatures';
 import { useLocaleContext } from '@/contexts/LocaleContext';
 import type { ContractPositionItem } from '@/lib/api/modules/contract';
 import {
@@ -17,6 +21,7 @@ import {
   createContractTradingViewDatafeed,
   type ContractHistoryBarsEvent,
   type ContractHistoryErrorEvent,
+  type ContractHistoryTimingEvent,
   type ContractRealtimeResetRequirement,
   type ContractRealtimeSubscriptionReadiness,
 } from './tradingview/contractTradingViewDatafeed';
@@ -55,8 +60,16 @@ import {
   bindTradingViewDisplayTimeZone,
   type TradingViewTimezoneChart,
 } from '@/lib/tradingview/displayTimeZoneSync';
+import type { TradingViewCustomIndicatorsGetter } from '@/components/tradingview/customIndicators';
 
 export type ContractChartMode = 'time' | 'candle';
+
+type MobileTradingViewStudyInstanceApi = {
+  getInputValues: () => readonly {
+    id: string;
+    value: string | number | boolean;
+  }[];
+};
 
 export type TradingViewChartApi = {
   dataReady?: () => Promise<boolean> | boolean;
@@ -85,8 +98,23 @@ export type TradingViewChartApi = {
   createShape?: ContractTradingViewOverlayChart['createShape'];
   getShapeById?: ContractTradingViewOverlayChart['getShapeById'];
   removeEntity?: ContractTradingViewOverlayChart['removeEntity'];
+  createStudy?: (
+    name: string,
+    forceOverlay?: boolean,
+    lock?: boolean,
+    inputs?: Readonly<Record<string, string | number | boolean>>,
+    overrides?: Readonly<Record<string, string | number | boolean>>,
+    options?: Readonly<{ disableUndo?: boolean }>,
+  ) => Promise<string | number | null>;
+  getAllStudies?: () => readonly { id: string | number; name: string }[];
+  getStudyById?: (entityId: string | number) => MobileTradingViewStudyInstanceApi;
   getTimezoneApi?: TradingViewTimezoneChart['getTimezoneApi'];
 };
+
+type MobileTradingViewStudyChartApi = TradingViewChartApi & Required<Pick<
+  TradingViewChartApi,
+  'createStudy' | 'removeEntity' | 'getAllStudies' | 'getStudyById'
+>>;
 
 type TradingViewVisiblePriceRange = { from: number; to: number };
 
@@ -128,6 +156,7 @@ type TradingViewLoadError = {
 
 type ContractTradingViewChartProps = {
   bootstrapReady?: boolean;
+  mobileEmbed?: boolean;
   symbol: string;
   category?: ContractKlineAssetClass | string | null;
   displaySymbol?: string | null;
@@ -142,7 +171,10 @@ type ContractTradingViewChartProps = {
   priceDirection?: ContractPriceDirection;
   onChartModeChange?: (value: ContractChartMode) => void;
   onIntervalChange?: (value: string) => void;
+  onIntervalResolutionCommit?: (value: string) => void;
   onLatestKlineCloseChange?: (price: string | null) => void;
+  onMobileChartApiReady?: (chart: MobileTradingViewStudyChartApi | null) => void;
+  customIndicatorsGetter?: TradingViewCustomIndicatorsGetter;
 };
 
 type ContractResolutionRequestParams = {
@@ -387,7 +419,7 @@ export function shouldShowContractChartLoading(reason: string, error: string) {
 }
 
 export function isContractHistoryEventCurrent(
-  event: ContractHistoryBarsEvent | ContractHistoryErrorEvent,
+  event: Pick<ContractHistoryBarsEvent, 'symbol' | 'interval' | 'resolution' | 'requestSeq'>,
   expected: {
     symbol: string;
     interval: string;
@@ -1066,6 +1098,7 @@ function getTradingViewGlobal() {
 
 export default function ContractTradingViewChart({
   bootstrapReady = true,
+  mobileEmbed = false,
   symbol,
   category,
   displaySymbol,
@@ -1080,7 +1113,10 @@ export default function ContractTradingViewChart({
   priceDirection = 'flat',
   onChartModeChange,
   onIntervalChange,
+  onIntervalResolutionCommit,
   onLatestKlineCloseChange,
+  onMobileChartApiReady,
+  customIndicatorsGetter,
 }: ContractTradingViewChartProps) {
   const { locale, t } = useLocaleContext();
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -1196,7 +1232,9 @@ export default function ContractTradingViewChart({
   const widgetKeyRef = useRef(widgetKey);
   const onChartModeChangeRef = useRef(onChartModeChange);
   const onIntervalChangeRef = useRef(onIntervalChange);
+  const onIntervalResolutionCommitRef = useRef(onIntervalResolutionCommit);
   const onLatestKlineCloseChangeRef = useRef(onLatestKlineCloseChange);
+  const onMobileChartApiReadyRef = useRef(onMobileChartApiReady);
   const positionLinesInputRef = useRef<{ symbol: string; lines: ContractTradingViewPositionLine[] }>({
     symbol: normalizedSymbol,
     lines: positionLines,
@@ -1234,7 +1272,9 @@ export default function ContractTradingViewChart({
     widgetKeyRef.current = widgetKey;
     onChartModeChangeRef.current = onChartModeChange;
     onIntervalChangeRef.current = onIntervalChange;
+    onIntervalResolutionCommitRef.current = onIntervalResolutionCommit;
     onLatestKlineCloseChangeRef.current = onLatestKlineCloseChange;
+    onMobileChartApiReadyRef.current = onMobileChartApiReady;
     positionLinesInputRef.current = { symbol: normalizedSymbol, lines: positionLines };
   }, [
     activeInterval,
@@ -1246,7 +1286,9 @@ export default function ContractTradingViewChart({
     normalizedSymbol,
     onChartModeChange,
     onIntervalChange,
+    onIntervalResolutionCommit,
     onLatestKlineCloseChange,
+    onMobileChartApiReady,
     overlayPrice,
     positionLines,
     priceDirection,
@@ -1426,6 +1468,9 @@ export default function ContractTradingViewChart({
     finishChartLoading(resolutionLoadingSeqRef.current);
     flushPendingInitialVisibleRangeRef.current(committed.tradingViewResolution);
     resumePriceOverlay(committedInterval);
+    if (committed.intentId > 1) {
+      onIntervalResolutionCommitRef.current?.(committedInterval);
+    }
     const readinessWait = resolutionReadinessWaitRef.current;
     if (readinessWait?.sessionId === committed.sessionId) {
       readinessWait.cancel();
@@ -1953,6 +1998,7 @@ export default function ContractTradingViewChart({
       releaseDisplayTimeZoneSync = () => undefined;
       activeWidgetGenerationRef.current = 0;
       chartReadyRef.current = false;
+      if (mobileEmbed) onMobileChartApiReadyRef.current?.(null);
       resolutionRequestRef.current?.cancel();
       resolutionRequestRef.current = null;
       resolutionReadinessWaitRef.current?.cancel();
@@ -1993,6 +2039,13 @@ export default function ContractTradingViewChart({
         // TradingView cleanup remains best-effort during allowed rebuilds.
       }
       widgetRef.current = null;
+      containerRef.current?.setAttribute('data-contract-chart-widget', 'pending');
+      containerRef.current?.setAttribute('data-contract-chart-history', 'pending');
+      containerRef.current?.setAttribute('data-contract-chart-study-api', 'pending');
+      containerRef.current?.removeAttribute('data-contract-chart-get-bars-request');
+      containerRef.current?.removeAttribute('data-contract-chart-get-bars-response');
+      containerRef.current?.removeAttribute('data-contract-chart-get-bars-normalized');
+      containerRef.current?.removeAttribute('data-contract-chart-get-bars-delivered');
     };
 
     const disposeEffect = () => {
@@ -2042,7 +2095,9 @@ export default function ContractTradingViewChart({
       }
     }, 0);
 
-    const eventMatchesCurrentChart = (event: ContractHistoryBarsEvent | ContractHistoryErrorEvent) => (
+    const eventMatchesCurrentChart = (
+      event: ContractHistoryBarsEvent | ContractHistoryErrorEvent | ContractHistoryTimingEvent,
+    ) => (
       !cancelled
       && datafeedBuildSeqRef.current === buildSeq
       && isContractHistoryEventCurrent(event, {
@@ -2169,12 +2224,28 @@ export default function ContractTradingViewChart({
           widgetBuildLoadingTimer = null;
         }
         latestHistoryRequestSeqRef.current = event.requestSeq;
+        containerRef.current?.setAttribute('data-contract-chart-history', 'ready');
         resumePriceOverlay(event.interval);
         getPreloadManager().schedule(event);
         applyInitialVisibleRange(event);
         setLoadError(null);
         finishChartLoading(activeChartLoadingSeqRef.current);
       },
+      onHistoryTiming: mobileEmbed
+        ? (event) => {
+          if (!event.firstDataRequest || !eventMatchesCurrentChart(event)) return;
+          const attributeByPhase: Record<ContractHistoryTimingEvent['phase'], string> = {
+            request: 'data-contract-chart-get-bars-request',
+            'http-response': 'data-contract-chart-get-bars-response',
+            normalized: 'data-contract-chart-get-bars-normalized',
+            delivered: 'data-contract-chart-get-bars-delivered',
+          };
+          containerRef.current?.setAttribute(
+            attributeByPhase[event.phase],
+            String(event.elapsedMs),
+          );
+        }
+        : undefined,
       onHistoryError: (event) => {
         if (!event.firstDataRequest || !eventMatchesCurrentChart(event)) return;
         widgetBuildCompleted = true;
@@ -2233,11 +2304,14 @@ export default function ContractTradingViewChart({
       container: containerId,
       datafeed,
       library_path: TRADINGVIEW_LIBRARY_PATH,
+      ...(customIndicatorsGetter
+        ? { custom_indicators_getter: customIndicatorsGetter }
+        : {}),
       locale: resolveTradingViewLocale(locale),
       timezone: getDisplayTimeZone(),
       theme: 'dark',
       style: initialStyle,
-      header_widget_buttons_mode: 'compact',
+      header_widget_buttons_mode: mobileEmbed ? 'adaptive' : 'compact',
       disabled_features: [
         'use_localstorage_for_settings',
         'header_symbol_search',
@@ -2246,8 +2320,13 @@ export default function ContractTradingViewChart({
         'symbol_search_hot_key',
         'display_market_status',
         'volume_force_overlay',
+        ...(mobileEmbed ? MOBILE_TRADINGVIEW_DISABLED_FEATURES : []),
       ],
-      enabled_features: ['iframe_loading_same_origin', 'custom_resolutions'],
+      enabled_features: [
+        'iframe_loading_same_origin',
+        'custom_resolutions',
+        ...(mobileEmbed ? MOBILE_TRADINGVIEW_ENABLED_FEATURES : []),
+      ],
       overrides: {
         'paneProperties.background': '#12161c',
         'paneProperties.backgroundType': 'solid',
@@ -2278,6 +2357,7 @@ export default function ContractTradingViewChart({
       },
     });
     widgetRef.current = widget;
+    containerRef.current?.setAttribute('data-contract-chart-widget', 'ready');
 
     const markChartReady = () => {
       if (
@@ -2299,6 +2379,16 @@ export default function ContractTradingViewChart({
         ),
       });
       if (!chart) return;
+      if (
+        mobileEmbed
+        && chart.createStudy
+        && chart.removeEntity
+        && chart.getAllStudies
+        && chart.getStudyById
+      ) {
+        containerRef.current?.setAttribute('data-contract-chart-study-api', 'ready');
+        onMobileChartApiReadyRef.current?.(chart as MobileTradingViewStudyChartApi);
+      }
       releaseDisplayTimeZoneSync();
       releaseDisplayTimeZoneSync = bindTradingViewDisplayTimeZone(chart);
       if (
@@ -2350,6 +2440,10 @@ export default function ContractTradingViewChart({
         || widgetRef.current !== widget
         || activeWidgetGenerationRef.current !== widgetGeneration
       ) return;
+      if (mobileEmbed) {
+        restoreToolbarInteraction(buildSeq);
+        return;
+      }
       const toolbarSlot = widget.createButton({ align: 'left', useTradingViewStyle: false });
       toolbarSlotRef.current = toolbarSlot;
       toolbarSlot.setAttribute('title', '');
@@ -2438,11 +2532,13 @@ export default function ContractTradingViewChart({
     canonicalCategory,
     chartMode,
     containerId,
+    customIndicatorsGetter,
     finishChartLoading,
     ensureReferencePriceViewport,
     getPreloadManager,
     handleRealtimeResetRequirement,
     locale,
+    mobileEmbed,
     normalizedSymbol,
     pausePreloadForeground,
     pricePrecision,
@@ -2477,10 +2573,14 @@ export default function ContractTradingViewChart({
 
   return (
     <div
-      className="relative flex h-full min-h-[420px] w-full flex-col bg-[#12161c]"
-      style={{ minHeight: height }}
+      className={mobileEmbed
+        ? 'relative flex h-full min-h-0 w-full flex-col bg-[#12161c]'
+        : 'relative flex h-full min-h-[420px] w-full flex-col bg-[#12161c]'}
+      style={mobileEmbed ? undefined : { minHeight: height }}
       data-contract-chart-loading={showChartLoading ? 'pending' : 'ready'}
       data-contract-chart-bootstrap={bootstrapReady ? 'ready' : 'pending'}
+      data-contract-chart-script={scriptReady ? 'ready' : 'pending'}
+      data-contract-chart-error={activeLoadError}
     >
       <Script
         src={TRADINGVIEW_SCRIPT_SRC}
@@ -2494,6 +2594,7 @@ export default function ContractTradingViewChart({
       <div
         id={containerId}
         ref={containerRef}
+        data-contract-chart-perf=""
         className="min-h-0 flex-1"
         aria-label={`${displayName || normalizedSymbol} ${chartMode === 'time' ? 'time' : activeInterval}`}
       />

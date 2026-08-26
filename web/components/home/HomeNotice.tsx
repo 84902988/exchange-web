@@ -3,12 +3,13 @@
 import Link from "next/link";
 
 import { useLocaleContext } from "@/contexts/LocaleContext";
+import { parseApiDateTime } from "@/lib/displayTimeZone";
 
 export type NoticeItem = {
   id: string;
   title: string;
   url?: string;
-  publishedAt: string;
+  publishedAt?: string | null;
   type?: string;
 };
 
@@ -23,6 +24,11 @@ export default function HomeNotice({
   const notices = items ?? [];
 
   const dateLocale = locale === "ja" ? "ja-JP" : locale === "en" ? "en-US" : locale === "zh-TW" ? "zh-TW" : "zh-CN";
+
+  function formatPublishedAt(value: string | null | undefined): string {
+    const date = parseApiDateTime(value);
+    return date ? date.toLocaleString(dateLocale) : "--";
+  }
 
   return (
     <section className="px-4 pb-16 sm:px-6 sm:pb-24">
@@ -54,7 +60,7 @@ export default function HomeNotice({
                     {notice.title}
                   </Link>
                   <span className="w-full shrink-0 text-right text-xs text-gray-500 sm:w-auto">
-                    {new Date(notice.publishedAt).toLocaleString(dateLocale)}
+                    {formatPublishedAt(notice.publishedAt)}
                   </span>
                 </li>
               ))}

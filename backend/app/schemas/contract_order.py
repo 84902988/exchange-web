@@ -1,9 +1,28 @@
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+_CLIENT_ORDER_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,63}$")
+
+
+def _normalize_client_order_id(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("client_order_id must be a string")
+    normalized = value.strip().lower()
+    if not normalized:
+        raise ValueError("client_order_id must not be empty")
+    if len(normalized) > 64:
+        raise ValueError("client_order_id must not exceed 64 characters")
+    if _CLIENT_ORDER_ID_PATTERN.fullmatch(normalized) is None:
+        raise ValueError("client_order_id contains unsupported characters")
+    return normalized
 
 
 class ContractOpenOrderRequest(BaseModel):
@@ -28,6 +47,12 @@ class ContractOpenOrderRequest(BaseModel):
     leverage: int
     take_profit_price: Optional[Decimal] = None
     stop_loss_price: Optional[Decimal] = None
+    client_order_id: Optional[str] = None
+
+    @field_validator("client_order_id", mode="before")
+    @classmethod
+    def normalize_client_order_id(cls, value: object) -> Optional[str]:
+        return _normalize_client_order_id(value)
 
 
 class ContractCloseOrderRequest(BaseModel):
@@ -66,6 +91,12 @@ class ContractCloseSummaryOrderRequest(BaseModel):
     order_type: Literal["MARKET", "LIMIT"]
     price: Optional[Decimal] = None
     quantity: Optional[Decimal] = None
+    client_order_id: Optional[str] = None
+
+    @field_validator("client_order_id", mode="before")
+    @classmethod
+    def normalize_client_order_id(cls, value: object) -> Optional[str]:
+        return _normalize_client_order_id(value)
 
 
 class ContractPositionTpSlUpdateRequest(BaseModel):
@@ -102,12 +133,14 @@ class ContractOrderResponse(BaseModel):
     remaining_position_quantity: Optional[str] = None
     take_profit_price: Optional[str] = None
     stop_loss_price: Optional[str] = None
+    client_order_id: Optional[str] = None
 
 
 class ContractCloseSummaryOrderResponse(BaseModel):
     symbol: str
     side: str
     order_type: str
+    price: Optional[str] = None
     requested_quantity: str
     closed_quantity: str
     submitted_quantity: str
@@ -115,6 +148,7 @@ class ContractCloseSummaryOrderResponse(BaseModel):
     generated_trade_ids: List[int]
     affected_position_ids: List[int]
     status: str
+    client_order_id: Optional[str] = None
 
 
 class ContractOrderListItem(BaseModel):
@@ -164,6 +198,7 @@ class ContractTradeListItem(BaseModel):
     fee_amount: str
     spread_fee: str
     realized_pnl: str
+    close_reason: Optional[str] = None
     created_at: Optional[str] = None
 
 

@@ -6,13 +6,18 @@ from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.deps.auth import get_current_user_id
 from app.schemas.response import ok
-from app.schemas.support_ticket import SupportTicketCreateIn, SupportTicketMessageCreateIn
+from app.schemas.support_ticket import (
+    SupportTicketCreateIn,
+    SupportTicketMessageCreateIn,
+    SupportTicketReadIn,
+)
 from app.services.support_ticket_service import (
     add_user_support_ticket_message,
     close_user_support_ticket,
     create_user_support_ticket,
     get_user_support_ticket,
     list_user_support_tickets,
+    mark_user_support_ticket_read,
     serialize_support_ticket,
 )
 
@@ -126,4 +131,36 @@ def close_my_support_ticket(
         raise HTTPException(
             status_code=500,
             detail={"code": "SUPPORT_TICKET_CLOSE_FAILED", "message": "Support ticket close failed"},
+        )
+
+
+@router.post("/{ticket_id}/read")
+def mark_my_support_ticket_read(
+    ticket_id: int,
+    payload: SupportTicketReadIn,
+    request: Request,
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    trace_id = getattr(request.state, "trace_id", None)
+    try:
+        data = mark_user_support_ticket_read(
+            db=db,
+            user_id=int(user_id),
+            ticket_id=ticket_id,
+            last_seen_message_id=payload.last_seen_message_id,
+        )
+        db.commit()
+        return ok(data=data, trace_id=trace_id)
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "SUPPORT_TICKET_READ_FAILED",
+                "message": "Support ticket read state update failed",
+            },
         )

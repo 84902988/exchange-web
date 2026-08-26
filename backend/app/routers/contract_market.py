@@ -259,6 +259,8 @@ def _contract_symbol_payload(
         ).strip().upper(),
         "price_precision": item.price_precision,
         "quantity_precision": item.quantity_precision,
+        "min_quantity": str(getattr(item, "min_quantity", 0) or 0),
+        "max_quantity": str(getattr(item, "max_quantity", 0) or 0),
         "max_leverage": item.max_leverage,
         "status": item.status,
         **contract_symbol_market_status_payload(item),

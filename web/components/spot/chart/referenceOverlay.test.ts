@@ -1,5 +1,6 @@
 import { describe, expect, it } from '@jest/globals';
 import {
+  getReferenceOverlayConfig,
   normalizeReferenceOverlayConfig,
   normalizeReferenceOverlaySymbol,
 } from './referenceOverlay';
@@ -7,6 +8,10 @@ import {
 const translate = (key: string) => key;
 
 describe('reference overlay symbol identity', () => {
+  it('does not restore a hard-coded MFC quote when the reference API is unavailable', () => {
+    expect(getReferenceOverlayConfig('MFCUSDT', translate)).toBeNull();
+  });
+
   it('treats display separators as aliases instead of distinct RWA symbols', () => {
     expect(normalizeReferenceOverlaySymbol('BON-2/USDT')).toBe('BON2USDT');
     expect(normalizeReferenceOverlaySymbol('bon2usdt')).toBe('BON2USDT');

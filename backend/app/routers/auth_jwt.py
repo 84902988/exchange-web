@@ -24,7 +24,8 @@ from app.core.security import (
     verify_password,
     verify_refresh_token,
 )
-from app.db.models import User, UserLoginLog, UserSession
+from app.deps.auth import get_current_user_id
+from app.db.models import User, UserLoginLog, UserSecurityEvent, UserSession
 from app.db.session import get_db
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -287,7 +288,10 @@ def _verify_captcha_or_raise(body: "LoginIn", email_key: str, ip: str) -> None:
 
 def _device_name(user_agent: str) -> str:
     ua = user_agent or ""
-    if "Edg" in ua:
+    ua_lower = ua.lower()
+    if "exchangemobile" in ua_lower or "okhttp" in ua_lower or "cfnetwork" in ua_lower:
+        browser = "ExchangeMobile"
+    elif "Edg" in ua:
         browser = "Edge"
     elif "Chrome" in ua:
         browser = "Chrome"
@@ -298,7 +302,11 @@ def _device_name(user_agent: str) -> str:
     else:
         browser = "Unknown browser"
 
-    if "Windows" in ua:
+    if "okhttp" in ua_lower:
+        os_name = "Android"
+    elif "cfnetwork" in ua_lower:
+        os_name = "iOS"
+    elif "Windows" in ua:
         os_name = "Windows"
     elif "Mac OS X" in ua or "Macintosh" in ua:
         os_name = "macOS"
@@ -424,6 +432,73 @@ class LogoutIn(BaseModel):
         description="刷新令牌（refresh_token）。Web 优先从 HttpOnly Cookie 读取；APP/Postman 可从 body 传。",
         example="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
     )
+
+
+class SessionProofIn(BaseModel):
+    refresh_token: Optional[str] = Field(
+        default=None,
+        max_length=8192,
+        description="当前刷新令牌。Web 优先读取 HttpOnly Cookie，APP 从请求体传入。",
+    )
+
+
+def _require_current_user_session(
+    request: Request,
+    body_token: Optional[str],
+    user_id: int,
+    db: Session,
+) -> tuple[UserSession, str]:
+    refresh_token = _get_refresh_token(request, body_token)
+    if not refresh_token:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "CURRENT_SESSION_REQUIRED",
+                "message": "Current refresh session is required",
+            },
+        )
+
+    try:
+        payload = verify_refresh_token(refresh_token)
+    except JWTError:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "CURRENT_SESSION_INVALID",
+                "message": "Current refresh session is invalid or expired",
+            },
+        )
+
+    if str(payload.get("sub") or "") != str(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "CURRENT_SESSION_MISMATCH",
+                "message": "Current refresh session does not belong to this user",
+            },
+        )
+
+    now = _utcnow()
+    refresh_token_hash = hash_refresh_token(refresh_token)
+    current_session = (
+        db.query(UserSession)
+        .filter(
+            UserSession.user_id == int(user_id),
+            UserSession.refresh_token_hash == refresh_token_hash,
+            UserSession.revoked_at.is_(None),
+            UserSession.expires_at > now,
+        )
+        .first()
+    )
+    if current_session is None:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "CURRENT_SESSION_REVOKED",
+                "message": "Current refresh session is no longer active",
+            },
+        )
+    return current_session, refresh_token
 
 
 # =========================
@@ -655,12 +730,23 @@ def refresh(request: Request, body: Optional[RefreshIn] = None, response: Respon
             UserSession.user_id == int(user.id),
             UserSession.refresh_token_hash == old_rt_hash,
             UserSession.revoked_at.is_(None),
+            UserSession.expires_at > now,
         )
+        .with_for_update()
         .first()
     )
-    if old_sess:
-        old_sess.revoked_at = now
-        old_sess.last_used_at = now
+    if old_sess is None:
+        # Redis is a fast whitelist, but the durable DB session is the final
+        # authority. This also makes password-change session revocation
+        # effective even if an old Redis JTI has not expired yet.
+        revoke_refresh_jti(jti)
+        raise HTTPException(
+            status_code=401,
+            detail={"code": "UNAUTHORIZED", "message": "Refresh session revoked"},
+        )
+
+    old_sess.revoked_at = now
+    old_sess.last_used_at = now
 
     # ✅ 4) 旋转 refresh：撤销旧 jti
     revoke_refresh_jti(jti)
@@ -764,4 +850,179 @@ def logout(request: Request, body: Optional[LogoutIn] = None, response: Response
         "data": {"message": "logged out"},
         "error": None,
         "trace_id": trace_id,
+    }
+
+
+@router.post(
+    "/sessions/list",
+    summary="列出当前用户的活跃刷新会话",
+    response_model=ApiResponse,
+)
+def list_active_sessions(
+    request: Request,
+    body: Optional[SessionProofIn] = None,
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    current_session, _ = _require_current_user_session(
+        request,
+        body.refresh_token if body else None,
+        int(user_id),
+        db,
+    )
+    now = _utcnow()
+    other_sessions = (
+        db.query(UserSession)
+        .filter(
+            UserSession.user_id == int(user_id),
+            UserSession.id != int(current_session.id),
+            UserSession.revoked_at.is_(None),
+            UserSession.expires_at > now,
+        )
+        .order_by(UserSession.last_used_at.desc(), UserSession.id.desc())
+        .limit(49)
+        .all()
+    )
+    sessions = [current_session, *other_sessions]
+    return {
+        "ok": True,
+        "data": {
+            "items": [
+                {
+                    "id": int(item.id),
+                    "ip_address": item.ip or "unknown",
+                    "user_agent": item.user_agent or "",
+                    "device_name": _device_name(item.user_agent or ""),
+                    "created_at": item.created_at.isoformat() if item.created_at else None,
+                    "last_used_at": item.last_used_at.isoformat() if item.last_used_at else None,
+                    "expires_at": item.expires_at.isoformat() if item.expires_at else None,
+                    "is_current": int(item.id) == int(current_session.id),
+                }
+                for item in sessions
+            ],
+            "current_session_id": int(current_session.id),
+            "total": len(sessions),
+        },
+        "error": None,
+        "trace_id": getattr(request.state, "trace_id", None),
+    }
+
+
+@router.post(
+    "/sessions/{session_id}/revoke",
+    summary="撤销当前用户的指定其他会话",
+    response_model=ApiResponse,
+)
+def revoke_active_session(
+    session_id: int,
+    request: Request,
+    body: Optional[SessionProofIn] = None,
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    current_session, _ = _require_current_user_session(
+        request,
+        body.refresh_token if body else None,
+        int(user_id),
+        db,
+    )
+    if int(session_id) == int(current_session.id):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "CANNOT_REVOKE_CURRENT_SESSION",
+                "message": "Use logout to revoke the current session",
+            },
+        )
+
+    now = _utcnow()
+    target = (
+        db.query(UserSession)
+        .filter(
+            UserSession.id == int(session_id),
+            UserSession.user_id == int(user_id),
+            UserSession.revoked_at.is_(None),
+            UserSession.expires_at > now,
+        )
+        .with_for_update()
+        .first()
+    )
+    if target is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "SESSION_NOT_FOUND", "message": "Active session not found"},
+        )
+
+    target.revoked_at = now
+    target.last_used_at = now
+    db.add(
+        UserSecurityEvent(
+            user_id=int(user_id),
+            event_type="SESSION_REVOKED",
+            ip=get_client_ip(request),
+            user_agent=get_user_agent(request),
+            details={"target_device": _device_name(target.user_agent or "")},
+            created_at=now,
+        )
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "data": {"session_id": int(target.id), "revoked": True},
+        "error": None,
+        "trace_id": getattr(request.state, "trace_id", None),
+    }
+
+
+@router.post(
+    "/sessions/revoke-others",
+    summary="撤销当前用户除本机外的全部活跃会话",
+    response_model=ApiResponse,
+)
+def revoke_other_sessions(
+    request: Request,
+    body: Optional[SessionProofIn] = None,
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    current_session, _ = _require_current_user_session(
+        request,
+        body.refresh_token if body else None,
+        int(user_id),
+        db,
+    )
+    now = _utcnow()
+    revoked_count = (
+        db.query(UserSession)
+        .filter(
+            UserSession.user_id == int(user_id),
+            UserSession.id != int(current_session.id),
+            UserSession.revoked_at.is_(None),
+            UserSession.expires_at > now,
+        )
+        .update(
+            {UserSession.revoked_at: now, UserSession.last_used_at: now},
+            synchronize_session=False,
+        )
+    )
+    if int(revoked_count or 0) > 0:
+        db.add(
+            UserSecurityEvent(
+                user_id=int(user_id),
+                event_type="SESSIONS_REVOKED",
+                ip=get_client_ip(request),
+                user_agent=get_user_agent(request),
+                details={"revoked_count": int(revoked_count)},
+                created_at=now,
+            )
+        )
+    db.commit()
+    return {
+        "ok": True,
+        "data": {
+            "revoked_count": int(revoked_count or 0),
+            "current_session_id": int(current_session.id),
+        },
+        "error": None,
+        "trace_id": getattr(request.state, "trace_id", None),
     }

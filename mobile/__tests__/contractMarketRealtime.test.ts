@@ -546,6 +546,75 @@ describe('ContractMarketRealtimeStore', () => {
     harness.setNow(4_000);
     jest.advanceTimersByTime(1);
     expect(harness.store.getSnapshot().lease).toBeNull();
+    expect(harness.store.getSnapshot().executionRecovering).toBe(true);
+  });
+
+  it('keeps an expired live lease recoverable and resolves an execution wait only after a fresh lease arrives', async () => {
+    const harness = createHarness();
+    harness.store.acquire('screen');
+    harness.open();
+    harness.sendSnapshot(marketPayload({sequence: 0}));
+    harness.sendMarketState(marketPayload({sequence: 1}));
+
+    harness.setNow(10_921);
+    jest.advanceTimersByTime(900);
+    expect(harness.store.getSnapshot().lease).toBeNull();
+    expect(harness.store.getSnapshot().executionRecovering).toBe(true);
+
+    const grantPromise = harness.store.waitForExecutionLease();
+    expect(harness.transport.send).toHaveBeenLastCalledWith(
+      buildContractMarketSubscribeMessage(SYMBOL),
+    );
+    harness.setNow(10_930);
+    harness.sendMarketState(
+      marketPayload({
+        envelopeTimeMs: 10_910,
+        receivedAtMs: 10_800,
+        sequence: 2,
+      }),
+      10_910,
+    );
+    jest.advanceTimersByTime(250);
+
+    await expect(grantPromise).resolves.toMatchObject({
+      lease: {executionBid: 100, executionAsk: 101},
+    });
+    expect(harness.store.getSnapshot().executionRecovering).toBe(false);
+  });
+
+  it('does not let REST display fallback interrupt a bounded live execution renewal', async () => {
+    const harness = createHarness({
+      initialFetch: Promise.resolve(marketView({sequence: 0})),
+    });
+    harness.store.acquire('screen');
+    await Promise.resolve();
+    await Promise.resolve();
+    harness.open();
+    harness.sendSnapshot(marketPayload({sequence: 1}));
+    harness.sendMarketState(marketPayload({sequence: 2}));
+
+    harness.setNow(10_921);
+    jest.advanceTimersByTime(900);
+    expect(harness.store.getSnapshot().lease).toBeNull();
+    expect(harness.store.getSnapshot().executionRecovering).toBe(true);
+
+    harness.fetchMarketView.mockResolvedValueOnce(
+      marketView({receivedAtMs: 10_800, sequence: 3}),
+    );
+    jest.advanceTimersByTime(500);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(harness.store.getSnapshot()).toMatchObject({
+      source: 'REST',
+      lease: null,
+      executionRecovering: true,
+    });
+
+    jest.advanceTimersByTime(5_499);
+    expect(harness.store.getSnapshot().executionRecovering).toBe(true);
+    jest.advanceTimersByTime(1);
+    expect(harness.store.getSnapshot().executionRecovering).toBe(false);
   });
 
   it('does not let a late combined snapshot roll back accepted state authority', () => {
@@ -668,6 +737,7 @@ describe('ContractMarketRealtimeStore', () => {
     );
     expect(harness.store.getSnapshot().marketView).not.toBeNull();
     expect(harness.store.getSnapshot().lease).toBeNull();
+    expect(harness.store.getSnapshot().executionRecovering).toBe(false);
 
     harness.sendMarketState(
       marketPayload({sequence: 2, receivedAtMs: 10_050}),
@@ -687,6 +757,7 @@ describe('ContractMarketRealtimeStore', () => {
       10_000,
     );
     expect(harness.store.getSnapshot().lease).toBeNull();
+    expect(harness.store.getSnapshot().executionRecovering).toBe(false);
 
     harness.setNow(11_230);
     harness.sendMarketState(
@@ -708,6 +779,7 @@ describe('ContractMarketRealtimeStore', () => {
       marketPayload({generation: null, sequence: 1}),
     );
     expect(harness.store.getSnapshot().lease).toBeNull();
+    expect(harness.store.getSnapshot().executionRecovering).toBe(false);
 
     const freshnessHarness = createHarness();
     freshnessHarness.store.acquire('screen');

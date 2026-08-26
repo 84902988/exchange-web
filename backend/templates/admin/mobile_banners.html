@@ -1,0 +1,80 @@
+{% extends "admin/layout.html" %}
+
+{% block title %}手机端 Banner{% endblock %}
+{% block page_title %}手机端 Banner{% endblock %}
+{% block page_subtitle %}<div class="page-subtitle">手机端独立图片位：HERO 建议 16:9（1200×675）；PROMO 建议 3:1（1200×400）。</div>{% endblock %}
+{% block page_actions %}<a class="btn" href="/admin/mobile-content/banners/new">新增 Banner</a>{% endblock %}
+
+{% block content %}
+  {% if notice %}<div class="alert success">{{ notice }}</div>{% endif %}
+  {% if error %}<div class="alert error">{{ error }}</div>{% endif %}
+  <section class="page-section">
+    <div class="filter-card">
+      <form method="get" class="filter-grid">
+        <input name="keyword" value="{{ filters.keyword or '' }}" placeholder="搜索标题" />
+        <select name="status">
+          <option value="">全部状态</option>
+          <option value="ACTIVE" {% if filters.status == 'ACTIVE' %}selected{% endif %}>启用</option>
+          <option value="DISABLED" {% if filters.status == 'DISABLED' %}selected{% endif %}>停用</option>
+        </select>
+        <button class="btn secondary">筛选</button>
+      </form>
+    </div>
+  </section>
+  <section class="page-section">
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>ID</th><th>图片</th><th>标题</th><th>规格</th><th>排序</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody>
+          {% for item in items %}
+            <tr>
+              <td>{{ item.id }}</td>
+              <td>
+                {% if item.image %}
+                  <img
+                    src="{{ item.image.url }}"
+                    alt="{{ item.title }}"
+                    style="width:128px;aspect-ratio:{% if item.placement == 'PROMO' %}3/1{% else %}16/9{% endif %};object-fit:cover;border-radius:8px"
+                  />
+                {% else %}
+                  <span class="muted">图片不可用</span>
+                {% endif %}
+              </td>
+              <td>{{ item.title }}{% if item.subtitle %}<div class="muted">{{ item.subtitle }}</div>{% endif %}</td>
+              <td>{{ item.placement }} / {{ item.aspect_ratio }} / {{ item.recommended_size }}</td>
+              <td>{{ item.sort_order }}</td>
+              <td>{{ item.status }}</td>
+              <td>
+                <a class="btn secondary" href="/admin/mobile-content/banners/{{ item.id }}/edit">编辑</a>
+                <form method="post" action="/admin/mobile-content/banners/{{ item.id }}/toggle" style="display:inline">
+                  <button class="btn secondary" type="submit">{% if item.status == 'ACTIVE' %}停用{% else %}启用{% endif %}</button>
+                </form>
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="7" class="muted">暂无手机端 Banner</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="admin-pagination">
+      <div class="admin-muted">
+        共 {{ pagination.total }} 条，当前第 {{ pagination.page }} / {{ pagination.pages }} 页
+      </div>
+      <div>
+        {% if pagination.page > 1 %}
+          <a
+            href="{{ request.url.include_query_params(page=pagination.page - 1, page_size=pagination.page_size) }}"
+            class="btn secondary admin-btn admin-btn-secondary admin-btn-sm"
+          >上一页</a>
+        {% endif %}
+        {% if pagination.page < pagination.pages %}
+          <a
+            href="{{ request.url.include_query_params(page=pagination.page + 1, page_size=pagination.page_size) }}"
+            class="btn secondary admin-btn admin-btn-secondary admin-btn-sm"
+          >下一页</a>
+        {% endif %}
+      </div>
+    </div>
+  </section>
+{% endblock %}

@@ -42,4 +42,37 @@ describe("HomeNotice", () => {
       "/notice/system-maintenance",
     );
   });
+
+  test("treats a legacy timezone-less server timestamp as UTC", () => {
+    render(
+      <HomeNotice
+        items={[
+          {
+            id: "42",
+            title: "上线公告",
+            publishedAt: "2026-07-30 11:26:49",
+          },
+        ]}
+      />,
+    );
+
+    const expected = new Date("2026-07-30T11:26:49Z").toLocaleString("zh-CN");
+    expect(screen.getByText(expected)).toBeInTheDocument();
+  });
+
+  test("does not invent the current time when no persisted timestamp exists", () => {
+    render(
+      <HomeNotice
+        items={[
+          {
+            id: "42",
+            title: "系统维护通知",
+            publishedAt: null,
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("--")).toBeInTheDocument();
+  });
 });

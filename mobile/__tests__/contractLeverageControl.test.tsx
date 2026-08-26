@@ -78,7 +78,7 @@ describe('ContractOrderForm leverage control', () => {
         <ContractOrderForm
           {...createProps({
             pricePrecision: 1,
-            quantity: '1',
+            quantity: '0.1',
             spreadFeePrice: 0.1,
           })}
         />,
@@ -91,22 +91,23 @@ describe('ContractOrderForm leverage control', () => {
         .map(node => node.props.children)
         .flat();
 
-    expect(renderedText()).toContain('0.1 USDT');
+    expect(renderedText()).toContain('0.01 USDT');
+    expect(renderedText()).not.toContain('0 USDT');
 
     act(() => {
       renderer?.update(
         <ContractOrderForm
           {...createProps({
             pricePrecision: 1,
-            quantity: '10',
+            quantity: '1',
             spreadFeePrice: 0.1,
           })}
         />,
       );
     });
 
-    expect(renderedText()).toContain('1 USDT');
-    expect(renderedText()).not.toContain('0.1 USDT');
+    expect(renderedText()).toContain('0.1 USDT');
+    expect(renderedText()).not.toContain('0.01 USDT');
   });
 
   it('opens the bounded selector and applies an exact leverage value', () => {
@@ -196,6 +197,54 @@ describe('ContractOrderForm leverage control', () => {
     expect(
       findByAccessibilityLabel(renderer!, '提交买单').props.accessibilityState,
     ).toMatchObject({ busy: false, disabled: false });
+  });
+
+  it('keeps the submit action disabled until both price and quantity are valid', () => {
+    act(() => {
+      renderer = ReactTestRenderer.create(
+        <ContractOrderForm
+          {...createProps({
+            price: '0',
+            quantity: '0',
+            submitDisabled: false,
+          })}
+        />,
+      );
+    });
+
+    expect(
+      findByAccessibilityLabel(renderer!, '提交买单').props.accessibilityState,
+    ).toMatchObject({ disabled: true });
+
+    act(() => {
+      renderer?.update(
+        <ContractOrderForm
+          {...createProps({
+            price: '100',
+            quantity: '0',
+            submitDisabled: false,
+          })}
+        />,
+      );
+    });
+    expect(
+      findByAccessibilityLabel(renderer!, '提交买单').props.accessibilityState,
+    ).toMatchObject({ disabled: true });
+
+    act(() => {
+      renderer?.update(
+        <ContractOrderForm
+          {...createProps({
+            price: '100',
+            quantity: '1',
+            submitDisabled: false,
+          })}
+        />,
+      );
+    });
+    expect(
+      findByAccessibilityLabel(renderer!, '提交买单').props.accessibilityState,
+    ).toMatchObject({ disabled: false });
   });
 
   it('keeps buy and sell labels while mapping close orders to the opposite position side', () => {

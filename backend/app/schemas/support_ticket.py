@@ -11,3 +11,7 @@ class SupportTicketCreateIn(BaseModel):
 
 class SupportTicketMessageCreateIn(BaseModel):
     message: str = Field(..., min_length=1, max_length=5000)
+
+
+class SupportTicketReadIn(BaseModel):
+    last_seen_message_id: int = Field(..., ge=1)

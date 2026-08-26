@@ -146,10 +146,16 @@ def get_spot_balances(db: Session, user_id: int, symbol: str) -> Dict:
 # =========================
 # 2. 当前委托
 # =========================
-def get_current_orders(db: Session, user_id: int, symbol: str, limit: int = 50) -> Dict:
+def get_current_orders(
+    db: Session,
+    user_id: int,
+    symbol: str,
+    limit: int = 50,
+    before_id: Optional[int] = None,
+) -> Dict:
     pair = _get_pair_by_symbol(db, symbol)
-
-    rows = (
+    safe_limit = min(max(int(limit), 1), 100)
+    query = (
         db.query(Order)
         .options(joinedload(Order.fee_asset))
         .filter(
@@ -158,13 +164,15 @@ def get_current_orders(db: Session, user_id: int, symbol: str, limit: int = 50) 
             Order.status.in_(OPEN_STATUSES),
             Order.amount > Order.filled_amount,
         )
-        .order_by(desc(Order.id))
-        .limit(limit)
-        .all()
     )
+    if before_id is not None:
+        query = query.filter(Order.id < int(before_id))
+    rows = query.order_by(desc(Order.id)).limit(safe_limit + 1).all()
+    has_more = len(rows) > safe_limit
+    page_rows = rows[:safe_limit]
 
     items: List[Dict] = []
-    for row in rows:
+    for row in page_rows:
         # Keep a fail-closed read guard in addition to the SQL predicate so a
         # stale ORM row can never reappear through a private-event snapshot.
         if _is_effectively_open(row):
@@ -174,16 +182,24 @@ def get_current_orders(db: Session, user_id: int, symbol: str, limit: int = 50) 
         "symbol": pair.symbol,
         "total": len(items),
         "items": items,
+        "has_more": has_more,
+        "next_cursor": int(page_rows[-1].id) if has_more and page_rows else None,
     }
 
 
 # =========================
 # 3. 历史委托
 # =========================
-def get_history_orders(db: Session, user_id: int, symbol: str, limit: int = 100) -> Dict:
+def get_history_orders(
+    db: Session,
+    user_id: int,
+    symbol: str,
+    limit: int = 100,
+    before_id: Optional[int] = None,
+) -> Dict:
     pair = _get_pair_by_symbol(db, symbol)
-
-    rows = (
+    safe_limit = min(max(int(limit), 1), 100)
+    query = (
         db.query(Order)
         .options(joinedload(Order.fee_asset))
         .filter(
@@ -194,26 +210,36 @@ def get_history_orders(db: Session, user_id: int, symbol: str, limit: int = 100)
                 Order.amount <= Order.filled_amount,
             ),
         )
-        .order_by(desc(Order.id))
-        .limit(limit)
-        .all()
     )
+    if before_id is not None:
+        query = query.filter(Order.id < int(before_id))
+    rows = query.order_by(desc(Order.id)).limit(safe_limit + 1).all()
+    has_more = len(rows) > safe_limit
+    page_rows = rows[:safe_limit]
 
     items: List[Dict] = []
-    for row in rows:
+    for row in page_rows:
         items.append(_build_order_item(row, pair))
 
     return {
         "symbol": pair.symbol,
         "total": len(items),
         "items": items,
+        "has_more": has_more,
+        "next_cursor": int(page_rows[-1].id) if has_more and page_rows else None,
     }
 
 
 # =========================
 # 4. 成交明细
 # =========================
-def get_my_trades(db: Session, user_id: Union[int, str], symbol: str, limit: int = 100) -> Dict:
+def get_my_trades(
+    db: Session,
+    user_id: Union[int, str],
+    symbol: str,
+    limit: int = 100,
+    before_id: Optional[int] = None,
+) -> Dict:
     # get_current_user_id currently returns the JWT subject as a string. SQL
     # comparisons coerce it for us, but Python does not: comparing an integer
     # buyer_user_id with a string user_id would classify every trade as SELL
@@ -221,8 +247,8 @@ def get_my_trades(db: Session, user_id: Union[int, str], symbol: str, limit: int
     # boundary so both the query and the ownership checks use the same type.
     normalized_user_id = int(user_id)
     pair = _get_pair_by_symbol(db, symbol)
-
-    rows = (
+    safe_limit = min(max(int(limit), 1), 100)
+    query = (
         db.query(Trade)
         .filter(
             Trade.trading_pair_id == pair.id,
@@ -231,13 +257,15 @@ def get_my_trades(db: Session, user_id: Union[int, str], symbol: str, limit: int
                 Trade.seller_user_id == normalized_user_id,
             ),
         )
-        .order_by(desc(Trade.id))
-        .limit(limit)
-        .all()
     )
+    if before_id is not None:
+        query = query.filter(Trade.id < int(before_id))
+    rows = query.order_by(desc(Trade.id)).limit(safe_limit + 1).all()
+    has_more = len(rows) > safe_limit
+    page_rows = rows[:safe_limit]
 
     items: List[Dict] = []
-    for row in rows:
+    for row in page_rows:
         side = "BUY" if row.buyer_user_id == normalized_user_id else "SELL"
         own_order_id = row.buy_order_id if side == "BUY" else row.sell_order_id
         role = "MAKER" if own_order_id == row.maker_order_id else "TAKER"
@@ -284,4 +312,6 @@ def get_my_trades(db: Session, user_id: Union[int, str], symbol: str, limit: int
         "symbol": pair.symbol,
         "total": len(items),
         "items": items,
+        "has_more": has_more,
+        "next_cursor": int(page_rows[-1].id) if has_more and page_rows else None,
     }

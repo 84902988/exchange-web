@@ -38,6 +38,8 @@ class SpotOrdersResponse(BaseModel):
     symbol: str
     total: int
     items: List[SpotOrderItem]
+    has_more: bool = False
+    next_cursor: Optional[int] = None
 
 
 class SpotTradeItem(BaseModel):
@@ -77,3 +79,5 @@ class SpotTradesResponse(BaseModel):
     symbol: str
     total: int
     items: List[SpotTradeItem]
+    has_more: bool = False
+    next_cursor: Optional[int] = None

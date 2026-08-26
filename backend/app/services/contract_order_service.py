@@ -308,6 +308,77 @@ def _normalize_optional_trigger_price(value: Any) -> Optional[Decimal]:
     return _normalize_price(value, required=False)
 
 
+def contract_open_idempotency_payload(request: ContractOpenOrderRequest) -> dict[str, Any]:
+    order_type = str(request.order_type or "").upper()
+    return {
+        "symbol": _normalize_symbol(request.symbol),
+        "position_side": str(request.position_side or "").upper(),
+        "order_type": order_type,
+        "price": _normalize_price(request.price, required=order_type == "LIMIT"),
+        "quantity": _normalize_quantity(request.quantity),
+        "leverage": int(request.leverage or 0),
+        "take_profit_price": _normalize_optional_trigger_price(request.take_profit_price),
+        "stop_loss_price": _normalize_optional_trigger_price(request.stop_loss_price),
+    }
+
+
+def contract_close_summary_idempotency_payload(
+    request: ContractCloseSummaryOrderRequest,
+) -> dict[str, Any]:
+    order_type = str(request.order_type or "").upper()
+    close_all = request.quantity is None
+    return {
+        "symbol": _normalize_symbol(request.symbol),
+        "side": str(request.side or "").upper(),
+        "order_type": order_type,
+        "price": _normalize_price(request.price, required=order_type == "LIMIT"),
+        "quantity_mode": "ALL" if close_all else "EXACT",
+        "quantity": None if close_all else _normalize_quantity(request.quantity),
+    }
+
+
+def prepare_contract_open_order_quote(
+    db: Session,
+    user_id: int,
+    request: ContractOpenOrderRequest,
+) -> dict[str, Any]:
+    symbol = _normalize_symbol(request.symbol)
+    order_type = str(request.order_type or "").upper()
+    try:
+        return _load_contract_execution_quote(
+            db,
+            symbol,
+            context="market_open" if order_type == "MARKET" else "limit_open_reference",
+            require_executable=order_type == "MARKET",
+            user_id=user_id,
+        )
+    except ContractQuoteNotLive as exc:
+        _raise_open_quote_not_live(exc)
+    except Exception as exc:
+        raise ContractOrderQuoteUnavailable("CONTRACT_QUOTE_UNAVAILABLE") from exc
+
+
+def prepare_contract_close_summary_order_quote(
+    db: Session,
+    user_id: int,
+    request: ContractCloseSummaryOrderRequest,
+) -> dict[str, Any]:
+    symbol = _normalize_symbol(request.symbol)
+    order_type = str(request.order_type or "").upper()
+    try:
+        return _load_contract_execution_quote(
+            db,
+            symbol,
+            context="market_close_summary" if order_type == "MARKET" else "limit_close_reference",
+            require_executable=order_type == "MARKET",
+            user_id=user_id,
+        )
+    except ContractQuoteNotLive as exc:
+        _raise_close_quote_not_live(exc)
+    except Exception as exc:
+        raise ContractOrderQuoteUnavailable("CONTRACT_QUOTE_UNAVAILABLE") from exc
+
+
 def _validate_take_profit_stop_loss(
     *,
     position_side: str,
@@ -430,6 +501,7 @@ def _response_from_order(
     realized_pnl: Optional[Decimal] = None,
     released_margin: Optional[Decimal] = None,
     remaining_position_quantity: Optional[Decimal] = None,
+    client_order_id: Optional[str] = None,
 ) -> ContractOrderResponse:
     return ContractOrderResponse(
         order_id=int(order.id),
@@ -453,6 +525,7 @@ def _response_from_order(
         ),
         take_profit_price=_fmt_decimal(order.take_profit_price) if order.take_profit_price is not None else None,
         stop_loss_price=_fmt_decimal(order.stop_loss_price) if order.stop_loss_price is not None else None,
+        client_order_id=client_order_id,
     )
 
 
@@ -460,6 +533,9 @@ def create_contract_open_order(
     db: Session,
     user_id: int,
     request: ContractOpenOrderRequest,
+    *,
+    commit: bool = True,
+    quote_override: Optional[dict[str, Any]] = None,
 ) -> ContractOrderResponse:
     symbol = _normalize_symbol(request.symbol)
     position_side = str(request.position_side or "").upper()
@@ -478,18 +554,10 @@ def create_contract_open_order(
         leverage=leverage,
     )
 
-    try:
-        quote = _load_contract_execution_quote(
-            db,
-            symbol,
-            context="market_open" if order_type == "MARKET" else "limit_open_reference",
-            require_executable=order_type == "MARKET",
-            user_id=user_id,
-        )
-    except ContractQuoteNotLive as exc:
-        _raise_open_quote_not_live(exc)
-    except Exception as exc:
-        raise ContractOrderQuoteUnavailable("CONTRACT_QUOTE_UNAVAILABLE") from exc
+    if quote_override is None:
+        quote = prepare_contract_open_order_quote(db, user_id, request)
+    else:
+        quote = quote_override
 
     bid_price = _q18(quote["bid_price"])
     ask_price = _q18(quote["ask_price"])
@@ -707,13 +775,21 @@ def create_contract_open_order(
             now=now,
         )
 
-    try:
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        raise ContractOrderBadRequest("CONTRACT_OPEN_ORDER_FAILED") from exc
-    db.refresh(order)
-    return _response_from_order(order, position_id)
+    if not commit:
+        db.flush()
+    result = _response_from_order(
+        order,
+        position_id,
+        client_order_id=request.client_order_id,
+    )
+    if commit:
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise ContractOrderBadRequest("CONTRACT_OPEN_ORDER_FAILED") from exc
+        db.refresh(order)
+    return result
 
 
 def cancel_contract_order(db: Session, user_id: int, order_id: int) -> ContractOrderResponse:
@@ -1527,6 +1603,9 @@ def close_contract_position_summary(
     db: Session,
     user_id: int,
     request: ContractCloseSummaryOrderRequest,
+    *,
+    commit: bool = True,
+    quote_override: Optional[dict[str, Any]] = None,
 ) -> ContractCloseSummaryOrderResponse:
     symbol = _normalize_symbol(request.symbol)
     position_side = str(request.side or "").upper()
@@ -1539,21 +1618,10 @@ def close_contract_position_summary(
         raise ContractOrderBadRequest("INVALID_ORDER_TYPE")
 
     _load_enabled_contract_symbol(db, symbol)
-    _normalize_price(request.price, required=order_type == "LIMIT")
-    quote: Optional[dict[str, Any]] = None
-    if order_type == "MARKET":
-        try:
-            quote = _load_contract_execution_quote(
-                db,
-                symbol,
-                context="market_close_summary",
-                require_executable=True,
-                user_id=user_id,
-            )
-        except ContractQuoteNotLive as exc:
-            _raise_close_quote_not_live(exc)
-        except Exception as exc:
-            raise ContractOrderQuoteUnavailable("CONTRACT_QUOTE_UNAVAILABLE") from exc
+    limit_price = _normalize_price(request.price, required=order_type == "LIMIT")
+    quote: Optional[dict[str, Any]] = quote_override
+    if quote is None and order_type == "MARKET":
+        quote = prepare_contract_close_summary_order_quote(db, user_id, request)
 
     positions = (
         db.query(ContractPosition)
@@ -1607,7 +1675,7 @@ def close_contract_position_summary(
                     quantity=split_quantity,
                 ),
                 commit=False,
-                quote_override=quote if order_type == "MARKET" else None,
+                quote_override=quote,
             )
 
             generated_order_ids.append(int(response.order_id))
@@ -1628,7 +1696,31 @@ def close_contract_position_summary(
         if submitted_quantity != requested_quantity:
             raise ContractOrderBadRequest("CONTRACT_CLOSE_ORDER_FAILED")
 
-        db.commit()
+        if closed_quantity >= requested_quantity:
+            status = "FILLED"
+        elif closed_quantity > Decimal("0"):
+            status = "PARTIALLY_FILLED"
+        else:
+            status = "OPEN"
+
+        result = ContractCloseSummaryOrderResponse(
+            symbol=symbol,
+            side=position_side,
+            order_type=order_type,
+            price=_fmt_decimal(limit_price) if order_type == "LIMIT" and limit_price is not None else None,
+            requested_quantity=_fmt_decimal(requested_quantity),
+            closed_quantity=_fmt_decimal(closed_quantity),
+            submitted_quantity=_fmt_decimal(submitted_quantity),
+            generated_order_ids=generated_order_ids,
+            generated_trade_ids=generated_trade_ids,
+            affected_position_ids=affected_position_ids,
+            status=status,
+            client_order_id=request.client_order_id,
+        )
+        if commit:
+            db.commit()
+        else:
+            db.flush()
     except IntegrityError as exc:
         db.rollback()
         raise ContractOrderBadRequest("CONTRACT_CLOSE_ORDER_FAILED") from exc
@@ -1636,25 +1728,7 @@ def close_contract_position_summary(
         db.rollback()
         raise
 
-    if closed_quantity >= requested_quantity:
-        status = "FILLED"
-    elif closed_quantity > Decimal("0"):
-        status = "PARTIALLY_FILLED"
-    else:
-        status = "OPEN"
-
-    return ContractCloseSummaryOrderResponse(
-        symbol=symbol,
-        side=position_side,
-        order_type=order_type,
-        requested_quantity=_fmt_decimal(requested_quantity),
-        closed_quantity=_fmt_decimal(closed_quantity),
-        submitted_quantity=_fmt_decimal(submitted_quantity),
-        generated_order_ids=generated_order_ids,
-        generated_trade_ids=generated_trade_ids,
-        affected_position_ids=affected_position_ids,
-        status=status,
-    )
+    return result
 
 
 def _mark_order_failed(db: Session, *, order: ContractOrder, reason: str) -> None:

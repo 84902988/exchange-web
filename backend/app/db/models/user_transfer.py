@@ -26,6 +26,7 @@ class UserTransfer(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     transfer_no: Mapped[str] = mapped_column(String(64), nullable=False)
     request_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
     from_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     to_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)

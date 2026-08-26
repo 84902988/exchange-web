@@ -37,6 +37,7 @@ CORE_FINANCIAL_TABLES: dict[str, dict[str, str]] = {
     "contract_orders": {"type": "合约订单", "hot_retention": "12～24 个月", "next_step": "月度归档 / 冷数据迁移"},
     "contract_trades": {"type": "合约成交", "hot_retention": "12～24 个月", "next_step": "月度归档 / 冷数据迁移"},
     "contract_margin_logs": {"type": "保证金流水", "hot_retention": "12～24 个月", "next_step": "月度归档 / 冷数据迁移"},
+    "trade_idempotency_requests": {"type": "交易幂等凭据", "hot_retention": "12～24 个月", "next_step": "随订单月度归档"},
     "deposits": {"type": "充值", "hot_retention": "24 个月", "next_step": "月度归档 / 冷数据迁移"},
     "withdraw_logs": {"type": "提现", "hot_retention": "24 个月", "next_step": "月度归档 / 冷数据迁移"},
     "user_balances": {"type": "用户余额", "hot_retention": "长期在线", "next_step": "仅快照归档"},

@@ -40,7 +40,29 @@ const nextConfig: NextConfig = {
         headers: [
           {
             key: "Cache-Control",
-            value: "public, max-age=3600, stale-while-revalidate=86400",
+            value: "public, max-age=31536000, immutable",
+          },
+        ],
+      },
+      // TradingView's unhashed entry file points at version-hashed bundles.
+      // Revalidate it on every load so an update cannot pair an old entry
+      // script with a new bundle directory. This rule intentionally comes
+      // after the wildcard because Next.js lets the last matching key win.
+      {
+        source: "/tradingview/charting_library/charting_library.js",
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "public, max-age=0, must-revalidate",
+          },
+        ],
+      },
+      {
+        source: "/tradingview/charting_library/sameorigin.html",
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "public, max-age=0, must-revalidate",
           },
         ],
       },

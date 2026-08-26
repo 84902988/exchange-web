@@ -1,20 +1,26 @@
 from __future__ import annotations
 
+import logging
 import re
 import uuid
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, File
+from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field, validator
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.security import hash_password, verify_password
 from app.deps.auth import get_current_user_id
-from app.db.models import User, UserLoginLog, UserProfile, UserSetting
+from app.core.request_utils import get_client_ip, get_user_agent
+from app.db.models import User, UserLoginLog, UserProfile, UserSecurityEvent, UserSession, UserSetting
 from app.db.session import get_db
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/me", tags=["me"])
 profile_router = APIRouter(tags=["user-profile"])
@@ -23,6 +29,8 @@ PHONE_PATTERN = re.compile(r"^[+\d][+\d\s-]{5,19}$")
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 AVATAR_UPLOAD_DIR = BACKEND_DIR / "static" / "uploads" / "avatars"
 AVATAR_MAX_BYTES = 2 * 1024 * 1024
+AVATAR_MAX_DIMENSION = 4096
+AVATAR_MAX_PIXELS = 16_000_000
 AVATAR_CONTENT_TYPES = {
     "image/jpeg": ".jpg",
     "image/png": ".png",
@@ -321,6 +329,32 @@ def change_password(
     user.password_changed_at = now
     user.updated_at = now
 
+    # Password changes revoke every durable refresh session, including the
+    # session used by the current device. Clients must clear local tokens after
+    # this response. Access tokens remain bounded by their short JWT lifetime.
+    revoked_sessions = (
+        db.query(UserSession)
+        .filter(
+            UserSession.user_id == int(user.id),
+            UserSession.revoked_at.is_(None),
+        )
+        .update(
+            {UserSession.revoked_at: now, UserSession.last_used_at: now},
+            synchronize_session=False,
+        )
+    )
+
+    db.add(
+        UserSecurityEvent(
+            user_id=int(user.id),
+            event_type="PASSWORD_CHANGED",
+            ip=get_client_ip(request),
+            user_agent=get_user_agent(request),
+            details={"revoked_sessions": int(revoked_sessions or 0)},
+            created_at=now,
+        )
+    )
+
     db.commit()
 
     return {
@@ -419,6 +453,54 @@ def login_logs(
 # =========================
 # Upload Avatar
 # =========================
+def _validate_avatar_content(content: bytes, expected_extension: str) -> None:
+    expected_format = {
+        ".jpg": "JPEG",
+        ".png": "PNG",
+        ".webp": "WEBP",
+    }[expected_extension]
+    try:
+        with Image.open(BytesIO(content)) as image:
+            actual_format = (image.format or "").upper()
+            width, height = image.size
+            image.verify()
+    except (Image.DecompressionBombError, UnidentifiedImageError, OSError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_IMAGE", "message": "头像图片内容无效"},
+        )
+
+    if actual_format != expected_format:
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_IMAGE", "message": "头像图片格式与文件类型不一致"},
+        )
+    if (
+        width <= 0
+        or height <= 0
+        or width > AVATAR_MAX_DIMENSION
+        or height > AVATAR_MAX_DIMENSION
+        or width * height > AVATAR_MAX_PIXELS
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "IMAGE_DIMENSIONS_INVALID", "message": "头像图片尺寸过大"},
+        )
+
+
+def _local_avatar_path(avatar_url: Optional[str]) -> Optional[Path]:
+    prefix = "/static/uploads/avatars/"
+    raw = (avatar_url or "").strip()
+    if not raw.startswith(prefix):
+        return None
+    filename = raw[len(prefix):]
+    if not filename or Path(filename).name != filename:
+        return None
+    root = AVATAR_UPLOAD_DIR.resolve()
+    candidate = (root / filename).resolve()
+    return candidate if candidate.parent == root else None
+
+
 @router.post(
     "/avatar",
     summary="上传头像",
@@ -460,21 +542,34 @@ def upload_avatar(
             status_code=400,
             detail={"code": "EMPTY_FILE", "message": "请选择要上传的头像图片"},
         )
+    _validate_avatar_content(content, ext)
 
     AVATAR_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
     fname = f"user_{int(user.id)}_{timestamp}_{uuid.uuid4().hex[:10]}{ext}"
     path = AVATAR_UPLOAD_DIR / fname
 
-    with open(path, "wb") as f:
-        f.write(content)
+    old_avatar_path = _local_avatar_path(profile.avatar_url)
+    try:
+        with open(path, "xb") as f:
+            f.write(content)
 
-    # 这里返回一个可访问 URL：按你 Nginx/Static 配置自行调整
-    # 比如你把 /uploads 映射到静态：avatar_url = f"/uploads/{fname}"
-    profile.avatar_url = f"/static/uploads/avatars/{fname}"
-    profile.updated_at = datetime.utcnow()
+        profile.avatar_url = f"/static/uploads/avatars/{fname}"
+        profile.updated_at = datetime.utcnow()
 
-    db.commit()
+        db.commit()
+    except Exception:
+        db.rollback()
+        path.unlink(missing_ok=True)
+        raise
+
+    if old_avatar_path and old_avatar_path != path:
+        try:
+            old_avatar_path.unlink(missing_ok=True)
+        except OSError:
+            # The new avatar is already committed. Cleanup failure must not
+            # turn a successful upload into an ambiguous client retry.
+            logger.warning("failed_to_cleanup_old_avatar user_id=%s", int(user.id))
     db.refresh(user)
 
     return _me_payload(user, trace_id)
