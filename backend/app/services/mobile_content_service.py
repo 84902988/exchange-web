@@ -9,6 +9,7 @@ import re
 from threading import RLock
 from time import monotonic
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from sqlalchemy import or_
 from sqlalchemy.exc import DataError, IntegrityError
@@ -104,6 +105,7 @@ MOBILE_HOME_MARKET_SHORTCUT_DEFAULTS = (
 MOBILE_HOME_MARKET_SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9_-]{1,63}$")
 MOBILE_HOME_PROMO_LIMIT_RANGE = (1, 8)
 MOBILE_HOME_ANNOUNCEMENT_LIMIT_RANGE = (1, 10)
+MOBILE_BANK_PORTAL_URL_MAX_LENGTH = 500
 MOBILE_UPLOAD_URL_RE = re.compile(
     r"^/static/uploads/mobile/([0-9a-f]{32}\.webp)$"
 )
@@ -325,6 +327,7 @@ def _default_mobile_home_config() -> dict[str, Any]:
         "market_shortcut_symbols": list(MOBILE_HOME_MARKET_SHORTCUT_DEFAULTS),
         "promo_limit": MOBILE_HOME_PROMO_LIMIT_RANGE[1],
         "announcement_limit": 3,
+        "bank_portal_url": None,
     }
 
 
@@ -353,6 +356,25 @@ def _bounded_home_text(
     valid = valid and not _contains_html_markup(text)
     valid = valid and not _has_disallowed_text_control(text)
     return (text if valid else fallback), valid
+
+
+def _mobile_bank_portal_url(value: Any) -> tuple[Optional[str], Optional[str]]:
+    url = _optional(value)
+    if url is None:
+        return None, None
+    if len(url) > MOBILE_BANK_PORTAL_URL_MAX_LENGTH:
+        return None, f"银行端口链接不能超过 {MOBILE_BANK_PORTAL_URL_MAX_LENGTH} 个字符"
+    if any(character.isspace() for character in url) or _has_disallowed_text_control(url):
+        return None, "银行端口链接不能包含空格或控制字符"
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return None, "银行端口链接格式不正确"
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        return None, "银行端口链接必须是完整的 HTTPS 地址"
+    if parsed.username or parsed.password:
+        return None, "银行端口链接不能包含用户名或密码"
+    return url, None
 
 
 def normalize_mobile_home_config(value: Any) -> dict[str, Any]:
@@ -456,6 +478,10 @@ def normalize_mobile_home_config(value: Any) -> dict[str, Any]:
         MOBILE_HOME_ANNOUNCEMENT_LIMIT_RANGE,
         3,
     )
+    bank_portal_url, _error = _mobile_bank_portal_url(
+        value.get("bank_portal_url")
+    )
+    conservative["bank_portal_url"] = bank_portal_url
     return conservative
 
 
@@ -481,6 +507,7 @@ def serialize_mobile_home_config(
         ],
         "market_shortcut_limit": config["market_shortcut_limit"],
         "market_shortcut_symbols": list(config["market_shortcut_symbols"]),
+        "bank_portal_url": config["bank_portal_url"],
     }
 
 
@@ -495,6 +522,7 @@ def _home_config_form(config: dict[str, Any]) -> dict[str, Any]:
         "home_market_shortcut_symbols": list(config["market_shortcut_symbols"]),
         "home_promo_limit": config["promo_limit"],
         "home_announcement_limit": config["announcement_limit"],
+        "home_bank_portal_url": config["bank_portal_url"] or "",
     }
 
 
@@ -514,6 +542,18 @@ def _normalize_mobile_home_config_payload(
         key: _parse_bool(payload.get(f"home_section_{key}"))
         for key in MOBILE_HOME_SECTION_DEFAULTS
     }
+    if "home_bank_portal_url" in payload:
+        raw_bank_portal_url = _optional(payload.get("home_bank_portal_url"))
+        bank_portal_url, bank_portal_error = _mobile_bank_portal_url(
+            raw_bank_portal_url
+        )
+        config["bank_portal_url"] = (
+            raw_bank_portal_url if bank_portal_error else bank_portal_url
+        )
+        if bank_portal_error:
+            errors.append(bank_portal_error)
+    else:
+        config["bank_portal_url"] = current.get("bank_portal_url")
 
     range_fields = (
         (

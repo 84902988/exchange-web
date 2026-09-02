@@ -282,13 +282,13 @@
             </div>
             <div class="field">
               <label for="liquidation_threshold">强平阈值</label>
-              <div class="field-help">实际风控参数：仓位权益（保证金 + 未实现盈亏）小于等于“初始保证金 × 阈值”时触发强平。0 表示权益归零时强平；0.1 表示剩余 10% 保证金时强平。请勿填写负数。</div>
-              <input id="liquidation_threshold" type="text" name="liquidation_threshold" value="{{ form.liquidation_threshold or '' }}" placeholder="例如 0 或 0.1" />
+              <div class="field-help">填写 0 到 1 的小数比例，不要填写百分号。仓位权益（保证金 + 未实现盈亏）小于等于“初始保证金 × 阈值”时触发强平；0 表示保证金亏完才强平，0.1 表示剩余 10% 保证金时强平。高杠杆会让保证金在很小的反向波动中快速亏完，调低阈值不能消除杠杆风险。</div>
+              <input id="liquidation_threshold" type="number" min="0" max="1" step="0.01" name="liquidation_threshold" value="{{ form.liquidation_threshold if form.liquidation_threshold is not none else '0' }}" placeholder="例如 0 或 0.1" />
             </div>
             <div class="field">
-              <label for="warning_threshold">预警阈值</label>
-              <div class="field-help">预留参数，当前仅用于后台配置展示。</div>
-              <input id="warning_threshold" type="text" name="warning_threshold" value="{{ form.warning_threshold or '' }}" placeholder="例如 0.9" />
+              <label for="warning_threshold">风险预警阈值</label>
+              <div class="field-help">填写 0 到 1 的小数比例，不要填写百分号；当前仅用于后台风险预警配置展示，不直接改变强平执行条件。</div>
+              <input id="warning_threshold" type="number" min="0" max="1" step="0.01" name="warning_threshold" value="{{ form.warning_threshold if form.warning_threshold is not none else '0' }}" placeholder="例如 0.9" />
             </div>
           </div>
         </div>

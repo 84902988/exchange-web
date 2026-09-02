@@ -11094,6 +11094,10 @@ def _admin_contract_symbol_form_row(row: Dict[str, Any]) -> Dict[str, Any]:
     item["quantity_precision"] = str(int(row.get("quantity_precision") or 0))
     item["max_leverage"] = str(int(row.get("max_leverage") or 0))
     item["spread_x"] = _admin_amount_display(row.get("spread_x"))
+    # List rows render ratios as percentages, while the edit form accepts raw
+    # decimal ratios (0.1 means 10%). Keep edit values machine-parseable.
+    item["liquidation_threshold"] = _admin_amount_display(row.get("liquidation_threshold"))
+    item["warning_threshold"] = _admin_amount_display(row.get("warning_threshold"))
     return item
 
 
@@ -11209,8 +11213,18 @@ def _validate_contract_symbol_form(form: Dict[str, Any], *, is_create: bool) -> 
     min_quantity = _parse_decimal(form["min_quantity"], Decimal("0"))
     max_quantity = _parse_decimal(form["max_quantity"], Decimal("0"))
     min_margin = _parse_decimal(form["min_margin"], Decimal("0"))
-    liquidation_threshold = _parse_decimal(form["liquidation_threshold"], Decimal("0"))
-    warning_threshold = _parse_decimal(form["warning_threshold"], Decimal("0"))
+    liquidation_threshold = _parse_decimal_config_field(
+        form["liquidation_threshold"],
+        field_label="强平阈值",
+        errors=errors,
+    )
+    warning_threshold = _parse_decimal_config_field(
+        form["warning_threshold"],
+        field_label="风险预警阈值",
+        errors=errors,
+    )
+    assert liquidation_threshold is not None
+    assert warning_threshold is not None
 
     if price_precision < 0:
         errors.append("价格精度必须大于等于 0")
@@ -11222,8 +11236,10 @@ def _validate_contract_symbol_form(form: Dict[str, Any], *, is_create: bool) -> 
         errors.append("人工单边绝对加点必须在 0 到 100 U 之间")
     if min_quantity < 0 or max_quantity < 0 or min_margin < 0:
         errors.append("交易规则数值不能小于 0")
-    if liquidation_threshold < 0 or warning_threshold < 0:
-        errors.append("风控阈值不能小于 0")
+    if liquidation_threshold < 0 or liquidation_threshold > 1:
+        errors.append("强平阈值必须在 0 到 1 之间（0 表示仓位权益归零时强平）")
+    if warning_threshold < 0 or warning_threshold > 1:
+        errors.append("风险预警阈值必须在 0 到 1 之间")
 
     values = {
         **form,

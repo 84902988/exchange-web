@@ -51,6 +51,11 @@
           </div>
           <span class="muted">关闭模块后，手机端不再展示对应区域；活动和公告关闭后公开 bootstrap 也不查询对应列表。</span>
         </div>
+        <div class="field" style="grid-column:1 / -1">
+          <label for="home_bank_portal_url">银行端口跳转链接</label>
+          <input id="home_bank_portal_url" name="home_bank_portal_url" type="url" inputmode="url" placeholder="https://bank.example.com/portal" maxlength="500" value="{{ form.home_bank_portal_url or '' }}" />
+          <span class="muted">选填。填写完整 HTTPS 地址后，手机首页会在“活动中心”下方显示“银行端口 / Bank Portal”；留空则不显示。点击后直接打开该链接。</span>
+        </div>
         <div class="field">
           <label for="home_market_shortcut_limit">首页行情卡数量</label>
           <input id="home_market_shortcut_limit" name="home_market_shortcut_limit" type="number" min="1" max="4" value="{{ form.home_market_shortcut_limit or 4 }}" required />
@@ -82,6 +87,7 @@
         </div>
         <div class="field" style="grid-column:1 / -1">
           <label>资产快捷入口</label>
+          <span class="muted" style="display:block;margin-bottom:8px">对应手机端登录后首页“总资产估值”下方的充值、提现、划转和资金流水入口。各语言字段只在 App 切换到对应语言后显示；保存后重新进入首页即可刷新。</span>
           <div style="overflow:auto">
             <table style="width:100%;min-width:720px">
               <thead>

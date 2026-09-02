@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 from app.services.admin_queries import (
+    _admin_contract_symbol_form_row,
     _contract_symbol_form_from_payload,
     _validate_contract_symbol_form,
 )
@@ -70,3 +73,31 @@ def test_admin_rejects_invalid_timezone_override() -> None:
     _, errors = _validate_contract_symbol_form(form, is_create=True)
 
     assert "时区覆盖必须是有效的 IANA 时区，例如 America/New_York" in errors
+
+
+def test_admin_contract_symbol_edit_form_uses_raw_threshold_ratios() -> None:
+    form = _admin_contract_symbol_form_row(
+        {
+            "liquidation_threshold": Decimal("0.1"),
+            "warning_threshold": Decimal("0.25"),
+        }
+    )
+
+    assert form["liquidation_threshold"] == "0.1"
+    assert form["warning_threshold"] == "0.25"
+
+
+def test_admin_rejects_malformed_or_out_of_range_risk_thresholds() -> None:
+    malformed = _contract_symbol_form_from_payload(
+        _payload(liquidation_threshold="10%"),
+    )
+    _, malformed_errors = _validate_contract_symbol_form(malformed, is_create=True)
+
+    out_of_range = _contract_symbol_form_from_payload(
+        _payload(liquidation_threshold="1.01", warning_threshold="2"),
+    )
+    _, out_of_range_errors = _validate_contract_symbol_form(out_of_range, is_create=True)
+
+    assert "强平阈值格式不正确。" in malformed_errors
+    assert "强平阈值必须在 0 到 1 之间（0 表示仓位权益归零时强平）" in out_of_range_errors
+    assert "风险预警阈值必须在 0 到 1 之间" in out_of_range_errors

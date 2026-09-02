@@ -200,6 +200,7 @@ def test_bootstrap_matches_strict_mobile_contract_and_never_creates_pc_tables() 
             "ETHUSDT",
             "NVDAUSDT_PERP",
         ],
+        "bank_portal_url": None,
     }
     assert len(payload["announcements"]) == 1
     assert "content" not in payload["announcements"][0]
@@ -322,6 +323,7 @@ def test_home_config_admin_drives_sections_limits_copy_and_order(
         "home_market_shortcut_symbol_4": "NVDAUSDT_PERP",
         "home_promo_limit": "1",
         "home_announcement_limit": "1",
+        "home_bank_portal_url": "https://bank.example.com/portal?source=mobile",
     }
     entries = {
         "deposit": ("充值资产", "链上与平台充值", "3", True),
@@ -344,6 +346,9 @@ def test_home_config_admin_drives_sections_limits_copy_and_order(
     )
 
     assert result["ok"] is True
+    assert result["form"]["home_bank_portal_url"] == (
+        "https://bank.example.com/portal?source=mobile"
+    )
     assert bootstrap["home"]["config"] == {
         "version": 1,
         "sections": {
@@ -364,6 +369,7 @@ def test_home_config_admin_drives_sections_limits_copy_and_order(
             "RCBUSDT",
             "NVDAUSDT_PERP",
         ],
+        "bank_portal_url": "https://bank.example.com/portal?source=mobile",
     }
     assert bootstrap["home"]["promos"] == []
     assert bootstrap["announcements"] == []
@@ -383,6 +389,7 @@ def test_home_config_rejects_unsafe_operator_copy_without_overwriting_current() 
             "home_market_shortcut_limit": "8",
             "home_promo_limit": "1",
             "home_announcement_limit": "1",
+            "home_bank_portal_url": "javascript:alert(1)",
             "home_quick_deposit_title": "<b>充值</b>",
             "home_quick_deposit_description": "充值资产",
             "home_quick_deposit_sort_order": "0",
@@ -401,6 +408,7 @@ def test_home_config_rejects_unsafe_operator_copy_without_overwriting_current() 
     assert result["ok"] is False
     assert any("行情卡数量" in error for error in result["errors"])
     assert any("HTML" in error for error in result["errors"])
+    assert any("HTTPS" in error for error in result["errors"])
     assert db.query(MobileContentSettings).one().home_config == before
 
 
@@ -421,6 +429,7 @@ def test_corrupt_stored_home_config_fails_closed_without_breaking_bootstrap() ->
         "announcements": False,
     }
     assert payload["home"]["config"]["quick_entries"] == []
+    assert payload["home"]["config"]["bank_portal_url"] is None
     assert payload["home"]["promos"] == []
     assert payload["announcements"] == []
 

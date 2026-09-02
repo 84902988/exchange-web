@@ -11382,8 +11382,8 @@ def _default_contract_symbol_form() -> Dict[str, str]:
         "min_margin": "",
         "max_leverage": "100",
         "spread_x": "0.0",
-        "liquidation_threshold": "",
-        "warning_threshold": "",
+        "liquidation_threshold": "0",
+        "warning_threshold": "0",
         "status": "1",
     }
 

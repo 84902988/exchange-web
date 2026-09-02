@@ -64,6 +64,10 @@ class ContractOrderBadRequest(ContractOrderError):
     code = "BAD_REQUEST"
 
 
+class ContractOrderWouldLiquidate(ContractOrderBadRequest):
+    code = "OPEN_WOULD_LIQUIDATE_IMMEDIATELY"
+
+
 class ContractOrderInsufficientMargin(ContractOrderError):
     code = "INSUFFICIENT_CONTRACT_MARGIN"
 
@@ -233,6 +237,30 @@ def _contract_spread_fee(*, spread_x: Decimal, quantity: Decimal) -> Decimal:
         return Decimal("0")
     # In order context, spread_x_snapshot stores the single-side spread fee price.
     return _q18(spread_x * quantity)
+
+
+def _ensure_open_equity_above_liquidation_threshold(
+    *,
+    position_side: str,
+    entry_price: Decimal,
+    mark_price: Decimal,
+    quantity: Decimal,
+    margin_amount: Decimal,
+    liquidation_threshold: Decimal,
+) -> None:
+    if position_side == "LONG":
+        initial_pnl = (mark_price - entry_price) * quantity
+    elif position_side == "SHORT":
+        initial_pnl = (entry_price - mark_price) * quantity
+    else:
+        raise ContractOrderBadRequest("INVALID_POSITION_SIDE")
+
+    initial_equity = margin_amount + initial_pnl
+    threshold_amount = margin_amount * liquidation_threshold
+    if initial_equity <= threshold_amount:
+        raise ContractOrderWouldLiquidate(
+            "当前成交价与杠杆会使仓位开仓后立即达到强平条件，请降低杠杆或联系后台检查人工加点"
+        )
 
 
 def _normalize_symbol(value: str) -> str:
@@ -607,6 +635,15 @@ def create_contract_open_order(
     spread_fee_amount = _contract_spread_fee(spread_x=spread_x_snapshot, quantity=quantity)
     margin_amount = quantity * entry_price / Decimal(leverage)
     total_cost = margin_amount
+    if should_fill:
+        _ensure_open_equity_above_liquidation_threshold(
+            position_side=position_side,
+            entry_price=entry_price,
+            mark_price=mark_price,
+            quantity=quantity,
+            margin_amount=margin_amount,
+            liquidation_threshold=_q18(contract_symbol.liquidation_threshold),
+        )
 
     now = datetime.utcnow()
     account = _lock_contract_account(db, user_id=int(user_id), margin_asset="USDT")

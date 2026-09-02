@@ -218,6 +218,40 @@ def _authority_mapping(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _execution_authority_renewal_evidence(value: Any) -> dict[str, Any]:
+    """Return only evidence that can prove a fresh provider observation.
+
+    Price/depth equality is display deduplication, not transport liveness. A
+    provider may publish the same BBO repeatedly with a newer receipt time or
+    revision. Keep that evidence in the broadcast signature so executable
+    leases can renew without forcing a visible price change.
+    """
+
+    metadata = _authority_mapping(value)
+    revision = metadata.get("revision")
+    if not isinstance(revision, dict):
+        revision = {}
+    revision_epoch = metadata.get("revision_epoch")
+    if revision_epoch is None:
+        revision_epoch = revision.get("epoch")
+    revision_sequence = metadata.get("revision_sequence")
+    if revision_sequence is None:
+        revision_sequence = metadata.get("revision_seq")
+    if revision_sequence is None:
+        revision_sequence = revision.get("sequence")
+    received_at_ms = metadata.get("received_at_ms")
+    if received_at_ms is None:
+        received_at_ms = metadata.get("updated_at_ms")
+    evidence = {
+        "provider_generation": metadata.get("provider_generation"),
+        "revision_epoch": revision_epoch,
+        "revision_sequence": revision_sequence,
+        "provider_event_time_ms": metadata.get("provider_event_time_ms"),
+        "received_at_ms": received_at_ms,
+    }
+    return {key: item for key, item in evidence.items() if item is not None}
+
+
 def _legacy_domain_value(value: Any) -> Any:
     legacy = _to_jsonable(value)
     if isinstance(legacy, dict):
@@ -1628,6 +1662,23 @@ class ContractMarketGateway:
             if value is not None
         }
 
+    def _execution_authority_changed(
+        self,
+        domain: ContractMarketDomainName,
+        symbol: str,
+        authority_payload: Any,
+    ) -> bool:
+        incoming = _execution_authority_renewal_evidence(authority_payload)
+        if not incoming:
+            return False
+        current_snapshot = self.get_domain_snapshot(domain, symbol)
+        if current_snapshot is None:
+            return True
+        current = _execution_authority_renewal_evidence(
+            current_snapshot.metadata.model_dump(mode="json")
+        )
+        return incoming != current
+
     def _build_market_state_from_latest(
         self,
         symbol: str,
@@ -1738,7 +1789,15 @@ class ContractMarketGateway:
             return []
         quote = self._contract_quote_response(quote_payload)
         signature = self._quote_signature(quote)
-        if self._last_quote_signature.get(normalized_symbol) == signature:
+        display_changed = (
+            self._last_quote_signature.get(normalized_symbol) != signature
+        )
+        authority_changed = self._execution_authority_changed(
+            ContractMarketDomainName.TICKER,
+            normalized_symbol,
+            quote_payload,
+        )
+        if not display_changed and not authority_changed:
             return []
         if not self._set_latest(
             CONTRACT_MARKET_CACHE_QUOTE,
@@ -1746,6 +1805,8 @@ class ContractMarketGateway:
             quote,
             authority_payload=quote_payload,
         ):
+            return []
+        if not display_changed:
             return []
         self._last_quote_signature[normalized_symbol] = signature
         return [self._quote_message(normalized_symbol, quote)]
@@ -1772,7 +1833,15 @@ class ContractMarketGateway:
             return []
         depth = ContractDepthResponse(**contract_depth_to_response(depth_payload)).model_dump()
         signature = self._depth_signature(depth)
-        if self._last_depth_signature.get(normalized_symbol) == signature:
+        display_changed = (
+            self._last_depth_signature.get(normalized_symbol) != signature
+        )
+        authority_changed = self._execution_authority_changed(
+            ContractMarketDomainName.DEPTH,
+            normalized_symbol,
+            depth_payload,
+        )
+        if not display_changed and not authority_changed:
             return []
         if not self._set_latest(
             CONTRACT_MARKET_CACHE_DEPTH,
@@ -1780,6 +1849,8 @@ class ContractMarketGateway:
             depth,
             authority_payload=depth_payload,
         ):
+            return []
+        if not display_changed:
             return []
         self._last_depth_signature[normalized_symbol] = signature
         self._last_depth_broadcast_at[normalized_symbol] = time.monotonic()
@@ -2867,6 +2938,16 @@ class ContractMarketGateway:
         )
 
     def _state_signature(self, state: dict[str, Any]) -> str:
+        snapshot_metadata = state.get("snapshot_metadata")
+        execution_authority = None
+        if state.get("executable") is True and isinstance(snapshot_metadata, dict):
+            execution_authority = {
+                domain: _execution_authority_renewal_evidence(
+                    snapshot_metadata.get(domain)
+                )
+                for domain in ("ticker", "depth")
+                if isinstance(snapshot_metadata.get(domain), dict)
+            }
         return _json_signature(
             {
                 "display_price": state.get("display_price"),
@@ -2881,6 +2962,10 @@ class ContractMarketGateway:
                 "market_status": state.get("market_status"),
                 "market_session_type": state.get("market_session_type"),
                 "session_reason_code": state.get("session_reason_code"),
+                "execution_quote_time": (
+                    state.get("quote_time") if state.get("executable") is True else None
+                ),
+                "execution_authority": execution_authority,
                 "ticker_24h": {
                     key: (state.get("ticker") or {}).get(key)
                     for key in (
