@@ -55,6 +55,12 @@ export function getTradingErrorMessage(error: unknown, fallback: string) {
     return '可用保证金不足';
   }
   if (
+    combined.includes('OPEN_WOULD_LIQUIDATE_IMMEDIATELY') ||
+    combined.includes('立即达到强平条件')
+  ) {
+    return '当前杠杆和成交价会导致开仓后立即强平，请降低杠杆后重试';
+  }
+  if (
     combined.includes('INSUFFICIENT BALANCE') ||
     combined.includes('BALANCE NOT ENOUGH') ||
     combined.includes('AVAILABLE NOT ENOUGH')

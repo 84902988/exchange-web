@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useCallback, useRef, useState } from 'react';
 import {
   Keyboard,
   Modal,
@@ -39,7 +39,14 @@ export default function TradingNumericInput({
 }: Props) {
   const { t } = useLanguage();
   const [keypadVisible, setKeypadVisible] = useState(false);
+  const inputRef = useRef<TextInput>(null);
   const usesNativeTradingKeypad = Platform.OS === 'android';
+
+  const closeKeypad = useCallback(() => {
+    setKeypadVisible(false);
+    inputRef.current?.blur();
+    Keyboard.dismiss();
+  }, []);
 
   const openKeypad = () => {
     if (!editable || !usesNativeTradingKeypad) return;
@@ -51,6 +58,7 @@ export default function TradingNumericInput({
     <>
       <TextInput
         {...inputProps}
+        ref={inputRef}
         accessibilityLabel={accessibilityLabel}
         editable={editable}
         keyboardType="decimal-pad"
@@ -72,7 +80,7 @@ export default function TradingNumericInput({
           animationType="fade"
           statusBarTranslucent
           visible={keypadVisible}
-          onRequestClose={() => setKeypadVisible(false)}
+          onRequestClose={closeKeypad}
         >
           <View
             accessibilityViewIsModal
@@ -81,7 +89,7 @@ export default function TradingNumericInput({
             <Pressable
               accessibilityLabel={t('common.cancel')}
               style={StyleSheet.absoluteFill}
-              onPress={() => setKeypadVisible(false)}
+              onPress={closeKeypad}
             />
             <View style={styles.sheet}>
               <View style={styles.handle} />
@@ -140,7 +148,7 @@ export default function TradingNumericInput({
                   styles.confirm,
                   pressed ? styles.confirmPressed : null,
                 ]}
-                onPress={() => setKeypadVisible(false)}
+                onPress={closeKeypad}
               >
                 <Text style={styles.confirmText}>{t('common.confirm')}</Text>
               </Pressable>

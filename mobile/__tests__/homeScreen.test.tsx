@@ -1,4 +1,5 @@
 import React from 'react';
+import {Linking} from 'react-native';
 import ReactTestRenderer, { act } from 'react-test-renderer';
 import type { MobileContentSnapshot } from '../src/api/mobileContent';
 import type { MarketInstrument } from '../src/api/market';
@@ -12,6 +13,7 @@ const mockUseAssetSnapshot = jest.fn();
 const mockUseMarketFavorites = jest.fn();
 const mockUseMobileHomeData = jest.fn();
 const mockUseMobileMessageUnreadCounts = jest.fn();
+const mockOpenURL = jest.spyOn(Linking, 'openURL').mockResolvedValue(undefined);
 
 jest.mock('@react-navigation/native', () => ({
   useNavigation: () => ({ navigate: mockNavigate }),
@@ -67,6 +69,7 @@ function content(): MobileContentSnapshot {
         { id: 'TRANSFER', title: '划转', description: '账户划转' },
         { id: 'HISTORY', title: '资金流水', description: '查看记录' },
       ],
+      bankPortalUrl: 'https://bank.example.com/portal',
       marketShortcutLimit: 4,
       marketShortcutSymbols: ['BTCUSDT', 'RCBUSDT', 'ETHUSDT', 'NVDAUSDT_PERP'],
     },
@@ -263,8 +266,11 @@ describe('HomeScreen real-data wiring', () => {
     const allAnnouncementsButton = renderer.root.findByProps({
       accessibilityLabel: '公告，查看全部',
     });
-    const inviteButton = renderer.root.findByProps({
-      accessibilityLabel: '邀请好友，邀请与奖励',
+    const depositButton = renderer.root.findByProps({
+      accessibilityLabel: '充值，充值资产',
+    });
+    const bankPortalButton = renderer.root.findByProps({
+      accessibilityLabel: '银行端口，进入专属银行服务',
     });
     const profileButton = renderer.root.findByProps({
       accessibilityLabel: '用户入口',
@@ -274,7 +280,8 @@ describe('HomeScreen real-data wiring', () => {
       marketButton.props.onPress();
       noticeButton.props.onPress();
       allAnnouncementsButton.props.onPress();
-      inviteButton.props.onPress();
+      depositButton.props.onPress();
+      bankPortalButton.props.onPress();
     });
     expect(mockNavigate).toHaveBeenCalledWith('Account');
     expect(mockNavigate).toHaveBeenCalledWith('Markets', {
@@ -285,9 +292,8 @@ describe('HomeScreen real-data wiring', () => {
       title: 'Real notice',
     });
     expect(mockNavigate).toHaveBeenCalledWith('AnnouncementCenter');
-    expect(mockNavigate).toHaveBeenCalledWith('Assets', {
-      section: 'invite',
-    });
+    expect(mockNavigate).toHaveBeenCalledWith('AssetDeposit');
+    expect(mockOpenURL).toHaveBeenCalledWith('https://bank.example.com/portal');
 
     const supportButton = renderer.root.findByProps({
       accessibilityLabel: '客服与帮助中心',
@@ -334,7 +340,7 @@ describe('HomeScreen real-data wiring', () => {
     });
   });
 
-  it('obeys backend-driven section visibility around real service shortcuts', () => {
+  it('renders updated backend quick-entry copy and opens its fixed asset route', () => {
     const configured = content();
     configured.homeConfig = {
       version: 1,
@@ -345,7 +351,14 @@ describe('HomeScreen real-data wiring', () => {
         promos: false,
         announcements: false,
       },
-      quickEntries: [],
+      quickEntries: [
+        {
+          id: 'DEPOSIT',
+          title: 'Deposit',
+          description: 'Updated English description',
+        },
+      ],
+      bankPortalUrl: null,
       marketShortcutLimit: 1,
       marketShortcutSymbols: ['ETHUSDT', 'BTCUSDT', 'RCBUSDT', 'NVDAUSDT_PERP'],
     };
@@ -366,22 +379,23 @@ describe('HomeScreen real-data wiring', () => {
     const renderer = renderHome();
 
     expect(renderer.root.findAllByType(SectionTitle)).toHaveLength(0);
-    const rewardsButton = renderer.root.findByProps({
-      accessibilityLabel: '奖励记录，奖励流水',
+    expect(
+      renderer.root.findAllByProps({
+        accessibilityLabel: '银行端口，进入专属银行服务',
+      }),
+    ).toHaveLength(0);
+    const depositButton = renderer.root.findByProps({
+      accessibilityLabel: 'Deposit，Updated English description',
     });
     const blackCardButton = renderer.root.findByProps({
       accessibilityLabel: 'BlackCard，会员权益',
     });
     act(() => {
+      depositButton.props.onPress();
       blackCardButton.props.onPress();
     });
+    expect(mockNavigate).toHaveBeenCalledWith('AssetDeposit');
     expect(mockNavigate).toHaveBeenCalledWith('BlackCard');
-    act(() => {
-      rewardsButton.props.onPress();
-    });
-    expect(mockNavigate).toHaveBeenCalledWith('AssetHistory', {
-      initialFilter: 'inviteReward',
-    });
 
     act(() => {
       renderer.unmount();

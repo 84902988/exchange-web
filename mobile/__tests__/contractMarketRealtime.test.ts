@@ -549,6 +549,37 @@ describe('ContractMarketRealtimeStore', () => {
     expect(harness.store.getSnapshot().executionRecovering).toBe(true);
   });
 
+  it('renews an unchanged BBO before the previous execution lease expires', () => {
+    const harness = createHarness();
+    harness.store.acquire('screen');
+    harness.open();
+    harness.sendSnapshot(marketPayload({sequence: 0}));
+    harness.sendMarketState(marketPayload({sequence: 1}));
+
+    const firstExpiry = harness.store.getSnapshot().lease?.expiresAtMs;
+    expect(firstExpiry).toBeDefined();
+
+    harness.setNow(10_700);
+    harness.sendMarketState(
+      marketPayload({
+        envelopeTimeMs: 10_700,
+        receivedAtMs: 10_680,
+        sequence: 2,
+      }),
+      10_700,
+    );
+
+    const renewedExpiry = harness.store.getSnapshot().lease?.expiresAtMs;
+    expect(renewedExpiry).toBeDefined();
+    expect(renewedExpiry).toBeGreaterThan(firstExpiry as number);
+
+    harness.setNow((firstExpiry as number) + 1);
+    jest.advanceTimersByTime((firstExpiry as number) - 10_020 + 1);
+
+    expect(harness.store.getSnapshot().lease).not.toBeNull();
+    expect(harness.store.getSnapshot().executionRecovering).toBe(false);
+  });
+
   it('keeps an expired live lease recoverable and resolves an execution wait only after a fresh lease arrives', async () => {
     const harness = createHarness();
     harness.store.acquire('screen');

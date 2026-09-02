@@ -2,6 +2,12 @@ import { createTranslator, type Translator } from '../i18n';
 
 export type InviteRegistrationType = 'user' | 'bd';
 
+export function inferInviteRegistrationType(
+  inviteCode: string,
+): InviteRegistrationType {
+  return inviteCode.trim().toUpperCase().startsWith('BD') ? 'bd' : 'user';
+}
+
 export function buildInviteRegistrationLink(
   webBaseUrl: string,
   inviteCode: string,

@@ -1,6 +1,10 @@
 import React from 'react';
 import { Text } from 'react-native';
 import ReactTestRenderer, { act } from 'react-test-renderer';
+import {
+  clampLeverage,
+  getLeverageMarks,
+} from '../src/components/contract/ContractLeverageSelectorSheet';
 import ContractOrderForm, {
   calculateContractSpreadCost,
   isCompactContractOrderForm,
@@ -65,6 +69,13 @@ describe('ContractOrderForm leverage control', () => {
     expect(isCompactContractOrderForm(411, 1)).toBe(false);
   });
 
+  it('matches the web leverage marks without rendering every integer option', () => {
+    expect(getLeverageMarks(50)).toEqual([1, 30, 50]);
+    expect(getLeverageMarks(200)).toEqual([1, 30, 60, 90, 120, 150, 200]);
+    expect(clampLeverage(201, 200)).toBe(200);
+    expect(clampLeverage(9.9, 200)).toBe(9);
+  });
+
   it('updates the spread cost from the single-side price and quantity', () => {
     expect(calculateContractSpreadCost(0.1, 1)).toBeCloseTo(0.1);
     expect(calculateContractSpreadCost(0.1, 10)).toBeCloseTo(1);
@@ -110,7 +121,7 @@ describe('ContractOrderForm leverage control', () => {
     expect(renderedText()).not.toContain('0.01 USDT');
   });
 
-  it('opens the bounded selector and applies an exact leverage value', () => {
+  it('opens the bounded input and slider, then applies only after confirmation', () => {
     const onLeverageChange = jest.fn();
     act(() => {
       renderer = ReactTestRenderer.create(
@@ -126,12 +137,22 @@ describe('ContractOrderForm leverage control', () => {
       trigger.props.onPress();
     });
 
-    expect(findByAccessibilityLabel(renderer!, '选择 1 倍杠杆').props.accessibilityState)
-      .toMatchObject({selected: true});
+    const slider = findByAccessibilityLabel(renderer!, '调整杠杆');
+    expect(slider.props.accessibilityRole).toBe('adjustable');
+    expect(slider.props.accessibilityValue).toMatchObject({
+      min: 1,
+      max: 3,
+      now: 1,
+    });
     expect(() => findByAccessibilityLabel(renderer!, '选择 4 倍杠杆')).toThrow();
 
     act(() => {
-      findByAccessibilityLabel(renderer!, '选择 3 倍杠杆').props.onPress();
+      findByAccessibilityLabel(renderer!, '输入杠杆倍数').props.onChangeText('3');
+    });
+    expect(onLeverageChange).not.toHaveBeenCalled();
+
+    act(() => {
+      findByAccessibilityLabel(renderer!, '确认 3 倍杠杆').props.onPress();
     });
     expect(onLeverageChange).toHaveBeenCalledTimes(1);
     expect(onLeverageChange).toHaveBeenCalledWith(3);
@@ -197,6 +218,21 @@ describe('ContractOrderForm leverage control', () => {
     expect(
       findByAccessibilityLabel(renderer!, '提交买单').props.accessibilityState,
     ).toMatchObject({ busy: false, disabled: false });
+  });
+
+  it('exposes the active percent sizing choice', () => {
+    act(() => {
+      renderer = ReactTestRenderer.create(
+        <ContractOrderForm {...createProps({ selectedPercent: 25 })} />,
+      );
+    });
+
+    expect(
+      findByAccessibilityLabel(renderer!, '使用 25%').props.accessibilityState,
+    ).toMatchObject({ selected: true });
+    expect(
+      findByAccessibilityLabel(renderer!, '使用 50%').props.accessibilityState,
+    ).toMatchObject({ selected: false });
   });
 
   it('keeps the submit action disabled until both price and quantity are valid', () => {

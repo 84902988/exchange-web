@@ -105,6 +105,7 @@ export type MobileHomeConfig = {
     announcements: boolean;
   };
   quickEntries: MobileHomeQuickEntry[];
+  bankPortalUrl: string | null;
   marketShortcutLimit: number;
   marketShortcutSymbols: string[];
 };
@@ -806,6 +807,7 @@ function createLegacyMobileHomeConfig(): MobileHomeConfig {
       { id: 'TRANSFER', title: '划转', description: '账户划转' },
       { id: 'HISTORY', title: '资金流水', description: '查看记录' },
     ],
+    bankPortalUrl: null,
     marketShortcutLimit: 4,
     marketShortcutSymbols: [...DEFAULT_MOBILE_HOME_MARKET_SHORTCUT_SYMBOLS],
   };
@@ -892,6 +894,10 @@ function normalizeRequiredMobileHomeConfig(value: unknown): MobileHomeConfig {
       ),
     };
   });
+  const bankPortalUrl = normalizeOptionalBankPortalUrl(
+    record.bank_portal_url,
+    `${label}.bank_portal_url`,
+  );
 
   return {
     version: MOBILE_HOME_CONFIG_VERSION,
@@ -903,9 +909,40 @@ function normalizeRequiredMobileHomeConfig(value: unknown): MobileHomeConfig {
       announcements: sections.announcements as boolean,
     },
     quickEntries,
+    bankPortalUrl,
     marketShortcutLimit,
     marketShortcutSymbols,
   };
+}
+
+function normalizeOptionalBankPortalUrl(value: unknown, label: string) {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value !== 'string') {
+    throw new MobileContentContractError(`${label} is invalid`);
+  }
+  const candidate = value.trim();
+  if (
+    !candidate ||
+    candidate.length > 500 ||
+    /\s/.test(candidate)
+  ) {
+    throw new MobileContentContractError(`${label} is invalid`);
+  }
+  let url: URL;
+  try {
+    url = new URL(candidate);
+  } catch {
+    throw new MobileContentContractError(`${label} is invalid`);
+  }
+  if (
+    url.protocol !== 'https:' ||
+    !url.hostname ||
+    url.username ||
+    url.password
+  ) {
+    throw new MobileContentContractError(`${label} is invalid`);
+  }
+  return url.toString();
 }
 
 function normalizeHero(

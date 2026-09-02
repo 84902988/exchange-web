@@ -1280,6 +1280,101 @@ describe('ContractScreen execution confirmation lifecycle', () => {
     expect(mockOrderFormProps?.markPrice).toBe(101);
   });
 
+  it('replays a BBO request after a renewal gap and resizes an active percent draft', async () => {
+    mockContractMarketState = {
+      ...executableMarketState(),
+      lease: null,
+      executionRecovering: true,
+      executionGeneration: 2,
+    };
+    await act(async () => {
+      renderer = ReactTestRenderer.create(<ContractScreen />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      mockOrderFormProps?.onPriceChange('1');
+    });
+    await act(async () => {
+      mockOrderFormProps?.onPercentPress(25);
+    });
+    expect(mockOrderFormProps?.price).toBe('1');
+    expect(mockOrderFormProps?.quantity).toBe('25000');
+    expect(mockOrderFormProps?.selectedPercent).toBe(25);
+
+    await act(async () => {
+      mockOrderFormProps?.onBboPress();
+    });
+    expect(mockOrderFormProps?.price).toBe('1');
+    expect(mockOrderFormProps?.feedbackText).toBe('实时重连中 · 保留最近数据');
+
+    mockContractMarketState = {
+      ...executableMarketState(),
+      executionGeneration: 3,
+    };
+    await act(async () => {
+      renderer?.update(<ContractScreen />);
+      await Promise.resolve();
+    });
+
+    expect(mockOrderFormProps?.price).toBe('101');
+    expect(mockOrderFormProps?.quantity).toBe('247.524752');
+    expect(mockOrderFormProps?.selectedPercent).toBe(25);
+    expect(mockOrderFormProps?.feedbackText).toBe('');
+  });
+
+  it('cancels a queued BBO fill after a manual price edit', async () => {
+    mockContractMarketState = {
+      ...executableMarketState(),
+      lease: null,
+      executionRecovering: true,
+      executionGeneration: 2,
+    };
+    await act(async () => {
+      renderer = ReactTestRenderer.create(<ContractScreen />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      mockOrderFormProps?.onPriceChange('1');
+      mockOrderFormProps?.onBboPress();
+    });
+    await act(async () => {
+      mockOrderFormProps?.onPriceChange('2');
+    });
+
+    mockContractMarketState = {
+      ...executableMarketState(),
+      executionGeneration: 3,
+    };
+    await act(async () => {
+      renderer?.update(<ContractScreen />);
+      await Promise.resolve();
+    });
+
+    expect(mockOrderFormProps?.price).toBe('2');
+  });
+
+  it('stops percent resizing after the user manually edits quantity', async () => {
+    renderer = await renderReadyContractScreen();
+
+    await act(async () => {
+      mockOrderFormProps?.onPercentPress(25);
+    });
+    expect(mockOrderFormProps?.quantity).toBe('247.524752');
+    expect(mockOrderFormProps?.selectedPercent).toBe(25);
+
+    await act(async () => {
+      mockOrderFormProps?.onQuantityChange('3');
+      mockOrderFormProps?.onPriceChange('202');
+    });
+
+    expect(mockOrderFormProps?.quantity).toBe('3');
+    expect(mockOrderFormProps?.selectedPercent).toBeNull();
+  });
+
   it('shows a nonblocking fallback notice when private realtime is reconnecting', async () => {
     mockPrivateRealtimeStatus = 'reconnecting';
     renderer = await renderReadyContractScreen();

@@ -1,16 +1,13 @@
 import Foundation
-import React
 
 @objc(AppConfig)
-final class AppConfig: NSObject, RCTBridgeModule {
-  static func moduleName() -> String! {
-    "AppConfig"
-  }
-
+final class AppConfig: NSObject {
+  @objc
   static func requiresMainQueueSetup() -> Bool {
     false
   }
 
+  @objc
   func constantsToExport() -> [AnyHashable: Any]! {
     let info = Bundle.main.infoDictionary ?? [:]
     return [

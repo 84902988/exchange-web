@@ -25,6 +25,7 @@ type Props = {
   orderType: ContractOrderType;
   price: string;
   quantity: string;
+  selectedPercent?: number | null;
   leverage: number;
   maxLeverage: number | null;
   availableMargin: number | null;
@@ -64,6 +65,7 @@ function ContractOrderForm({
   orderType,
   price,
   quantity,
+  selectedPercent = null,
   leverage,
   maxLeverage,
   availableMargin,
@@ -377,18 +379,30 @@ function ContractOrderForm({
                 percent: step,
               })}
               accessibilityRole="button"
-              accessibilityState={{ disabled: submitting }}
+              accessibilityState={{
+                disabled: submitting,
+                selected: selectedPercent === step,
+              }}
               android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
               disabled={submitting}
               hitSlop={{ top: 11, bottom: 11 }}
               key={step}
               style={({ pressed }) => [
                 styles.percent,
+                selectedPercent === step ? styles.percentSelected : null,
                 pressed ? styles.pressed : null,
               ]}
               onPress={() => onPercentPress(step)}
             >
-              <Text maxFontSizeMultiplier={1.15} style={styles.percentText}>
+              <Text
+                maxFontSizeMultiplier={1.15}
+                style={[
+                  styles.percentText,
+                  selectedPercent === step
+                    ? styles.percentTextSelected
+                    : null,
+                ]}
+              >
                 {step}%
               </Text>
             </Pressable>
@@ -481,9 +495,10 @@ function ContractOrderForm({
       <ContractLeverageSelectorSheet
         leverage={leverage}
         maxLeverage={maxLeverage}
+        symbol={`${baseAsset}${quoteAsset}`}
         visible={leverageSelectorVisible}
         onClose={() => setLeverageSelectorVisible(false)}
-        onSelect={nextLeverage => {
+        onConfirm={nextLeverage => {
           onLeverageChange(nextLeverage);
           setLeverageSelectorVisible(false);
         }}
@@ -849,11 +864,19 @@ const styles = StyleSheet.create({
     borderRadius: 5,
     backgroundColor: colors.cardAlt,
   },
+  percentSelected: {
+    borderWidth: 1,
+    borderColor: 'rgba(214,168,50,0.42)',
+    backgroundColor: colors.primarySoft,
+  },
   percentText: {
     ...typography.number,
     color: colors.textMuted,
     fontSize: 10,
     fontWeight: '700',
+  },
+  percentTextSelected: {
+    color: colors.gold,
   },
   metrics: {
     minHeight: 92,

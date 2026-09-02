@@ -67,6 +67,7 @@ function snapshot(revision: string): MobileContentSnapshot {
         announcements: true,
       },
       quickEntries: [],
+      bankPortalUrl: null,
       marketShortcutLimit: 4,
       marketShortcutSymbols: ['BTCUSDT', 'RCBUSDT', 'ETHUSDT', 'NVDAUSDT_PERP'],
     },
@@ -131,6 +132,11 @@ describe('useMobileHomeData', () => {
       renderer = ReactTestRenderer.create(<Probe />);
     });
     const cleanup = await startFocus();
+
+    expect(mockLoadMobileContentBootstrap).toHaveBeenCalledWith({
+      force: true,
+      locale: 'zh-CN',
+    });
 
     await act(async () => {
       contentRequest.resolve({

@@ -20,6 +20,7 @@ import type {
 import { useLanguage } from '../../i18n';
 import { useAuth } from '../../store/authStore';
 import { colors, typography } from '../../theme';
+import { inferInviteRegistrationType } from '../../utils/inviteLink';
 
 type Props = NativeStackScreenProps<AuthStackParamList, 'Register'>;
 
@@ -88,7 +89,10 @@ export default function RegisterScreen({ navigation }: Props) {
         otp: normalizedOtp,
         password,
         ...(normalizedInviteCode
-          ? { invite_code: normalizedInviteCode, invite_type: 'user' as const }
+          ? {
+              invite_code: normalizedInviteCode,
+              invite_type: inferInviteRegistrationType(normalizedInviteCode),
+            }
           : {}),
       });
       if (mountedRef.current) navigation.getParent()?.goBack();

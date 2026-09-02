@@ -55,7 +55,7 @@ export function useMobileHomeData(locale = defaultLocale) {
       });
 
       Promise.resolve()
-        .then(() => loadMobileContentBootstrap({locale}))
+        .then(() => loadMobileContentBootstrap({force: true, locale}))
         .then(result => {
           if (!active || generation !== generationRef.current) {
             return;

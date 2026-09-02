@@ -6,6 +6,12 @@ import {
   appShellZhTW,
 } from './appShellCatalog';
 import {
+  blackCardEn,
+  blackCardJa,
+  blackCardZhCN,
+  blackCardZhTW,
+} from './blackCardCatalog';
+import {
   assetActionEn,
   assetActionJa,
   assetActionZhCN,
@@ -55,6 +61,7 @@ export const defaultLocale: MobileLocale = 'zh-CN';
 
 const zhCN = {
   ...appShellZhCN,
+  ...blackCardZhCN,
   'common.a11ySeparator': '，',
   'common.back': '返回',
   'common.viewDetails': '查看详情',
@@ -109,7 +116,7 @@ const zhCN = {
   'auth.acceptLegalError': '请先阅读并同意用户协议与隐私政策',
   'auth.invalidInvite': '邀请码格式不正确',
   'auth.registerFailed': '注册失败，请稍后重试',
-  'auth.inviteOptional': '好友邀请码（选填，仅用于普通邀请）',
+  'auth.inviteOptional': '邀请码（选填，支持好友或 BD 邀请）',
   'auth.acceptLegalA11y': '同意用户协议与隐私政策',
   'auth.legalPrefix': '我已阅读并同意',
   'auth.terms': '《用户协议》',
@@ -206,6 +213,11 @@ const zhCN = {
   'home.activityCenter': '活动中心',
   'home.activityCenterDescription': '查看全部活动、奖励与参与规则',
   'home.activityCenterA11y': '活动中心，查看全部活动与奖励规则',
+  'home.bankPortal': '银行端口',
+  'home.bankPortalDescription': '进入专属银行服务',
+  'home.bankPortalA11y': '银行端口，进入专属银行服务',
+  'home.bankPortalOpenFailedTitle': '无法打开银行端口',
+  'home.bankPortalOpenFailedDescription': '请稍后重试或联系平台客服。',
   'home.about': '关于 Exchange',
   'home.aboutDescription': '了解平台故事、愿景与价值观',
   'home.aboutA11y': '关于平台，了解 Exchange',
@@ -720,6 +732,7 @@ export const translationKeys = Object.freeze(
 
 const zhTW: Record<TranslationKey, string> = {
   ...appShellZhTW,
+  ...blackCardZhTW,
   'common.a11ySeparator': '，',
   'common.back': '返回',
   'common.viewDetails': '查看詳情',
@@ -774,7 +787,7 @@ const zhTW: Record<TranslationKey, string> = {
   'auth.acceptLegalError': '請先閱讀並同意使用者協議與隱私政策',
   'auth.invalidInvite': '邀請碼格式不正確',
   'auth.registerFailed': '註冊失敗，請稍後再試',
-  'auth.inviteOptional': '好友邀請碼（選填，僅用於一般邀請）',
+  'auth.inviteOptional': '邀請碼（選填，支援好友或 BD 邀請）',
   'auth.acceptLegalA11y': '同意使用者協議與隱私政策',
   'auth.legalPrefix': '我已閱讀並同意',
   'auth.terms': '《使用者協議》',
@@ -871,6 +884,11 @@ const zhTW: Record<TranslationKey, string> = {
   'home.activityCenter': '活動中心',
   'home.activityCenterDescription': '查看全部活動、獎勵與參與規則',
   'home.activityCenterA11y': '活動中心，查看全部活動與獎勵規則',
+  'home.bankPortal': '銀行端口',
+  'home.bankPortalDescription': '進入專屬銀行服務',
+  'home.bankPortalA11y': '銀行端口，進入專屬銀行服務',
+  'home.bankPortalOpenFailedTitle': '無法開啟銀行端口',
+  'home.bankPortalOpenFailedDescription': '請稍後重試或聯絡平台客服。',
   'home.about': '關於 Exchange',
   'home.aboutDescription': '了解平台故事、願景與價值觀',
   'home.aboutA11y': '關於平台，了解 Exchange',
@@ -1380,6 +1398,7 @@ const zhTW: Record<TranslationKey, string> = {
 
 const en: Record<TranslationKey, string> = {
   ...appShellEn,
+  ...blackCardEn,
   'common.a11ySeparator': ', ',
   'common.back': 'Back',
   'common.viewDetails': 'View details',
@@ -1434,7 +1453,7 @@ const en: Record<TranslationKey, string> = {
   'auth.acceptLegalError': 'Read and accept the User Agreement and Privacy Policy first',
   'auth.invalidInvite': 'Invalid invitation code',
   'auth.registerFailed': 'Registration failed. Please try again later.',
-  'auth.inviteOptional': 'Friend invite code (optional, regular invites only)',
+  'auth.inviteOptional': 'Invite code (optional, friend or BD invite)',
   'auth.acceptLegalA11y': 'Accept the User Agreement and Privacy Policy',
   'auth.legalPrefix': 'I have read and agree to the ',
   'auth.terms': 'User Agreement',
@@ -1531,6 +1550,11 @@ const en: Record<TranslationKey, string> = {
   'home.activityCenter': 'Campaign Center',
   'home.activityCenterDescription': 'View all campaigns, rewards and participation rules',
   'home.activityCenterA11y': 'Campaign Center, view all campaigns and reward rules',
+  'home.bankPortal': 'Bank Portal',
+  'home.bankPortalDescription': 'Open dedicated banking services',
+  'home.bankPortalA11y': 'Bank Portal, open dedicated banking services',
+  'home.bankPortalOpenFailedTitle': 'Unable to open Bank Portal',
+  'home.bankPortalOpenFailedDescription': 'Please try again later or contact support.',
   'home.about': 'About Exchange',
   'home.aboutDescription': 'Learn about our story, vision and values',
   'home.aboutA11y': 'About Exchange',
@@ -2040,6 +2064,7 @@ const en: Record<TranslationKey, string> = {
 
 const ja: Record<TranslationKey, string> = {
   ...appShellJa,
+  ...blackCardJa,
   'common.a11ySeparator': '、',
   'common.back': '戻る',
   'common.viewDetails': '詳細を見る',
@@ -2094,7 +2119,7 @@ const ja: Record<TranslationKey, string> = {
   'auth.acceptLegalError': 'ユーザー契約とプライバシーポリシーを確認して同意してください',
   'auth.invalidInvite': '招待コードの形式が正しくありません',
   'auth.registerFailed': '登録できませんでした。しばらくしてから再試行してください。',
-  'auth.inviteOptional': '友達招待コード（任意・通常招待のみ）',
+  'auth.inviteOptional': '招待コード（任意・友達またはBD招待）',
   'auth.acceptLegalA11y': 'ユーザー契約とプライバシーポリシーに同意',
   'auth.legalPrefix': '確認して同意します：',
   'auth.terms': 'ユーザー契約',
@@ -2191,6 +2216,11 @@ const ja: Record<TranslationKey, string> = {
   'home.activityCenter': 'キャンペーンセンター',
   'home.activityCenterDescription': 'キャンペーン、報酬、参加条件をすべて確認',
   'home.activityCenterA11y': 'キャンペーンセンター、キャンペーンと報酬条件をすべて確認',
+  'home.bankPortal': 'バンクポータル',
+  'home.bankPortalDescription': '専用バンキングサービスを開く',
+  'home.bankPortalA11y': 'バンクポータル、専用バンキングサービスを開く',
+  'home.bankPortalOpenFailedTitle': 'バンクポータルを開けません',
+  'home.bankPortalOpenFailedDescription': '後でもう一度お試しいただくか、サポートへお問い合わせください。',
   'home.about': 'Exchangeについて',
   'home.aboutDescription': 'プラットフォームの歩み、ビジョン、価値観をご紹介します',
   'home.aboutA11y': 'Exchangeについて',

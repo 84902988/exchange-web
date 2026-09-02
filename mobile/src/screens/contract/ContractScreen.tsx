@@ -162,6 +162,63 @@ type PendingReconciliationSnapshot = {
   updatedAtMs: number;
 };
 
+type ContractQuantitySizingSnapshot = {
+  actionMode: ContractActionMode;
+  availableMargin: number | null;
+  direction: ContractDirection;
+  executionReferencePrice: number | null;
+  leverage: number;
+  orderType: ContractOrderType;
+  positions: ContractPositionItem[];
+  price: string;
+  quantityPrecision: number;
+};
+
+function resolveContractPercentQuantity(
+  sizing: ContractQuantitySizingSnapshot,
+  percent: number,
+) {
+  if (!Number.isFinite(percent) || percent <= 0 || percent > 100) return '';
+
+  if (sizing.actionMode === 'CLOSE') {
+    const totalQuantity = sizing.positions
+      .filter(item => item.side === sizing.direction)
+      .reduce((sum, item) => {
+        const value = Number(item.quantity.replace(/,/g, ''));
+        return Number.isFinite(value) && value > 0 ? sum + value : sum;
+      }, 0);
+    return totalQuantity > 0
+      ? formatOrderDecimal(
+          (totalQuantity * percent) / 100,
+          sizing.quantityPrecision,
+        )
+      : '';
+  }
+
+  const referencePrice =
+    sizing.orderType === 'MARKET'
+      ? sizing.executionReferencePrice
+      : Number(sizing.price.replace(/,/g, ''));
+  if (
+    sizing.availableMargin === null ||
+    !Number.isFinite(sizing.availableMargin) ||
+    sizing.availableMargin <= 0 ||
+    referencePrice === null ||
+    !Number.isFinite(referencePrice) ||
+    referencePrice <= 0 ||
+    !Number.isFinite(sizing.leverage) ||
+    sizing.leverage <= 0
+  ) {
+    return '';
+  }
+  const notional =
+    (sizing.availableMargin * percent * sizing.leverage) / 100;
+  return formatOrderDecimal(
+    notional / referencePrice,
+    sizing.quantityPrecision,
+  );
+}
+
 function clampContractLeverage(value: number, maxLeverage: number) {
   const safeMax =
     Number.isSafeInteger(maxLeverage) && maxLeverage >= CONTRACT_MIN_LEVERAGE
@@ -312,6 +369,7 @@ export default function ContractScreen() {
   const [orderType, setOrderType] = useState<ContractOrderType>('LIMIT');
   const [price, setPrice] = useState('');
   const [quantity, setQuantity] = useState('');
+  const [quantityPercent, setQuantityPercent] = useState<number | null>(null);
   const [positionCloseRequest, setPositionCloseRequest] =
     useState<ContractPositionCloseRequest | null>(null);
   const [leverage, setLeverage] = useState(CONTRACT_MIN_LEVERAGE);
@@ -455,6 +513,12 @@ export default function ContractScreen() {
   } | null>(null);
   const marketScreenActiveRef = useRef(false);
   const executionLifecycleGenerationRef = useRef(0);
+  const pendingBboFillRef = useRef<{
+    instrumentKey: string;
+    actionMode: ContractActionMode;
+    direction: ContractDirection;
+    orderType: ContractOrderType;
+  } | null>(null);
   const klineIntervalTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
@@ -501,8 +565,10 @@ export default function ContractScreen() {
       klineIntervalTimerRef.current = null;
     }
     pendingKlineIntervalRef.current = null;
+    pendingBboFillRef.current = null;
     setPrice('');
     setQuantity('');
+    setQuantityPercent(null);
     setLeverage(CONTRACT_MIN_LEVERAGE);
     setSymbolRules(null);
     setAccount(null);
@@ -766,10 +832,60 @@ export default function ContractScreen() {
     quantityPrecision,
   };
 
+  useEffect(() => {
+    if (quantityPercent === null) return;
+    const nextQuantity = resolveContractPercentQuantity(
+      orderSizingRef.current,
+      quantityPercent,
+    );
+    setQuantity(currentQuantity =>
+      currentQuantity === nextQuantity ? currentQuantity : nextQuantity,
+    );
+  }, [
+    actionMode,
+    availableMargin,
+    direction,
+    executionReferencePrice,
+    leverage,
+    orderType,
+    positions,
+    price,
+    quantityPercent,
+    quantityPrecision,
+  ]);
+
+  useEffect(() => {
+    const pendingBboFill = pendingBboFillRef.current;
+    if (!pendingBboFill) return;
+    if (
+      pendingBboFill.instrumentKey !== instrumentKey ||
+      pendingBboFill.actionMode !== actionMode ||
+      pendingBboFill.direction !== direction ||
+      pendingBboFill.orderType !== orderType
+    ) {
+      pendingBboFillRef.current = null;
+      return;
+    }
+    if (executionReferencePrice === null) return;
+
+    pendingBboFillRef.current = null;
+    setPrice(formatOrderDecimal(executionReferencePrice, pricePrecision));
+    setFeedbackText('');
+    setFeedbackTone(null);
+  }, [
+    actionMode,
+    direction,
+    executionReferencePrice,
+    instrumentKey,
+    orderType,
+    pricePrecision,
+  ]);
+
   useLayoutEffect(() => {
     marketScreenActiveRef.current = marketScreenActive;
     if (!marketScreenActive) {
       executionAuthorityRef.current = unavailableExecutionAuthority();
+      pendingBboFillRef.current = null;
     }
     return () => {
       marketScreenActiveRef.current = false;
@@ -2788,7 +2904,11 @@ export default function ContractScreen() {
 
   const handleActionModeChange = useCallback(
     (nextMode: ContractActionMode) => {
+      if (nextMode === actionMode) return;
       clearFeedback();
+      pendingBboFillRef.current = null;
+      setQuantityPercent(null);
+      setQuantity('');
       setActionMode(currentMode => {
         if (currentMode !== nextMode) {
           setDirection(currentDirection =>
@@ -2798,28 +2918,35 @@ export default function ContractScreen() {
         return nextMode;
       });
     },
-    [clearFeedback],
+    [actionMode, clearFeedback],
   );
 
   const handleDirectionChange = useCallback(
     (nextDirection: ContractDirection) => {
+      if (nextDirection === direction) return;
       clearFeedback();
+      pendingBboFillRef.current = null;
+      setQuantityPercent(null);
+      setQuantity('');
       setDirection(nextDirection);
     },
-    [clearFeedback],
+    [clearFeedback, direction],
   );
 
   const handleOrderTypeChange = useCallback(
     (nextOrderType: ContractOrderType) => {
+      if (nextOrderType === orderType) return;
       clearFeedback();
+      pendingBboFillRef.current = null;
       setOrderType(nextOrderType);
     },
-    [clearFeedback],
+    [clearFeedback, orderType],
   );
 
   const handlePriceChange = useCallback(
     (nextPrice: string) => {
       clearFeedback();
+      pendingBboFillRef.current = null;
       setPrice(nextPrice);
     },
     [clearFeedback],
@@ -2828,6 +2955,7 @@ export default function ContractScreen() {
   const handleQuantityChange = useCallback(
     (nextQuantity: string) => {
       clearFeedback();
+      setQuantityPercent(null);
       setQuantity(nextQuantity);
     },
     [clearFeedback],
@@ -2880,49 +3008,29 @@ export default function ContractScreen() {
     const currentSizing = orderSizingRef.current;
     const currentReferencePrice = currentSizing.executionReferencePrice;
     if (currentReferencePrice !== null) {
+      pendingBboFillRef.current = null;
       setPrice(
         formatOrderDecimal(currentReferencePrice, currentSizing.pricePrecision),
       );
+      return;
     }
-  }, [clearFeedback]);
+
+    pendingBboFillRef.current = {
+      instrumentKey,
+      actionMode: currentSizing.actionMode,
+      direction: currentSizing.direction,
+      orderType: currentSizing.orderType,
+    };
+    setFeedbackText(tRef.current('contract.realtimeReconnect'));
+    setFeedbackTone(null);
+  }, [clearFeedback, instrumentKey]);
 
   const handlePercentPress = useCallback(
     (percent: number) => {
       clearFeedback();
       const currentSizing = orderSizingRef.current;
-      if (currentSizing.actionMode === 'CLOSE') {
-        const matched = currentSizing.positions.filter(
-          item => item.side === currentSizing.direction,
-        );
-        const totalQuantity = matched.reduce((sum, item) => {
-          const value = Number(item.quantity);
-          return Number.isFinite(value) ? sum + value : sum;
-        }, 0);
-        if (totalQuantity > 0) {
-          setQuantity(
-            formatOrderDecimal(
-              (totalQuantity * percent) / 100,
-              currentSizing.quantityPrecision,
-            ),
-          );
-        }
-        return;
-      }
-
-      const referencePrice =
-        currentSizing.orderType === 'MARKET'
-          ? currentSizing.executionReferencePrice
-          : Number(currentSizing.price.replace(/,/g, ''));
-      if (!currentSizing.availableMargin || !referencePrice) return;
-      const notional =
-        (currentSizing.availableMargin * percent * currentSizing.leverage) /
-        100;
-      setQuantity(
-        formatOrderDecimal(
-          notional / referencePrice,
-          currentSizing.quantityPrecision,
-        ),
-      );
+      setQuantityPercent(percent);
+      setQuantity(resolveContractPercentQuantity(currentSizing, percent));
     },
     [clearFeedback],
   );
@@ -4064,6 +4172,7 @@ export default function ContractScreen() {
             price={price}
             pricePrecision={pricePrecision}
             quantity={quantity}
+            selectedPercent={quantityPercent}
             quoteAsset={quoteAsset}
             spreadFeePrice={quote?.spreadFeePrice}
             submitDisabled={

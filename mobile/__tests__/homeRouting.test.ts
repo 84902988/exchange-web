@@ -1,6 +1,7 @@
 import type { MobileContentAction } from '../src/api/mobileContent';
 import type { MarketInstrument } from '../src/api/market';
 import {
+  createConfiguredHomeQuickEntries,
   createLoggedInServiceEntries,
   navigateHomeMarket,
   navigateMobileContentAction,
@@ -46,7 +47,35 @@ describe('Home navigation mapping', () => {
     },
   );
 
-  it('maps the logged-in service shortcuts to implemented routes', () => {
+  it('preserves configured asset shortcut copy and maps fixed routes', () => {
+    const target = navigation();
+    const entries = createConfiguredHomeQuickEntries(target, [
+      {id: 'DEPOSIT', title: 'Deposit', description: 'Deposit assets'},
+      {id: 'WITHDRAW', title: 'Withdraw', description: 'Withdraw assets'},
+      {id: 'TRANSFER', title: 'Transfer', description: 'Account transfer'},
+      {id: 'HISTORY', title: 'History', description: 'View records'},
+    ]);
+
+    expect(entries.map(item => item.id)).toEqual([
+      'DEPOSIT',
+      'WITHDRAW',
+      'TRANSFER',
+      'HISTORY',
+    ]);
+    expect(entries.map(item => [item.title, item.description])).toEqual([
+      ['Deposit', 'Deposit assets'],
+      ['Withdraw', 'Withdraw assets'],
+      ['Transfer', 'Account transfer'],
+      ['History', 'View records'],
+    ]);
+    entries.forEach(item => item.onPress());
+    expect(target.navigate).toHaveBeenNthCalledWith(1, 'AssetDeposit');
+    expect(target.navigate).toHaveBeenNthCalledWith(2, 'AssetWithdraw');
+    expect(target.navigate).toHaveBeenNthCalledWith(3, 'AssetTransfer');
+    expect(target.navigate).toHaveBeenNthCalledWith(4, 'AssetHistory');
+  });
+
+  it('keeps the logged-in member services reachable beside asset shortcuts', () => {
     const target = navigation();
     const entries = createLoggedInServiceEntries(target);
 

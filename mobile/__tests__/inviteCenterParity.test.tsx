@@ -8,7 +8,10 @@ import AssetInviteCommissionRecords, {
 import AssetInviteSummary, {
   buildInviteShareMessage,
 } from '../src/components/assets/AssetInviteSummary';
-import { buildInviteRegistrationLink } from '../src/utils/inviteLink';
+import {
+  buildInviteRegistrationLink,
+  inferInviteRegistrationType,
+} from '../src/utils/inviteLink';
 
 const payload = {
   invite_code: 'INVITE88',
@@ -51,6 +54,13 @@ describe('mobile invite center parity', () => {
     expect(buildInviteRegistrationLink('invalid', 'INVITE88', 'user')).toBe(
       '',
     );
+  });
+
+  it('infers backend-compatible attribution for manually entered invite codes', () => {
+    expect(inferInviteRegistrationType(' BD100000029 ')).toBe('bd');
+    expect(inferInviteRegistrationType('bd42_suffix')).toBe('bd');
+    expect(inferInviteRegistrationType('U29')).toBe('user');
+    expect(inferInviteRegistrationType('Invite_2026')).toBe('user');
   });
 
   it('normalizes authoritative percentage and recent reward records', () => {

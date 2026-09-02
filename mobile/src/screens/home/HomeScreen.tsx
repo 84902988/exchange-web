@@ -1,16 +1,27 @@
 import React, { useCallback, useEffect, useMemo } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import {Alert, Linking, StyleSheet, Text, View} from 'react-native';
 import {
   useNavigation,
   type CompositeNavigationProp,
 } from '@react-navigation/native';
 import type { BottomTabNavigationProp } from '@react-navigation/bottom-tabs';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
-import { CreditCard, Crown, Gift, Handshake, UserPlus } from 'lucide-react-native';
+import {
+  ArrowDownToLine,
+  ArrowRightLeft,
+  ArrowUpFromLine,
+  CreditCard,
+  Crown,
+  Gift,
+  Handshake,
+  ReceiptText,
+  UserPlus,
+} from 'lucide-react-native';
 import type {
   MobileAnnouncementSummary,
   MobileContentAction,
   MobileContentSnapshot,
+  MobileHomeQuickEntry,
 } from '../../api/mobileContent';
 import { getOverviewMarkets, type MarketInstrument } from '../../api/market';
 import AppScreen from '../../components/common/AppScreen';
@@ -18,6 +29,7 @@ import SectionTitle from '../../components/common/SectionTitle';
 import AssetSummary from '../../components/home/AssetSummary';
 import HomeAboutEntry from '../../components/home/HomeAboutEntry';
 import HomeActivityEntry from '../../components/home/HomeActivityEntry';
+import HomeBankPortalEntry from '../../components/home/HomeBankPortalEntry';
 import HeroBanner from '../../components/home/HeroBanner';
 import HomeNewsFeed from '../../components/home/HomeNewsFeed';
 import HomeNoticeService from '../../components/home/HomeNoticeService';
@@ -80,6 +92,14 @@ export default function HomeScreen() {
         content?.homeConfig.marketShortcutSymbols,
       ),
     [content?.homeConfig.marketShortcutSymbols, visibleMarkets],
+  );
+  const assetEntries = useMemo(
+    () =>
+      createConfiguredHomeQuickEntries(
+        navigation,
+        content?.homeConfig.quickEntries ?? [],
+      ),
+    [content?.homeConfig.quickEntries, navigation],
   );
   const memberEntries = useMemo(
     () => createLoggedInServiceEntries(navigation, t),
@@ -152,6 +172,16 @@ export default function HomeScreen() {
   const openActivityCenter = useCallback(() => {
     navigation.navigate('ActivityCenter');
   }, [navigation]);
+  const openBankPortal = useCallback(() => {
+    const url = content?.homeConfig.bankPortalUrl;
+    if (!url) return;
+    Linking.openURL(url).catch(() => {
+      Alert.alert(
+        t('home.bankPortalOpenFailedTitle'),
+        t('home.bankPortalOpenFailedDescription'),
+      );
+    });
+  }, [content?.homeConfig.bankPortalUrl, t]);
   const openAboutPage = useCallback(() => {
     navigation.navigate('AboutPage');
   }, [navigation]);
@@ -198,7 +228,9 @@ export default function HomeScreen() {
           onActivityCenter={openActivityCenter}
           onAnnouncement={openAnnouncement}
           onAnnouncementCenter={openAnnouncementCenter}
+          onBankPortal={openBankPortal}
           onMarket={openMarket}
+          assetEntries={assetEntries}
           memberEntries={memberEntries}
         />
       ) : (
@@ -210,6 +242,7 @@ export default function HomeScreen() {
           onActivityCenter={openActivityCenter}
           onAnnouncement={openAnnouncement}
           onAnnouncementCenter={openAnnouncementCenter}
+          onBankPortal={openBankPortal}
           onLogin={openLogin}
           onMarket={openMarket}
           onRegister={openRegister}
@@ -256,6 +289,40 @@ export function navigateHomeMarket(
     return;
   }
   navigation.navigate('Markets', { category: item.category });
+}
+
+export function createConfiguredHomeQuickEntries(
+  navigation: HomeNavigation,
+  entries: readonly MobileHomeQuickEntry[],
+): QuickEntryItem[] {
+  return entries.map(entry => {
+    switch (entry.id) {
+      case 'DEPOSIT':
+        return {
+          ...entry,
+          Icon: ArrowDownToLine,
+          onPress: () => navigation.navigate('AssetDeposit'),
+        };
+      case 'WITHDRAW':
+        return {
+          ...entry,
+          Icon: ArrowUpFromLine,
+          onPress: () => navigation.navigate('AssetWithdraw'),
+        };
+      case 'TRANSFER':
+        return {
+          ...entry,
+          Icon: ArrowRightLeft,
+          onPress: () => navigation.navigate('AssetTransfer'),
+        };
+      case 'HISTORY':
+        return {
+          ...entry,
+          Icon: ReceiptText,
+          onPress: () => navigation.navigate('AssetHistory'),
+        };
+    }
+  });
 }
 
 export function createLoggedInServiceEntries(
@@ -320,6 +387,7 @@ type HomeContentProps = {
   onActivityCenter: () => void;
   onAnnouncement: (announcement: MobileAnnouncementSummary) => void;
   onAnnouncementCenter: () => void;
+  onBankPortal: () => void;
   onMarket: (item: MarketInstrument) => void;
 };
 
@@ -331,6 +399,7 @@ function GuestHome({
   onActivityCenter,
   onAnnouncement,
   onAnnouncementCenter,
+  onBankPortal,
   onLogin,
   onMarket,
   onRegister,
@@ -351,6 +420,9 @@ function GuestHome({
         siteName={content?.site.displayName}
       />
       <HomeActivityEntry onPress={onActivityCenter} />
+      {content?.homeConfig.bankPortalUrl ? (
+        <HomeBankPortalEntry onPress={onBankPortal} />
+      ) : null}
       {content?.homeConfig.sections.marketShortcuts !== false ? (
         <MarketContent
           limit={content?.homeConfig.marketShortcutLimit ?? 4}
@@ -385,6 +457,7 @@ function GuestHome({
 }
 
 function LoggedInHome({
+  assetEntries,
   content,
   marketShortcuts,
   markets,
@@ -393,9 +466,11 @@ function LoggedInHome({
   onActivityCenter,
   onAnnouncement,
   onAnnouncementCenter,
+  onBankPortal,
   onMarket,
   memberEntries,
 }: HomeContentProps & {
+  assetEntries: QuickEntryItem[];
   marketShortcuts: MarketInstrument[];
   memberEntries: QuickEntryItem[];
 }) {
@@ -415,9 +490,13 @@ function LoggedInHome({
         <AssetSummary />
       ) : null}
       {content?.homeConfig.sections.quickEntries !== false ? (
-        <QuickEntryRow entries={memberEntries} />
+        <QuickEntryRow entries={assetEntries} />
       ) : null}
+      <QuickEntryRow entries={memberEntries} />
       <HomeActivityEntry onPress={onActivityCenter} />
+      {content?.homeConfig.bankPortalUrl ? (
+        <HomeBankPortalEntry onPress={onBankPortal} />
+      ) : null}
       {content?.homeConfig.sections.marketShortcuts !== false &&
       marketShortcuts.length > 0 ? (
         <>

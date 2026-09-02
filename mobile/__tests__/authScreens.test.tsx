@@ -236,7 +236,7 @@ describe('mobile auth screens', () => {
       input(renderer, '邮箱').props.onChangeText('mobile@example.com');
       input(renderer, '邮箱验证码').props.onChangeText('123456');
       input(renderer, '密码').props.onChangeText('Strong1!');
-      input(renderer, '好友邀请码（选填，仅用于普通邀请）').props.onChangeText(
+      input(renderer, '邀请码（选填，支持好友或 BD 邀请）').props.onChangeText(
         ' Invite_2026 ',
       );
       acceptRegistrationLegal(renderer);
@@ -252,6 +252,36 @@ describe('mobile auth screens', () => {
       password: 'Strong1!',
       invite_code: 'Invite_2026',
       invite_type: 'user',
+    });
+    act(() => renderer.unmount());
+  });
+
+  it('submits a BD invite code with explicit BD attribution', async () => {
+    mockRegister.mockResolvedValue(undefined);
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = ReactTestRenderer.create(registerScreen());
+    });
+    act(() => {
+      input(renderer, '邮箱').props.onChangeText('mobile@example.com');
+      input(renderer, '邮箱验证码').props.onChangeText('123456');
+      input(renderer, '密码').props.onChangeText('Strong1!');
+      input(renderer, '邀请码（选填，支持好友或 BD 邀请）').props.onChangeText(
+        'bd100000029',
+      );
+      acceptRegistrationLegal(renderer);
+    });
+
+    await act(async () => {
+      await renderer.root.findByType(PrimaryButton).props.onPress();
+    });
+
+    expect(mockRegister).toHaveBeenCalledWith({
+      email: 'mobile@example.com',
+      otp: '123456',
+      password: 'Strong1!',
+      invite_code: 'bd100000029',
+      invite_type: 'bd',
     });
     act(() => renderer.unmount());
   });

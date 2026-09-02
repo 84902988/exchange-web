@@ -50,7 +50,7 @@ export default function QuickEntryRow({ entries = [] }: Props) {
               {item.title}
             </Text>
             {item.description ? (
-              <Text style={styles.desc} numberOfLines={1}>
+              <Text style={styles.desc} numberOfLines={2}>
                 {item.description}
               </Text>
             ) : null}
@@ -91,7 +91,10 @@ const styles = StyleSheet.create({
   desc: {
     ...typography.medium,
     marginTop: 3,
+    minHeight: 26,
     color: colors.textSubtle,
     fontSize: 10,
+    lineHeight: 13,
+    textAlign: 'center',
   },
 });

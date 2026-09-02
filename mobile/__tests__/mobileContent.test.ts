@@ -60,6 +60,7 @@ function validBootstrap(revision = 'mobile-r1') {
           { id: 'DEPOSIT', title: '充值', description: '充值资产' },
           { id: 'HISTORY', title: '资金记录', description: '查看流水' },
         ],
+        bank_portal_url: 'https://bank.example.com/portal?source=mobile',
         market_shortcut_limit: 3,
         market_shortcut_symbols: [
           'BTCUSDT',
@@ -157,6 +158,7 @@ describe('mobile content bootstrap contract', () => {
           { id: 'DEPOSIT', title: '充值', description: '充值资产' },
           { id: 'HISTORY', title: '资金记录', description: '查看流水' },
         ],
+        bankPortalUrl: 'https://bank.example.com/portal?source=mobile',
         marketShortcutLimit: 3,
         marketShortcutSymbols: ['BTCUSDT', 'RCBUSDT', 'ETHUSDT', 'NVDAUSDT_PERP'],
       },
@@ -247,6 +249,7 @@ describe('mobile content bootstrap contract', () => {
       marketShortcutLimit: 4,
       marketShortcutSymbols: ['BTCUSDT', 'RCBUSDT', 'ETHUSDT', 'NVDAUSDT_PERP'],
       sections: { quickEntries: true, announcements: true },
+      bankPortalUrl: null,
     });
     expect(snapshot.homeConfig.quickEntries.map(item => item.id)).toEqual([
       'DEPOSIT',
@@ -254,6 +257,17 @@ describe('mobile content bootstrap contract', () => {
       'TRANSFER',
       'HISTORY',
     ]);
+  });
+
+  it('accepts an older version-one home config without a bank portal', () => {
+    const payload = validBootstrap();
+    delete (payload.home.config as {bank_portal_url?: unknown}).bank_portal_url;
+
+    const snapshot = normalizeMobileContentBootstrap(payload, {
+      expectedLocale: 'zh-CN',
+    });
+
+    expect(snapshot.homeConfig.bankPortalUrl).toBeNull();
   });
 
   it.each([
@@ -268,6 +282,16 @@ describe('mobile content bootstrap contract', () => {
       'id',
     ],
     ['oversized market count', { market_shortcut_limit: 5 }, 'limit'],
+    [
+      'non-HTTPS bank portal',
+      {bank_portal_url: 'http://bank.example.com/portal'},
+      'bank_portal_url',
+    ],
+    [
+      'credential-bearing bank portal',
+      {bank_portal_url: 'https://user:secret@bank.example.com/portal'},
+      'bank_portal_url',
+    ],
     [
       'duplicate market shortcuts',
       {

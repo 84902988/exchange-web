@@ -36,5 +36,16 @@ describe('trade order helpers', () => {
         '提交失败',
       ),
     ).toBe('可用保证金不足');
+
+    expect(
+      getTradingErrorMessage(
+        new ApiClientError(
+          'OPEN_WOULD_LIQUIDATE_IMMEDIATELY',
+          '当前成交价与杠杆会使仓位开仓后立即达到强平条件',
+          400,
+        ),
+        '提交失败',
+      ),
+    ).toBe('当前杠杆和成交价会导致开仓后立即强平，请降低杠杆后重试');
   });
 });
