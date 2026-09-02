@@ -24,17 +24,16 @@
 	<string>????</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
 	<key>MobileApiBaseUrl</key>
 	<string>$(MOBILE_API_BASE_URL)</string>
 	<key>MobileBuildType</key>
 	<string>$(MOBILE_BUILD_TYPE)</string>
 	<key>MobileChartWebBaseUrl</key>
 	<string>$(MOBILE_CHART_WEB_BASE_URL)</string>
-	<key>LSRequiresIPhoneOS</key>
-	<true/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
-	  <!-- Do not change NSAllowsArbitraryLoads to true, or you will risk app rejection! -->
 		<key>NSAllowsArbitraryLoads</key>
 		<false/>
 	</dict>
@@ -42,6 +41,8 @@
 	<string>用于拍摄身份认证所需的证件和本人照片。</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>用于选择身份认证所需的证件和本人照片。</string>
+	<key>RCTNewArchEnabled</key>
+	<true/>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIRequiredDeviceCapabilities</key>
