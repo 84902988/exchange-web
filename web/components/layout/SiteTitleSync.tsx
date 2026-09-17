@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
+import { usePathname } from "next/navigation";
 
 import { useLocaleContext } from "@/contexts/LocaleContext";
 import { fallbackSiteConfig, getSiteConfig } from "@/lib/api/modules/site";
@@ -14,8 +15,10 @@ function normalizeTitle(value: string | null | undefined) {
 
 export default function SiteTitleSync() {
   const { locale } = useLocaleContext();
+  const pageOwnsTitle = usePathname() === '/download';
 
   useEffect(() => {
+    if (pageOwnsTitle) return;
     let cancelled = false;
 
     document.title = normalizeTitle(document.title);
@@ -33,7 +36,7 @@ export default function SiteTitleSync() {
     return () => {
       cancelled = true;
     };
-  }, [locale]);
+  }, [locale, pageOwnsTitle]);
 
   return null;
 }

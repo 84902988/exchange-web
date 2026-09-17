@@ -310,8 +310,7 @@ export default function Header() {
 
         <div className="flex shrink-0 items-center gap-1 sm:gap-2.5 xl:gap-3.5">
           <div className="relative hidden md:block" onMouseEnter={handleDownloadHover} onMouseLeave={handleDownloadLeave}>
-            {/* The download page is served by the deployment, outside the Next.js router. */}
-            <a
+            <Link
               href="/download"
               onFocus={handleDownloadHover}
               onBlur={handleDownloadLeave}
@@ -320,7 +319,7 @@ export default function Header() {
             >
               <Image src="/icons/header-download-1.svg" alt="" width={14} height={14} className="h-3.5 w-3.5 object-contain" />
               <span className="hidden whitespace-nowrap md:inline">{headerT('downloadApp')}</span>
-            </a>
+            </Link>
             {showQR && appQrItems.length > 0 && (
               <div className="absolute right-0 top-full z-40 hidden w-[252px] pt-2 md:block">
                 <div className="rounded-lg border border-white/10 bg-[#0a0a0d] p-4 shadow-2xl shadow-black/40">
