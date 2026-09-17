@@ -138,7 +138,7 @@
             <div class="field">
               <label for="daily_release_rate">解锁后每日释放比例</label>
               <input id="daily_release_rate" type="text" name="daily_release_rate" value="{{ form.daily_release_rate or '0.05000000' }}" placeholder="例如 0.05" />
-              <div class="stock-lock-field-help">填写小数比例，例如 0.05 表示 5%。</div>
+              <div class="stock-lock-field-help">填写小数比例，最多 8 位小数。例如 0.05 表示 5%，0.00123457 表示每日释放 0.123457%。</div>
             </div>
           </div>
         </div>
@@ -154,11 +154,10 @@
           </div>
         </div>
 
-        {% if form.lock_symbols_locked %}
-          <div class="stock-lock-edit-note">
-            该配置已存在，锁仓币种和释放/兑换币种不允许修改。兑换比例、锁定期、解锁后每日释放比例只影响后续新批次；已有批次继续使用创建时的配置快照。
-          </div>
-        {% endif %}
+        <div class="stock-lock-edit-note">
+          {% if form.lock_symbols_locked %}该配置已存在，锁仓币种和释放/兑换币种不允许修改。{% endif %}
+          每日释放比例在创建锁仓批次时保存。修改比例、禁用旧配置或新建配置，均不会覆盖已有批次保存的比例；新比例仅用于后续新建的锁仓批次。禁用配置不会停止已有批次的释放。
+        </div>
         <div class="stock-lock-form-actions">
           <button type="submit" class="btn admin-btn admin-btn-primary">{% if is_edit %}保存修改{% else %}创建配置{% endif %}</button>
           <a href="/admin/stock-token-lock-configs" class="btn secondary admin-btn admin-btn-secondary">取消</a>

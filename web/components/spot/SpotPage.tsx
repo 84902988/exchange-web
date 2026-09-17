@@ -1,4 +1,5 @@
 'use client';
+import {applicationName} from '@/lib/branding';
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
@@ -1626,14 +1627,14 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     : marketHeaderData;
 
   useEffect(() => {
-    originalDocumentTitleRef.current = document.title || 'Exchange';
+    originalDocumentTitleRef.current = document.title || applicationName;
 
     return () => {
       if (titleUpdateTimerRef.current !== null) {
         window.clearTimeout(titleUpdateTimerRef.current);
         titleUpdateTimerRef.current = null;
       }
-      document.title = originalDocumentTitleRef.current || 'Exchange';
+      document.title = originalDocumentTitleRef.current || applicationName;
     };
   }, []);
 
@@ -1641,8 +1642,8 @@ export default function SpotPage({ initialSymbol, initialCategory }: SpotPagePro
     const displaySymbol = formatSpotDisplaySymbol(symbol);
     const titlePrice = !shouldShowMarketSyncing && spotLastPrice !== '--' ? spotLastPrice : '';
     const nextTitle = titlePrice
-      ? `${titlePrice} ${displaySymbol} 现货交易 | Exchange`
-      : `${displaySymbol} 现货交易 | Exchange`;
+      ? `${titlePrice} ${displaySymbol} 现货交易 | ${applicationName}`
+      : `${displaySymbol} 现货交易 | ${applicationName}`;
     const now = Date.now();
     const remainingMs = Math.max(1000 - (now - titleUpdatedAtRef.current), 0);
     const applyTitle = () => {

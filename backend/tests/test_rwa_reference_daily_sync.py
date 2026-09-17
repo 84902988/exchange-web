@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -244,6 +245,45 @@ def test_iron_overlay_sync_updates_the_server_authoritative_display(monkeypatch)
         assert refreshed.market_status_text == "每日更新"
         assert refreshed.is_realtime is False
         assert refreshed.data_source == "COMMODITIES_API"
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("price, ton_price", [("0.09802", "98.02"), ("0.101", "101")])
+def test_manual_iron_units_follow_the_edited_price_not_the_old_auto_quote(price, ton_price):
+    from app.services.admin_queries import _admin_reference_overlay_row
+
+    overlay = _overlay(price_source="MANUAL", display_price=Decimal(price))
+    payload = serialize_reference_overlay(overlay)
+    admin_row = _admin_reference_overlay_row({
+        "reference_type": "IRON", "price_source": "MANUAL",
+        "display_price": Decimal(price), "display_value_label": "0.108 USD/公斤",
+        "last_ref_price": Decimal("0.108"), "last_ref_label": "108 USD/吨",
+    })
+    assert payload["display_price"] == price
+    assert payload["display_price_label"] == f"{price} USD/公斤"
+    assert payload["source_price_label"] == f"{ton_price} USD/吨"
+    assert admin_row["effective_display_label"] == payload["display_price_label"]
+    assert admin_row["source_price_label"] == payload["source_price_label"]
+    # Historical synchronization metadata is retained but is not the current price.
+    assert overlay.last_ref_label == "108 USD/吨"
+    assert overlay.last_ref_price == Decimal("0.108")
+
+
+def test_manual_iron_read_does_not_trigger_auto_sync(monkeypatch):
+    db = _db_session()
+    try:
+        db.add(_overlay(price_source="MANUAL", display_price=Decimal("0.09802")))
+        db.commit()
+
+        def unexpected_sync(*_args, **_kwargs):
+            pytest.fail("A manual reference read must not synchronize or overwrite the edited price")
+
+        monkeypatch.setattr(reference_overlay_sync_service, "sync_reference_overlay_once", unexpected_sync)
+        payload = get_reference_overlay_for_symbol(db, "MFCUSDT")
+        assert abs(Decimal(payload["display_price"]) - Decimal("0.09802")) < Decimal("1e-15")
+        ton_price = Decimal(payload["source_price_label"].split()[0])
+        assert abs(ton_price - Decimal("98.02")) < Decimal("1e-12")
     finally:
         db.close()
 

@@ -38,6 +38,14 @@ export default function VipCenterScreen() {
   const { t } = useLanguage();
   const tRef = useRef(t);
   const [overview, setOverview] = useState<VipOverview | null>(null);
+  const [selectedLevelGroup, setSelectedLevelGroup] = useState<
+    'VIP' | 'SVIP' | null
+  >(null);
+  const levelGroup =
+    selectedLevelGroup ??
+    (overview?.effectiveFeeSource === 'SVIP' ? 'SVIP' : 'VIP');
+  const visibleLevels =
+    (levelGroup === 'VIP' ? overview?.vipLevels : overview?.svipLevels) ?? [];
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [feePreference, setFeePreference] = useState<boolean | null>(null);
@@ -428,22 +436,40 @@ export default function VipCenterScreen() {
           </ActionCard>
 
           <Text style={styles.sectionTitle}>{t('vip.levelFees')}</Text>
-          {overview.vipLevels.map(level => (
+          <View style={styles.levelTabs}>
+            {(['VIP', 'SVIP'] as const).map(group => (
+              <Pressable
+                key={group}
+                accessibilityRole="tab"
+                accessibilityLabel={group}
+                accessibilityState={{ selected: levelGroup === group }}
+                android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
+                onPress={() => setSelectedLevelGroup(group)}
+                style={({ pressed }) => [
+                  styles.levelTab,
+                  levelGroup === group ? styles.levelTabActive : null,
+                  pressed ? styles.pressed : null,
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.levelTabLabel,
+                    levelGroup === group ? styles.activeText : null,
+                  ]}
+                >
+                  {group}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+          {visibleLevels.length === 0 ? (
+            <InlineNotice>{t('vip.noLevels')}</InlineNotice>
+          ) : null}
+          {visibleLevels.map(level => (
             <LevelCard
-              key={`VIP:${level.levelCode}`}
+              key={`${levelGroup}:${level.levelCode}`}
               active={
-                overview.effectiveFeeSource === 'VIP' &&
-                level.levelCode === overview.effectiveLevelCode
-              }
-              level={level}
-              t={t}
-            />
-          ))}
-          {overview.svipLevels.map(level => (
-            <LevelCard
-              key={`SVIP:${level.levelCode}`}
-              active={
-                overview.effectiveFeeSource === 'SVIP' &&
+                overview.effectiveFeeSource === levelGroup &&
                 level.levelCode === overview.effectiveLevelCode
               }
               level={level}
@@ -631,6 +657,30 @@ const styles = StyleSheet.create({
     borderColor: colors.line,
     backgroundColor: colors.card,
     padding: 14,
+  },
+  levelTabs: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 12,
+  },
+  levelTab: {
+    flex: 1,
+    minHeight: 44,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: colors.line,
+    backgroundColor: colors.card,
+  },
+  levelTabActive: {
+    borderColor: colors.gold,
+    backgroundColor: colors.goldSoft,
+  },
+  levelTabLabel: {
+    ...typography.bold,
+    color: colors.textMuted,
+    fontSize: 14,
   },
   levelCardActive: {
     borderColor: colors.gold,

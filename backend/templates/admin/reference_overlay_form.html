@@ -199,7 +199,7 @@
         <div class="rwa-section-title">多语言文案</div>
         <div class="rwa-help-card">
           <div><strong>简体中文：</strong>会同步写入原始字段，作为其他语言未填写时的 fallback。</div>
-          <div><strong>展示单位：</strong>AUTO 模式单位由系统按语言生成，不在这里手填；这里的“展示文案”主要用于 MANUAL 或兜底。</div>
+          <div><strong>展示单位：</strong>AUTO 模式单位由系统按语言生成；铁粉在手动和自动模式下均按价格生成每公斤价及每吨价，“展示文案”不覆盖铁粉价格。黄金、股票的手动价格可使用展示文案。</div>
         </div>
         <div class="rwa-i18n-tabs" role="tablist" aria-label="RWA参考价多语言文案">
           {% for suffix, label in i18n_languages %}
@@ -257,9 +257,16 @@
           </div>
         {% else %}
           <div class="rwa-help-card">
-            <div><strong>手动模式：</strong>前台价格优先使用这里填写的划线价格和展示文案。</div>
+            <div><strong>手动模式：</strong>前台价格使用这里填写的画线价格；黄金、股票可另填展示文案。铁粉两种单位的价格均由画线价格换算。</div>
           </div>
         {% endif %}
+        <div class="rwa-help-card">
+          <div><strong>铁粉价格修改入口：</strong>将“价格来源”设为“手动”，在“画线价格”填写每公斤美元价，保存后网页每公斤价、每吨价及参考线一起更新。</div>
+          <div><strong>换算示例：</strong>填写 <code>0.09802</code>，网页显示 <code>0.09802 USD/公斤</code> 和 <code>98.02 USD/吨</code>。自动模式仍使用同步行情。</div>
+          {% if reference_type_value == 'IRON' and form.source_price_label %}
+            <div><strong>当前每吨参考价：</strong>{{ form.source_price_label }}</div>
+          {% endif %}
+        </div>
         <div class="rwa-form-grid">
           <div class="field">
             <label for="line_color">线颜色</label>
@@ -271,7 +278,7 @@
           </div>
           <div class="field">
             <label for="display_value_label">展示文案</label>
-            <input id="display_value_label" type="text" name="display_value_label" value="{{ form.display_value_label or '' }}" placeholder="108 USD/吨" />
+            <input id="display_value_label" type="text" name="display_value_label" value="{{ form.display_value_label or '' }}" placeholder="黄金、股票的手动价格文案；铁粉价格由系统换算" />
           </div>
           <div class="field">
             <label for="line_title">线标题</label>

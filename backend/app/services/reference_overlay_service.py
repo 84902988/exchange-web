@@ -175,6 +175,10 @@ def serialize_reference_overlay(
     if display_price is None:
         return _disabled_payload(str(overlay.symbol or requested_symbol or "").strip().upper())
 
+    if reference_type == "IRON" and price_source == "MANUAL":
+        # Both units describe the current manual reference, not the last AUTO quote.
+        source_price_label = f"{_decimal_to_text(display_price * Decimal('1000'))} USD/吨"
+
     display_price_label = _display_price_label(
         reference_type=reference_type,
         display_price=display_price,

@@ -1,4 +1,5 @@
 'use client';
+import {legacyFavoritesStorageKeys} from '@/lib/branding';
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
@@ -436,7 +437,19 @@ function readFavoriteSymbols(): FavoriteSymbolItem[] {
   if (typeof window === 'undefined') return [];
 
   try {
-    const rawValue = window.localStorage.getItem(FAVORITE_SYMBOLS_STORAGE_KEY);
+    let rawValue = window.localStorage.getItem(FAVORITE_SYMBOLS_STORAGE_KEY);
+    if (rawValue === null) {
+      for (const key of legacyFavoritesStorageKeys) {
+        const previous = window.localStorage.getItem(key);
+        if (previous === null) continue;
+        try {
+          if (!Array.isArray(JSON.parse(previous))) continue;
+        } catch { continue; }
+        rawValue = previous;
+        try { window.localStorage.setItem(FAVORITE_SYMBOLS_STORAGE_KEY, previous); } catch { /* Storage may be read-only. */ }
+        break;
+      }
+    }
     const parsed = rawValue ? JSON.parse(rawValue) : [];
     if (!Array.isArray(parsed)) return [];
 

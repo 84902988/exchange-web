@@ -404,6 +404,11 @@ def _load_rcb_usdt_price(db: Session, current_pair: TradingPair, trade: Trade) -
         price = Decimal(str(trade.price or 0))
         return price if price > Decimal("0") else None
 
+    return load_rcb_last_trade_price(db)
+
+
+def load_rcb_last_trade_price(db: Session) -> Optional[Decimal]:
+    """The RCB conversion price used by spot settlement and its display preview."""
     rcb_pair = (
         db.query(TradingPair)
         .filter(TradingPair.symbol == "RCBUSDT")

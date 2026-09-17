@@ -4,9 +4,10 @@ import "./globals.css";
 import AppChrome from "@/components/layout/AppChrome";
 import Providers from "./providers";
 import { LocaleProvider } from "@/contexts/LocaleContext";
+import { applicationName } from '@/lib/branding';
 
 export const metadata: Metadata = {
-  title: "Exchange",
+  title: applicationName,
   description: "",
   icons: {
     icon: [

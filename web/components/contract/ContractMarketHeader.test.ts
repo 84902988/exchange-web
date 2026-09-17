@@ -132,6 +132,7 @@ const headerChangeModule = loadTypeScriptModule(
 const headerModule = loadTypeScriptModule(
   fileURLToPath(new URL('./ContractMarketHeader.tsx', import.meta.url)),
   {
+    '@/lib/branding': {applicationName: 'Exchange'},
     react: {
       useEffect: (
         effect: () => void | (() => void),

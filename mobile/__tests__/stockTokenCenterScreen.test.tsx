@@ -100,7 +100,7 @@ describe('mobile stock token center screen', () => {
 
   it('keeps every stock token key explicit in all four languages', () => {
     const expectedKeys = Object.keys(stockTokenZhCN).sort();
-    expect(expectedKeys).toHaveLength(45);
+    expect(expectedKeys).toHaveLength(46);
     expect(Object.keys(stockTokenZhTW).sort()).toEqual(expectedKeys);
     expect(Object.keys(stockTokenEn).sort()).toEqual(expectedKeys);
     expect(Object.keys(stockTokenJa).sort()).toEqual(expectedKeys);
@@ -124,6 +124,24 @@ describe('mobile stock token center screen', () => {
     expect(text).toContain('兑换成功');
     expect(text).toContain('移动端当前仅提供查询');
     expect(renderer.root.findAllByProps({accessibilityLabel: '兑换'})).toHaveLength(0);
+    act(() => renderer.unmount());
+  });
+
+  it('shows the precise saved rate separately for old and new batches', async () => {
+    mockFetchLocks.mockResolvedValueOnce({items: [
+      {...lock, dailyReleaseRate: '0.00120000'},
+      {...lock, id: 10, dailyReleaseRate: '0.001234570000000000'},
+    ]});
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = ReactTestRenderer.create(<StockTokenCenterScreen />);
+      await Promise.resolve();
+    });
+    const text = screenText(renderer);
+    expect(text).toContain('0.12%');
+    expect(text).toContain('0.123457%');
+    expect(text).toContain('本批次每日释放');
+    expect(text).toContain('后续配置调整不改变本批次的比例');
     act(() => renderer.unmount());
   });
 
@@ -190,6 +208,9 @@ describe('mobile stock token center screen', () => {
     expect(onPress).toHaveBeenCalledTimes(1);
     expect(formatDecimalAsPercent('0.01')).toBe('1');
     expect(formatDecimalAsPercent('0.0125')).toBe('1.25');
+    expect(formatDecimalAsPercent('0.00123457')).toBe('0.123457');
+    expect(formatDecimalAsPercent('0.00142857')).toBe('0.142857');
+    expect(formatDecimalAsPercent('0.00000001')).toBe('0.000001');
     expect(formatDecimalAsPercent('0.1')).toBe('10');
     expect(formatDecimalAsPercent('1')).toBe('100');
     expect(formatBackendUtcAt('invalid')).toBe('--');

@@ -1,3 +1,4 @@
+import {branding} from '../../config/branding';
 import React from 'react';
 import {
   Image,
@@ -28,13 +29,9 @@ import {colors, typography} from '../../theme';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'BlackCard'>;
 
-const CARD_SUPPORT_EMAIL = 'card@service.example';
-const BLACK_CARD_BACKGROUND = {
-  uri: 'https://service.example/images/mastercard/v2/mcbg1-v2.png',
-};
-const BLACK_CARD_IMAGE = {
-  uri: 'https://service.example/images/mastercard/v2/mastercard-v3.png',
-};
+const CARD_SUPPORT_EMAIL = branding.blackCard.supportEmail;
+const BLACK_CARD_BACKGROUND = branding.blackCard.backgroundUrl ? {uri: branding.blackCard.backgroundUrl} : undefined;
+const BLACK_CARD_IMAGE = branding.blackCard.imageUrl ? {uri: branding.blackCard.imageUrl} : require('../../assets/brand/app-logo.png');
 
 const featureItems: Array<{
   Icon: LucideIcon;
@@ -94,6 +91,14 @@ const disclaimerKeys: TranslationKey[] = [
 
 export default function BlackCardScreen({navigation}: Props) {
   const {t} = useLanguage();
+  if (!branding.blackCard.enabled) {
+    return (
+      <AppScreen contentStyle={styles.screen} contentWidth="dashboard">
+        <ActionHeader title={t('blackCard.marketing.pageTitle')} onBack={navigation.goBack} />
+        <Text style={styles.informationNoticeText}>{t('blackCard.marketing.informationOnlyNotice')}</Text>
+      </AppScreen>
+    );
+  }
 
   return (
     <AppScreen contentStyle={styles.screen} contentWidth="dashboard">
@@ -111,7 +116,7 @@ export default function BlackCardScreen({navigation}: Props) {
         style={styles.hero}
       >
         <View pointerEvents="none" style={styles.heroOverlay} />
-        <Text style={styles.heroEyebrow}>Exchange</Text>
+        <Text style={styles.heroEyebrow}>{branding.displayName}</Text>
         <Text accessibilityRole="header" style={styles.heroTitle}>
           {t('blackCard.marketing.heroTitle')}
         </Text>

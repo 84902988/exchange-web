@@ -1,4 +1,5 @@
 'use client';
+import {applicationName} from '@/lib/branding';
 
 import { useCallback, useEffect, useState } from 'react';
 
@@ -50,7 +51,7 @@ export default function WhoWeArePage() {
         <div className="mx-auto max-w-5xl">
           <div className="max-w-3xl">
             <p className="mb-4 text-sm font-medium uppercase tracking-[0.22em] text-[#f0b90b]">
-              Exchange
+              {applicationName}
             </p>
             <h1 className="text-4xl font-semibold leading-tight text-white sm:text-5xl">
               {content?.title || t('aboutPageTitle', 'common')}

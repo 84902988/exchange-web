@@ -77,13 +77,16 @@ import {
   MOBILE_TRADING_PANEL_GAP,
   MOBILE_TRADING_PANEL_HEIGHT,
 } from '../../constants/tradingLayout';
-import {resolveResponsiveLayout} from '../../constants/responsiveLayout';
+import { resolveResponsiveLayout } from '../../constants/responsiveLayout';
 import {
   formatOrderDecimal,
   getTradingErrorMessage,
   parsePositiveDecimal,
 } from '../../utils/tradeOrder';
-import { calculateSpotEstimatedFee } from '../../utils/spotFee';
+import {
+  calculateSpotEstimatedFee,
+  estimateSpotFeePayment,
+} from '../../utils/spotFee';
 import { formatFixedPrice } from '../../utils/format';
 import {
   clearPendingTradeIntent,
@@ -151,8 +154,11 @@ export default function TradeScreen() {
   const navigation = useNavigation<RootNavigation>();
   const route = useRoute<RouteProp<MainTabParamList, 'Trade'>>();
   const { t } = useLanguage();
-  const {fontScale, height: windowHeight, width: windowWidth} =
-    useWindowDimensions();
+  const {
+    fontScale,
+    height: windowHeight,
+    width: windowWidth,
+  } = useWindowDimensions();
   const responsiveLayout = resolveResponsiveLayout(
     windowWidth,
     windowHeight,
@@ -474,18 +480,33 @@ export default function TradeScreen() {
     [amount, feeRates, marketReferencePrice, orderType, price],
   );
   const estimatedFeeLabel = t('trading.estimatedFee');
+  const estimatedPayment =
+    estimatedFee && feeRates
+      ? estimateSpotFeePayment({
+          feeUsdt: estimatedFee.fee,
+          context: feeRates.payment,
+          symbol,
+          side,
+          amount: Number(amount),
+          executionPrice:
+            orderType === 'MARKET'
+              ? marketReferencePrice
+              : Number(price.replace(/,/g, '')),
+        })
+      : null;
   const estimatedFeeText = !isLoggedIn
     ? t('trading.loginToView')
     : feeLoading
     ? t('trading.feeLoading')
     : feeError || !feeRates
     ? t('trading.feeRetrying')
-    : estimatedFee
-    ? `${orderType === 'LIMIT' ? '≤' : '≈'} ${formatSpotNumber(
-        estimatedFee.fee,
-        8,
-      )} ${quoteAsset}`
+    : estimatedPayment
+    ? `≈ ${formatSpotNumber(estimatedPayment.fee, 8)} ${estimatedPayment.asset}`
     : '--';
+  const estimatedFeeHint =
+    !isLoggedIn || feeLoading || feeError || !estimatedPayment
+      ? undefined
+      : t(`spot.feePayment.${estimatedPayment.reason}`);
   const orderIntentReady = orderIntentHydratedScope === orderIntentScope;
   const orderIntentBlockingMessage = !orderIntentReady
     ? t('trading.restoringOrder')
@@ -761,6 +782,7 @@ export default function TradeScreen() {
         return;
       }
       loadPrivateData().catch(() => undefined);
+      setFeeRetryNonce(current => current + 1);
     },
   });
   const privateRealtimeNotice = !privateRealtimeEnabled
@@ -939,6 +961,7 @@ export default function TradeScreen() {
                   });
                   setFeedbackText(message);
                   setFeedbackTone('success');
+                  setFeeRetryNonce(current => current + 1);
                   Alert.alert(tRef.current('recovery.confirmedTitle'), message);
                   await loadPrivateData();
                 }
@@ -1456,6 +1479,7 @@ export default function TradeScreen() {
 
   useEffect(() => {
     const generation = ++feeGenerationRef.current;
+    const controller = new AbortController();
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     if (!isLoggedIn) {
       setFeeRates(null);
@@ -1470,11 +1494,15 @@ export default function TradeScreen() {
     setFeeRates(null);
     setFeeLoading(true);
     setFeeError(null);
-    fetchSpotFeeRates()
+    fetchSpotFeeRates({ signal: controller.signal })
       .then(nextRates => {
         if (generation !== feeGenerationRef.current) return;
         setFeeRates(nextRates);
         setFeeError(null);
+        retryTimer = setTimeout(() => {
+          if (generation === feeGenerationRef.current)
+            setFeeRetryNonce(current => current + 1);
+        }, 30_000);
       })
       .catch(() => {
         if (generation !== feeGenerationRef.current) return;
@@ -1492,6 +1520,7 @@ export default function TradeScreen() {
         }
       });
     return () => {
+      controller.abort();
       if (retryTimer !== null) clearTimeout(retryTimer);
       if (feeGenerationRef.current === generation) {
         feeGenerationRef.current += 1;
@@ -1984,6 +2013,7 @@ export default function TradeScreen() {
               setAmount('');
               setFeedbackText(message);
               setFeedbackTone('success');
+              setFeeRetryNonce(current => current + 1);
               await loadPrivateData();
               if (
                 mountedRef.current &&
@@ -2290,7 +2320,7 @@ export default function TradeScreen() {
       quoteAsset,
       displayLabel,
       initialInterval: klineInterval,
-      ...(klines.length > 0 ? {initialKlines: klines.slice(-48)} : {}),
+      ...(klines.length > 0 ? { initialKlines: klines.slice(-48) } : {}),
     });
   }, [
     baseAsset,
@@ -2479,14 +2509,16 @@ export default function TradeScreen() {
           responsiveLayout.shouldStackTradingPanels
             ? styles.tradeMainStacked
             : null,
-        ]}>
+        ]}
+      >
         <View
           style={[
             styles.formPanelWrap,
             responsiveLayout.shouldStackTradingPanels
               ? styles.panelWrapStacked
               : null,
-          ]}>
+          ]}
+        >
           <TradeOrderForm
             amount={amount}
             availableText={availableText}
@@ -2538,7 +2570,8 @@ export default function TradeScreen() {
             responsiveLayout.shouldStackTradingPanels
               ? styles.panelWrapStacked
               : null,
-          ]}>
+          ]}
+        >
           <TradeOrderBook
             amountPrecision={amountPrecision}
             asks={asks}
@@ -2552,6 +2585,12 @@ export default function TradeScreen() {
           />
         </View>
       </View>
+
+      {estimatedFeeHint ? (
+        <Text testID="spot-fee-payment-hint" style={styles.feePaymentHint}>
+          {estimatedFeeHint}
+        </Text>
+      ) : null}
 
       {deferredScreenContentReady ? (
         <>
@@ -2638,6 +2677,15 @@ function getSpotCancelErrorMessage(error: unknown, t: Translator) {
 }
 
 const styles = StyleSheet.create({
+  feePaymentHint: {
+    color: colors.textMuted,
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 8,
+    padding: 10,
+    backgroundColor: colors.card,
+    borderRadius: 8,
+  },
   pressed: { opacity: 0.78, transform: [{ scale: 0.99 }] },
   realtimeNotice: {
     marginTop: 8,

@@ -1,5 +1,5 @@
 import React from 'react';
-import {Linking} from 'react-native';
+import {Linking, Text} from 'react-native';
 import ReactTestRenderer, { act } from 'react-test-renderer';
 import type { MobileContentSnapshot } from '../src/api/mobileContent';
 import type { MarketInstrument } from '../src/api/market';
@@ -355,7 +355,7 @@ describe('HomeScreen real-data wiring', () => {
         {
           id: 'DEPOSIT',
           title: 'Deposit',
-          description: 'Updated English description',
+          description: 'Updated deposit copy',
         },
       ],
       bankPortalUrl: null,
@@ -385,8 +385,11 @@ describe('HomeScreen real-data wiring', () => {
       }),
     ).toHaveLength(0);
     const depositButton = renderer.root.findByProps({
-      accessibilityLabel: 'Deposit，Updated English description',
+      accessibilityLabel: 'Deposit，Updated deposit copy',
     });
+    expect(
+      depositButton.findAllByType(Text).map(node => node.props.children),
+    ).toEqual(['Deposit', 'Updated deposit copy']);
     const blackCardButton = renderer.root.findByProps({
       accessibilityLabel: 'BlackCard，会员权益',
     });

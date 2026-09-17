@@ -19,10 +19,6 @@ function getCpolarIoApiBaseUrl(host: string): string | null {
     return null;
   }
 
-  if (host.startsWith("sample-hook.")) {
-    return `https://${host.replace(/^sample-hook\./, "sample-api.")}`;
-  }
-
   if (host.includes("-hook.")) {
     return `https://${host.replace("-hook.", "-api.")}`;
   }

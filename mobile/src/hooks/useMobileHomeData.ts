@@ -1,5 +1,5 @@
-import {startTransition, useCallback, useRef, useState} from 'react';
-import {useFocusEffect} from '@react-navigation/native';
+import { startTransition, useCallback, useRef, useState } from 'react';
+import { useFocusEffect } from '@react-navigation/native';
 import {
   getCachedMobileContent,
   loadMobileContentBootstrap,
@@ -10,10 +10,11 @@ import {
   getCachedMobileMarkets,
   type MarketInstrument,
 } from '../api/market';
-import {defaultLocale} from '../i18n';
-import {useApplicationActive} from './useApplicationState';
+import { defaultLocale } from '../i18n';
+import { useApplicationActive } from './useApplicationState';
 
 export const MOBILE_HOME_MARKET_REFRESH_MS = 5_000;
+export const MOBILE_HOME_CONTENT_REFRESH_MS = 30_000;
 
 export type MobileHomeDataState = {
   content: MobileContentSnapshot | null;
@@ -54,34 +55,48 @@ export function useMobileHomeData(locale = defaultLocale) {
         };
       });
 
-      Promise.resolve()
-        .then(() => loadMobileContentBootstrap({force: true, locale}))
-        .then(result => {
-          if (!active || generation !== generationRef.current) {
-            return;
-          }
-          startTransition(() => {
-            setState(previous => ({
-              ...previous,
-              content: result.snapshot,
-              contentLoading: false,
-              contentError: result.error,
-            }));
+      let contentRefreshInFlight = false;
+      const refreshContent = () => {
+        if (contentRefreshInFlight) return;
+        contentRefreshInFlight = true;
+        Promise.resolve()
+          .then(() => loadMobileContentBootstrap({ force: true, locale }))
+          .then(result => {
+            if (!active || generation !== generationRef.current) {
+              return;
+            }
+            startTransition(() => {
+              setState(previous => ({
+                ...previous,
+                content: result.snapshot,
+                contentLoading: false,
+                contentError: result.error,
+              }));
+            });
+          })
+          .catch(() => {
+            if (!active || generation !== generationRef.current) {
+              return;
+            }
+            startTransition(() => {
+              setState(previous => ({
+                ...previous,
+                content: null,
+                contentLoading: false,
+                contentError: '首页内容暂时不可用，请稍后重试。',
+              }));
+            });
+          })
+          .finally(() => {
+            contentRefreshInFlight = false;
           });
-        })
-        .catch(() => {
-          if (!active || generation !== generationRef.current) {
-            return;
-          }
-          startTransition(() => {
-            setState(previous => ({
-              ...previous,
-              content: null,
-              contentLoading: false,
-              contentError: '首页内容暂时不可用，请稍后重试。',
-            }));
-          });
-        });
+      };
+
+      refreshContent();
+      const contentRefreshTimer = setInterval(
+        refreshContent,
+        MOBILE_HOME_CONTENT_REFRESH_MS,
+      );
 
       let marketRefreshInFlight = false;
       const refreshMarkets = () => {
@@ -128,6 +143,7 @@ export function useMobileHomeData(locale = defaultLocale) {
 
       return () => {
         active = false;
+        clearInterval(contentRefreshTimer);
         clearInterval(marketRefreshTimer);
         if (generationRef.current === generation) {
           generationRef.current += 1;

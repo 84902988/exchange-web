@@ -169,7 +169,7 @@ class Settings(BaseSettings):
     ALIYUN_DM_CONNECT_TIMEOUT_MS: int = 5000
     ALIYUN_DM_READ_TIMEOUT_MS: int = 10000
     # 阿里云控制台创建的发信地址
-    ALIYUN_DM_ACCOUNT_NAME: str = "no-reply@service.example"
+    ALIYUN_DM_ACCOUNT_NAME: str = ""
     # 发信人昵称
     ALIYUN_DM_FROM_ALIAS: str = "Exchange"
 

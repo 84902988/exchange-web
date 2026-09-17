@@ -1,4 +1,8 @@
 import { describe, expect, it } from '@jest/globals';
+import zh from '@/config/locales/zh.json';
+import zhTW from '@/config/locales/zh-TW.json';
+import en from '@/config/locales/en.json';
+import ja from '@/config/locales/ja.json';
 import {
   getReferenceOverlayConfig,
   normalizeReferenceOverlayConfig,
@@ -6,6 +10,7 @@ import {
 } from './referenceOverlay';
 
 const translate = (key: string) => key;
+const translateZh = (key: string) => zh.asset[key as keyof typeof zh.asset] as string;
 
 describe('reference overlay symbol identity', () => {
   it('does not restore a hard-coded MFC quote when the reference API is unavailable', () => {
@@ -75,5 +80,92 @@ describe('reference overlay symbol identity', () => {
     }, translateEnglish);
 
     expect(config?.description).toBe('1 MFC ≈ 1 KG iron powder');
+  });
+});
+
+describe('manual iron reference price editing', () => {
+  const manualIron = {
+    symbol: 'MFCUSDT',
+    enabled: true,
+    reference_type: 'IRON',
+    price_source: 'MANUAL',
+    display_price: '0.09802',
+    display_value_label: '0.108 USD/公斤',
+    last_ref_price: '0.108',
+    last_ref_label: '108 USD/吨',
+  };
+
+  it.each([undefined, null, '108 USD/吨'])(
+    'uses the edited manual price despite a historical source label of %s',
+    sourcePriceLabel => {
+      const config = normalizeReferenceOverlayConfig({
+        ...manualIron,
+        source_price_label: sourcePriceLabel,
+      }, translateZh);
+
+      expect(config).toMatchObject({
+        displayPrice: 0.09802,
+        valueLabel: '0.09802 USD/公斤',
+        sourcePriceLabel: '98.02 USD/吨',
+      });
+    },
+  );
+
+  it('updates both units again when the saved manual price changes', () => {
+    const config = normalizeReferenceOverlayConfig({
+      ...manualIron, display_price: '0.101',
+    }, translateZh);
+    expect(config).toMatchObject({
+      displayPrice: 0.101,
+      valueLabel: '0.101 USD/公斤',
+      sourcePriceLabel: '101 USD/吨',
+    });
+  });
+
+  it.each([
+    ['zh', zh.asset, 'USD/公斤', 'USD/吨'],
+    ['zh-TW', zhTW.asset, 'USD/公斤', 'USD/噸'],
+    ['en', en.asset, 'USD/kg', 'USD/ton'],
+    ['ja', ja.asset, 'USD/kg', 'USD/トン'],
+  ] as const)('keeps the price pair consistent in %s', (_locale, catalog, kgUnit, tonUnit) => {
+    const t = (key: string) => catalog[key as keyof typeof catalog] as string;
+    const config = normalizeReferenceOverlayConfig(manualIron, t);
+    expect(config?.valueLabel).toBe(`0.09802 ${kgUnit}`);
+    expect(config?.sourcePriceLabel).toBe(`98.02 ${tonUnit}`);
+  });
+
+  it('still uses the synchronized price in AUTO mode', () => {
+    const config = normalizeReferenceOverlayConfig({
+      ...manualIron,
+      price_source: 'AUTO',
+      display_price: '0.09509',
+      source_price_label: '95.09 USD/吨',
+    }, translateZh);
+    expect(config).toMatchObject({
+      displayPrice: 0.09509,
+      valueLabel: '0.09509 USD/公斤',
+      sourcePriceLabel: '95.09 USD/吨',
+    });
+  });
+
+  it('does not revive historical prices when the API explicitly clears the source label', () => {
+    const config = normalizeReferenceOverlayConfig({
+      ...manualIron, price_source: 'AUTO', source_price_label: null,
+    }, translateZh);
+    expect(config?.sourcePriceLabel).toBeNull();
+  });
+
+  it('does not show a historic AUTO quote for a manual price of another asset type', () => {
+    const config = normalizeReferenceOverlayConfig({
+      ...manualIron,
+      reference_type: 'STOCK',
+      symbol: 'BON2USDT',
+      display_price: '1.25',
+      display_value_label: '1.25 USD',
+      last_ref_label: '2 USD',
+      source_price_label: null,
+    }, translateZh);
+    expect(config?.sourcePriceLabel).toBeNull();
+    expect(config?.valueLabel).toBe('1.25 USD');
   });
 });
