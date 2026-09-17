@@ -56,7 +56,7 @@ export default function MobileMenu({
 
   return (
     <div
-      className={`fixed inset-0 z-50 2xl:hidden transition-all duration-300 ${
+      className={`fixed inset-0 z-50 lg:hidden transition-all duration-300 ${
         open ? 'pointer-events-auto' : 'pointer-events-none'
       }`}
     >

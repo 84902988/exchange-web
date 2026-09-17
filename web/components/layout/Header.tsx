@@ -215,6 +215,16 @@ export default function Header() {
   const handleDownloadLeave = () => setShowQR(false);
 
   const [showMobileMenu, setShowMobileMenu] = useState(false);
+  useEffect(() => {
+    if (!showMobileMenu) return;
+    const desktop = window.matchMedia('(min-width: 1024px)');
+    const closeOnDesktop = () => {
+      if (desktop.matches) setShowMobileMenu(false);
+    };
+    closeOnDesktop();
+    desktop.addEventListener('change', closeOnDesktop);
+    return () => desktop.removeEventListener('change', closeOnDesktop);
+  }, [showMobileMenu]);
   const headerT = (key: string) => (mounted ? t(key, 'common') : DEFAULT_COMMON_TRANSLATIONS[key] || key);
   const appDownloadTitle = siteBrand.appDownloadTitle || headerT('appDownloadTitle');
   const appDownloadSubtitle = siteBrand.appDownloadSubtitle || headerT('appDownloadSubtitle');
@@ -225,10 +235,10 @@ export default function Header() {
 
   return (
     <>
-      <header className="relative flex h-14 items-center justify-between border-b border-white/10 bg-[#0a0a0d] px-3.5">
+      <header className="relative flex h-14 items-center justify-between gap-x-3 border-b border-white/10 bg-[#0a0a0d] px-3.5 lg:h-auto lg:min-h-14 lg:flex-wrap xl:h-14 xl:flex-nowrap">
         {/* Left: Logo + Nav */}
-        <div className="flex min-w-0 items-center gap-4">
-          <Link href="/" className="flex min-w-0 items-center gap-2.5 hover:opacity-90 transition-opacity duration-200">
+        <div className="flex min-w-0 items-center gap-4 lg:contents xl:flex">
+          <Link href="/" className="flex min-w-0 shrink-0 items-center gap-2.5 hover:opacity-90 transition-opacity duration-200 lg:order-1 lg:min-h-14 xl:min-h-0">
             {siteBrand.logoUrl && (
               <div className="h-9 w-9 shrink-0 overflow-hidden rounded-md">
                 {siteBrand.logoUrl.startsWith('/') ? (
@@ -249,14 +259,14 @@ export default function Header() {
             <div className="flex min-w-0 flex-col justify-center leading-tight">
               <div className="truncate text-sm font-bold text-amber-400">{siteBrand.siteName}</div>
               {siteBrand.siteSlogan && (
-                <div className="hidden max-w-48 truncate text-[10px] font-medium text-white/45 lg:block">
+                <div className="hidden max-w-48 truncate text-[10px] font-medium text-white/45 2xl:block">
                   {siteBrand.siteSlogan}
                 </div>
               )}
             </div>
           </Link>
 
-          <nav className="hidden items-center gap-4 2xl:flex">
+          <nav className="hidden items-center gap-4 whitespace-nowrap lg:order-3 lg:flex lg:min-h-11 lg:w-full lg:justify-center xl:min-h-0 xl:w-auto xl:gap-3 2xl:gap-4">
             {menuConfig.items.map((item) => {
               const hasMegaMenu = 'megaMenu' in item;
               const translatedLabel = headerT(item.labelKey);
@@ -281,14 +291,14 @@ export default function Header() {
                     <button
                       type="button"
                       onClick={() => handleMenuHover(item.labelKey)}
-                      className="text-base font-semibold text-white/85 transition-colors duration-200 hover:text-white"
+                      className="text-sm font-semibold text-white/85 transition-colors duration-200 hover:text-white 2xl:text-base"
                     >
                       {translatedLabel}
                     </button>
                   ) : (
                     <Link
                       href={item.href}
-                      className="text-base font-semibold text-white/85 transition-colors duration-200 hover:text-white"
+                      className="text-sm font-semibold text-white/85 transition-colors duration-200 hover:text-white 2xl:text-base"
                     >
                       {translatedLabel}
                     </Link>
@@ -308,7 +318,7 @@ export default function Header() {
           </nav>
         </div>
 
-        <div className="flex shrink-0 items-center gap-1 sm:gap-2.5 xl:gap-3.5">
+        <div className="flex shrink-0 items-center gap-1 sm:gap-2.5 lg:order-2 xl:gap-2 2xl:gap-3.5">
           <div className="relative hidden md:block" onMouseEnter={handleDownloadHover} onMouseLeave={handleDownloadLeave}>
             <Link
               href="/download"
@@ -411,7 +421,7 @@ export default function Header() {
           
           <button
             onClick={() => setShowMobileMenu(true)}
-            className="2xl:hidden grid h-9 w-9 place-items-center rounded-md text-white/90 hover:bg-white/10"
+            className="lg:hidden grid h-9 w-9 place-items-center rounded-md text-white/90 hover:bg-white/10"
             aria-label={headerT('menu')}
           >
             {'\u2630'}
