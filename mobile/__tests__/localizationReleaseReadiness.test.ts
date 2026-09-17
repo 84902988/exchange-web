@@ -1,4 +1,4 @@
-import {branding} from '../src/config/branding';
+import {branding} from '../src/config/brandingConfig';
 import {
   createTranslator,
   supportedLocales,

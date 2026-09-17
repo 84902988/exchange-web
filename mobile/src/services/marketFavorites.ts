@@ -1,4 +1,4 @@
-import {branding} from '../config/branding';
+import {branding} from '../config/brandingConfig';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 export const MARKET_FAVORITES_STORAGE_KEY =

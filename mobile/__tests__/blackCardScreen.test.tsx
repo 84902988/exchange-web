@@ -2,7 +2,7 @@ import React from 'react';
 import ReactTestRenderer, { act } from 'react-test-renderer';
 import BlackCardScreen from '../src/screens/home/BlackCardScreen';
 import {createTranslator} from '../src/i18n';
-import {branding} from '../src/config/branding';
+import {branding} from '../src/config/brandingConfig';
 
 describe('BlackCard screen', () => {
   it('renders externally configured content and substitutes the configured name', () => {

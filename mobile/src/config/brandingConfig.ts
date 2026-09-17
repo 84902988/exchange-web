@@ -10,5 +10,6 @@ export type BrandingConfiguration = {
   blackCardTranslations: Record<string, Record<string, string>>;
 };
 
+// Keep the module basename distinct from the JSON: Metro resolves JSON before TS.
 // Replace the neutral JSON with an external profile in an isolated delivery build.
 export const branding: BrandingConfiguration = configuration;

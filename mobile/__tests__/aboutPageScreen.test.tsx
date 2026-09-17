@@ -3,7 +3,7 @@ import { Text } from 'react-native';
 import ReactTestRenderer, { act } from 'react-test-renderer';
 import type { MobileAboutPage } from '../src/api/about';
 import AboutPageScreen from '../src/screens/home/AboutPageScreen';
-import {branding} from '../src/config/branding';
+import {branding} from '../src/config/brandingConfig';
 
 const mockFetchAboutPage = jest.fn();
 const mockFetchPublicSupportContact = jest.fn();

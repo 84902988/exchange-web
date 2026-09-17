@@ -1,4 +1,4 @@
-import {branding} from '../config/branding';
+import {branding} from '../config/brandingConfig';
 import {assetEn, assetJa, assetZhCN, assetZhTW} from './assetCatalog';
 import {
   appShellEn,

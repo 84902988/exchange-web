@@ -1,5 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import {branding} from '../src/config/branding';
+import {branding} from '../src/config/brandingConfig';
 import {
   __resetMarketFavoritesForTests,
   getCachedMarketFavoriteSymbols,

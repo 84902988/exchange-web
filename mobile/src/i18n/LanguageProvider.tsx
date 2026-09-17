@@ -1,5 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import {branding} from '../config/branding';
+import {branding} from '../config/brandingConfig';
 import React, {
   createContext,
   useCallback,

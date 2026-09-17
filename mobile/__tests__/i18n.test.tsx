@@ -1,5 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import {branding} from '../src/config/branding';
+import {branding} from '../src/config/brandingConfig';
 import React from 'react';
 import {Pressable, Text} from 'react-native';
 import ReactTestRenderer, {act} from 'react-test-renderer';
