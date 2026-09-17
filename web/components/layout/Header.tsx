@@ -227,10 +227,10 @@ export default function Header() {
     <>
       <header className="relative flex h-14 items-center justify-between border-b border-white/10 bg-[#0a0a0d] px-3.5">
         {/* Left: Logo + Nav */}
-        <div className="flex items-center gap-4">
-          <Link href="/" className="flex items-center gap-2.5 hover:opacity-90 transition-opacity duration-200">
+        <div className="flex min-w-0 items-center gap-4">
+          <Link href="/" className="flex min-w-0 items-center gap-2.5 hover:opacity-90 transition-opacity duration-200">
             {siteBrand.logoUrl && (
-              <div className="h-9 w-9 overflow-hidden rounded-md">
+              <div className="h-9 w-9 shrink-0 overflow-hidden rounded-md">
                 {siteBrand.logoUrl.startsWith('/') ? (
                   <Image
                     src={siteBrand.logoUrl}
@@ -256,7 +256,7 @@ export default function Header() {
             </div>
           </Link>
 
-          <nav className="hidden items-center gap-7 md:flex">
+          <nav className="hidden items-center gap-4 2xl:flex">
             {menuConfig.items.map((item) => {
               const hasMegaMenu = 'megaMenu' in item;
               const translatedLabel = headerT(item.labelKey);
@@ -308,7 +308,39 @@ export default function Header() {
           </nav>
         </div>
 
-        <div className="flex items-center gap-3.5">
+        <div className="flex shrink-0 items-center gap-1 sm:gap-2.5 xl:gap-3.5">
+          <div className="relative hidden md:block" onMouseEnter={handleDownloadHover} onMouseLeave={handleDownloadLeave}>
+            {/* The download page is served by the deployment, outside the Next.js router. */}
+            <a
+              href="/download"
+              onFocus={handleDownloadHover}
+              onBlur={handleDownloadLeave}
+              className="inline-flex h-9 w-9 items-center justify-center gap-2 rounded-md border border-amber-400/30 bg-amber-400/10 text-sm font-semibold text-amber-400 transition-colors hover:bg-amber-400/20 md:w-auto md:px-3"
+              aria-label={headerT('downloadApp')}
+            >
+              <Image src="/icons/header-download-1.svg" alt="" width={14} height={14} className="h-3.5 w-3.5 object-contain" />
+              <span className="hidden whitespace-nowrap md:inline">{headerT('downloadApp')}</span>
+            </a>
+            {showQR && appQrItems.length > 0 && (
+              <div className="absolute right-0 top-full z-40 hidden w-[252px] pt-2 md:block">
+                <div className="rounded-lg border border-white/10 bg-[#0a0a0d] p-4 shadow-2xl shadow-black/40">
+                  <div className="text-sm font-semibold text-white">{appDownloadTitle}</div>
+                  <div className="mt-1 text-xs leading-5 text-white/55">{appDownloadSubtitle}</div>
+                  <div className={`mt-3 grid gap-3 ${appQrItems.length === 1 ? 'grid-cols-1' : 'grid-cols-2'}`}>
+                    {appQrItems.map((item) => (
+                      <div key={item.label}>
+                        <div className="mx-auto flex aspect-square max-w-36 items-center justify-center overflow-hidden rounded bg-white p-1">
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                          <img src={item.url} alt={`${item.label} ${headerT('qrCode')}`} className="h-full w-full object-contain" />
+                        </div>
+                        <div className="mt-2 text-center text-xs font-medium text-white/75">{item.label}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
           {!mounted ? (
             <div
               className="hidden h-9 w-[148px] md:block"
@@ -343,7 +375,7 @@ export default function Header() {
             </button>
           </div>
 
-          <Link href="/notice" className="relative">
+          <Link href="/notice" className="relative hidden sm:block">
             <button
               className="grid h-9 w-9 place-items-center rounded-md border border-white/0 bg-transparent text-white/90 hover:bg-white/10 transition-colors duration-200"
               aria-label={headerT('notice')}
@@ -359,45 +391,6 @@ export default function Header() {
 
           {stableIsLoggedIn && (
             <>
-              <div className="relative">
-                <button
-                  onMouseEnter={handleDownloadHover}
-                  onMouseLeave={handleDownloadLeave}
-                  className="grid h-9 w-9 place-items-center rounded-md border border-white/0 bg-transparent text-white/90 hover:bg-white/10 transition-colors duration-200"
-                  aria-label={headerT('download')}
-                >
-                  <Image src="/icons/header-download-1.svg" alt={headerT('download')} width={13} height={13} className="h-[13px] w-[13px] object-contain" />
-                </button>
-
-                {showQR && (
-                  <div
-                    className="absolute right-0 z-40 mt-2 w-[284px] rounded-md border border-white/10 bg-black/90 p-4 shadow-2xl shadow-black/40 backdrop-blur-sm"
-                    onMouseEnter={handleDownloadHover}
-                    onMouseLeave={handleDownloadLeave}
-                  >
-                    <div className="text-sm font-semibold text-white">{appDownloadTitle}</div>
-                    <div className="mt-1 text-xs leading-5 text-white/55">{appDownloadSubtitle}</div>
-                    {appQrItems.length > 0 ? (
-                      <div className="mt-3 grid grid-cols-2 gap-3">
-                        {appQrItems.map((item) => (
-                          <div key={item.label} className="rounded-md border border-white/10 bg-white/[0.04] p-2">
-                            <div className="flex aspect-square items-center justify-center overflow-hidden rounded bg-white">
-                              {/* eslint-disable-next-line @next/next/no-img-element */}
-                              <img src={item.url} alt={`${item.label} ${headerT('qrCode')}`} className="h-full w-full object-contain" />
-                            </div>
-                            <div className="mt-2 truncate text-center text-xs font-medium text-white/75">{item.label}</div>
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="mt-3 flex h-28 items-center justify-center rounded-md border border-dashed border-white/15 bg-white/[0.04] px-4 text-center text-xs leading-5 text-white/45">
-                        {headerT('appQrNotConfigured')}
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-
               <Link href="/asset">
                 <button
                   className="grid h-9 w-9 place-items-center rounded-md border border-white/0 bg-transparent text-white/90 hover:bg-white/10 transition-colors duration-200"
@@ -419,7 +412,7 @@ export default function Header() {
           
           <button
             onClick={() => setShowMobileMenu(true)}
-            className="md:hidden grid h-9 w-9 place-items-center rounded-md text-white/90 hover:bg-white/10"
+            className="2xl:hidden grid h-9 w-9 place-items-center rounded-md text-white/90 hover:bg-white/10"
             aria-label={headerT('menu')}
           >
             {'\u2630'}
