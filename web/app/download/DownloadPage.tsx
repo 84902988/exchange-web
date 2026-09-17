@@ -79,7 +79,6 @@ export default function DownloadPage({ configuration: config }: { configuration:
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img src={config.homePreviewUrl} alt={text('HomeAlt')} width={1080} height={2400} />
               </div>}
-              <div className={styles.previewLabel}><Icon kind="chart" /><span>{text('PreviewCaption')}<small>{text('PreviewSubcaption')}</small></span></div>
               <p className={styles.previewNote}>{text('PreviewNote')}</p>
             </div>
           )}

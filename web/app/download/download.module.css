@@ -30,9 +30,6 @@
 .back { width: 231px; left: 13px; top: 40px; transform: rotate(-8deg); filter: brightness(.85); }
 .front { right: 10px; top: 78px; transform: rotate(6deg); z-index: 2; }
 .previewNote { position: absolute; bottom: 0; left: 0; right: 0; text-align: center; font-size: 11px; color: #99989f; line-height: 1.5; }
-.previewLabel { position: absolute; z-index: 3; left: 8px; bottom: 112px; max-width: 94%; padding: 12px 18px; background: #151512f2; border: 1px solid #78612b5e; box-shadow: 0 10px 30px #0005; border-radius: 10px; display: flex; gap: 11px; align-items: center; font-size: 12px; }
-.previewLabel svg { color: #e3b442; }
-.previewLabel small { display: block; color: #aaa79f; font-size: 11px; }
 .features { padding-top: 55px; padding-bottom: 62px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 40px; }
 .feature { display: grid; grid-template-columns: 32px minmax(0, 1fr); gap: 13px; }
 .feature > svg { width: 29px; height: 29px; color: #e3b442; margin-top: 3px; }
@@ -62,7 +59,6 @@
   .front { right: 0; top: 90px; }
   .halo { width: 350px; height: 350px; left: 20px; }
   .features { gap: 25px; }
-  .previewLabel { left: 0; bottom: 85px; }
 }
 @media (max-width: 767px) {
   .wrap { padding-left: 24px; padding-right: 24px; }
@@ -80,7 +76,6 @@
   .back { width: 51%; left: 3%; top: 24px; }
   .front { right: 3%; top: 60px; }
   .halo { width: 280px; height: 280px; left: 20px; top: 90px; }
-  .previewLabel { bottom: 72px; left: 0; padding: 10px 14px; font-size: 11px; }
   .previewNote { font-size: 10px; }
   .features { padding-top: 36px; padding-bottom: 36px; grid-template-columns: minmax(0, 1fr); gap: 26px; }
   .feature h2 { font-size: 16px; margin-bottom: 4px; }
