@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import enTranslations from '@/config/locales/en.json';
+import {withBrandName} from '@/lib/branding';
 
 // 语言类型定义
 type Locale = 'en' | 'zh' | 'zh-TW' | 'ja';
@@ -234,11 +235,11 @@ export default function useLocale() {
   const t = useCallback(<T extends string>(key: string, namespace: 'common' | 'auth' | 'home' | 'footer' | 'asset' | 'markets' | 'opportunities' | 'user' | 'committee' | 'contracts' | 'activity' | 'mastercard' = 'common'): T => {
     const activeTranslations = isInitialized ? translations : DEFAULT_TRANSLATIONS;
     const value = activeTranslations[namespace]?.[key];
-    if (typeof value === 'string') return value as T;
+    if (typeof value === 'string') return withBrandName(value) as T;
     
     // 返回key作为默认值
     const fallbackValue = DEFAULT_TRANSLATIONS[namespace]?.[key];
-    if (typeof fallbackValue === 'string') return fallbackValue as T;
+    if (typeof fallbackValue === 'string') return withBrandName(fallbackValue) as T;
     
     return '' as T;
   }, [isInitialized, translations]);

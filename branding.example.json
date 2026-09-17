@@ -1,0 +1,23 @@
+{
+  "displayName": "Example Trading",
+  "organization": "",
+  "supportEmail": "",
+  "iconBackground": "#1E293B",
+  "mobile": {
+    "displayName": "Example Trading",
+    "supportEmail": "",
+    "complianceLicenses": [],
+    "legacyLocaleStorageKeys": [],
+    "blackCard": {
+      "enabled": false,
+      "supportEmail": "",
+      "backgroundUrl": "",
+      "imageUrl": ""
+    },
+    "blackCardTranslations": {},
+    "legacyFavoritesStorageKeys": []
+  },
+  "webTranslations": {},
+  "assetOverrides": {},
+  "legacyFavoritesStorageKeys": []
+}

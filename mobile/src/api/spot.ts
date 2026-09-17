@@ -158,6 +158,16 @@ export type CancelSpotOrderResponse = {
 export type SpotFeeRates = {
   makerRate: number;
   takerRate: number;
+  payment: SpotFeePaymentContext;
+};
+
+export type SpotFeePaymentContext = {
+  useRcbFee: boolean;
+  platformEnabled: boolean;
+  payRatio: number;
+  minRcbFee: number;
+  spotRcbAvailable: number;
+  rcbUsdtPrice: number | null;
 };
 
 const SPOT_ORDER_SUCCESS_STATUSES = new Set([
@@ -1067,8 +1077,13 @@ function requireSpotFeeRate(value: unknown) {
   return rate;
 }
 
-export async function fetchSpotFeeRates(): Promise<SpotFeeRates> {
-  const payload = await apiClient.get<unknown>('/vip/overview');
+export async function fetchSpotFeeRates({
+  signal,
+}: { signal?: AbortSignal } = {}): Promise<SpotFeeRates> {
+  const [payload, payment] = await Promise.all([
+    apiClient.get<unknown>('/vip/overview', { signal }),
+    apiClient.get<unknown>('/spot/fee-payment-context', { signal }),
+  ]);
   if (
     !isRecord(payload) ||
     readString(payload, ['auth_state']).toLowerCase() !== 'authenticated' ||
@@ -1086,6 +1101,43 @@ export async function fetchSpotFeeRates(): Promise<SpotFeeRates> {
     takerRate: requireSpotFeeRate(
       payload.user_summary.effective_spot_taker_fee,
     ),
+    payment: normalizeSpotFeePaymentContext(payment),
+  };
+}
+
+function normalizeSpotFeePaymentContext(value: unknown): SpotFeePaymentContext {
+  const invalid = () =>
+    new ApiClientError(
+      '现货手续费抵扣条件暂不可用',
+      'SPOT_FEE_CONTEXT_INVALID',
+    );
+  if (
+    !isRecord(value) ||
+    typeof value.use_rcb_fee !== 'boolean' ||
+    typeof value.spot_rcb_fee_enabled !== 'boolean'
+  ) {
+    throw invalid();
+  }
+  const decimal = (raw: unknown) => {
+    if (
+      (typeof raw !== 'number' && typeof raw !== 'string') ||
+      String(raw).trim() === ''
+    )
+      throw invalid();
+    const parsed = Number(raw);
+    if (!Number.isFinite(parsed) || parsed < 0) throw invalid();
+    return parsed;
+  };
+  const payRatio = decimal(value.rcb_fee_discount_rate);
+  if (payRatio <= 0 || payRatio > 1) throw invalid();
+  return {
+    useRcbFee: value.use_rcb_fee,
+    platformEnabled: value.spot_rcb_fee_enabled,
+    payRatio,
+    minRcbFee: decimal(value.min_rcb_fee_amount),
+    spotRcbAvailable: decimal(value.rcb_spot_available),
+    rcbUsdtPrice:
+      value.rcb_usdt_price === null ? null : decimal(value.rcb_usdt_price),
   };
 }
 

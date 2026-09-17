@@ -17,6 +17,14 @@ const mockCreateSpotOrder = jest.fn();
 const mockFetchSpotBalances = jest.fn();
 const mockFetchSpotCurrentOrders = jest.fn();
 const mockFetchSpotFeeRates = jest.fn();
+const mockFeePayment = {
+  useRcbFee: false,
+  platformEnabled: true,
+  payRatio: 0.75,
+  minRcbFee: 0,
+  spotRcbAvailable: 1,
+  rcbUsdtPrice: 2,
+};
 const mockFetchSpotHistoryOrders = jest.fn();
 const mockFetchSpotKlines = jest.fn();
 const mockFetchSpotMyTrades = jest.fn();
@@ -326,6 +334,7 @@ describe('TradeScreen execution confirmation lifecycle', () => {
     mockFetchSpotFeeRates.mockResolvedValue({
       makerRate: 0.001,
       takerRate: 0.002,
+      payment: mockFeePayment,
     });
     mockFetchSpotHistoryOrders.mockResolvedValue([]);
     mockFetchSpotMyTrades.mockResolvedValue([]);
@@ -397,7 +406,7 @@ describe('TradeScreen execution confirmation lifecycle', () => {
 
     expect(mockNavigate).toHaveBeenCalledWith(
       'MarketDetail',
-      expect.objectContaining({initialKlines}),
+      expect.objectContaining({ initialKlines }),
     );
   });
 
@@ -412,7 +421,11 @@ describe('TradeScreen execution confirmation lifecycle', () => {
   it('recovers the fee estimate after a transient endpoint failure', async () => {
     mockFetchSpotFeeRates
       .mockRejectedValueOnce(new Error('backend restarting'))
-      .mockResolvedValue({makerRate: 0.001, takerRate: 0.002});
+      .mockResolvedValue({
+        makerRate: 0.001,
+        takerRate: 0.002,
+        payment: mockFeePayment,
+      });
 
     renderer = await renderReadyTradeScreen();
 
@@ -445,12 +458,54 @@ describe('TradeScreen execution confirmation lifecycle', () => {
     expect(mockOrderFormProps?.feedbackTone).not.toBe('error');
   });
 
+  it('shows USDT and a funding-to-spot hint when RCB deduction is on but spot RCB is empty', async () => {
+    mockFetchSpotFeeRates.mockResolvedValue({
+      makerRate: 0.001,
+      takerRate: 0.002,
+      payment: { ...mockFeePayment, useRcbFee: true, spotRcbAvailable: 0 },
+    });
+    renderer = await renderReadyTradeScreen();
+    expect(mockOrderFormProps?.estimatedFeeText).toBe('≈ 0.202 USDT');
+    expect(
+      renderer.root.findByProps({ testID: 'spot-fee-payment-hint' }).props
+        .children,
+    ).toContain('现货 RCB 不足');
+    expect(
+      renderer.root.findByProps({ testID: 'spot-fee-payment-hint' }).props
+        .children,
+    ).toContain('资金账户划转');
+    expect(mockCreateSpotOrder).not.toHaveBeenCalled();
+  });
+
+  it('shows RCB estimates and refreshes eligibility while staying on the trading page', async () => {
+    mockFetchSpotFeeRates
+      .mockResolvedValueOnce({
+        makerRate: 0.001,
+        takerRate: 0.002,
+        payment: { ...mockFeePayment, useRcbFee: true },
+      })
+      .mockResolvedValue({
+        makerRate: 0.001,
+        takerRate: 0.002,
+        payment: { ...mockFeePayment, useRcbFee: true, spotRcbAvailable: 0 },
+      });
+    renderer = await renderReadyTradeScreen();
+    expect(mockOrderFormProps?.estimatedFeeText).toBe('≈ 0.07575 RCB');
+    await act(async () => {
+      jest.advanceTimersByTime(30_000);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(mockOrderFormProps?.estimatedFeeText).toBe('≈ 0.202 USDT');
+    expect(mockCreateSpotOrder).not.toHaveBeenCalled();
+  });
+
   it('retries failed private synchronization when a guarded submit is pressed', async () => {
     mockFetchSpotBalances
       .mockRejectedValueOnce(new Error('现货余额暂不可用'))
       .mockResolvedValue([
-        {coinSymbol: 'BTC', availableAmount: 10, frozenAmount: 0},
-        {coinSymbol: 'USDT', availableAmount: 100_000, frozenAmount: 0},
+        { coinSymbol: 'BTC', availableAmount: 10, frozenAmount: 0 },
+        { coinSymbol: 'USDT', availableAmount: 100_000, frozenAmount: 0 },
       ]);
 
     await act(async () => {
@@ -466,10 +521,7 @@ describe('TradeScreen execution confirmation lifecycle', () => {
       await Promise.resolve();
     });
 
-    expect(Alert.alert).toHaveBeenCalledWith(
-      '无法提交',
-      '现货余额暂不可用',
-    );
+    expect(Alert.alert).toHaveBeenCalledWith('无法提交', '现货余额暂不可用');
     expect(mockFetchSpotBalances).toHaveBeenCalledTimes(2);
     expect(mockOrderFormProps?.availableText).toBe('100,000 USDT');
   });

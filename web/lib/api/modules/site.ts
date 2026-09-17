@@ -1,5 +1,6 @@
 import { publicRequest } from "@/lib/api/core/request";
 import { DEFAULT_SITE_LOGO_URL } from "@/lib/siteLogo";
+import { applicationName } from '@/lib/branding';
 import { getContentApiLanguage, withContentLanguage } from "@/lib/api/core/locale";
 import type { Language } from "@/utils/language";
 
@@ -118,7 +119,7 @@ export type LegalPageContent = {
 };
 
 export const fallbackSiteConfig: SiteConfig = {
-  site_name: "Exchange",
+  site_name: applicationName,
   site_slogan: "",
   logo_url: DEFAULT_SITE_LOGO_URL,
   support_email: "",

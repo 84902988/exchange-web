@@ -1,4 +1,5 @@
 'use client';
+import {applicationName} from '@/lib/branding';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
@@ -51,7 +52,7 @@ export default function LegalPage({ pageKey, titleKey }: LegalPageProps) {
       <section className="border-b border-white/10 bg-[#080b10] px-4 py-14 sm:px-6 lg:px-8">
         <div className="mx-auto max-w-4xl">
           <p className="mb-4 text-sm font-medium uppercase tracking-[0.22em] text-[#f0b90b]">
-            Exchange
+            {applicationName}
           </p>
           <h1 className="text-4xl font-semibold leading-tight text-white sm:text-5xl">
             {content?.title || fallbackTitle}

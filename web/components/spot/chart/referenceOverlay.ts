@@ -200,13 +200,13 @@ export function normalizeReferenceOverlayConfig(
   const symbol = normalizeReferenceOverlaySymbol(String(record.symbol || ''));
   if (!symbol) return null;
 
+  const sourcePrice = String(record.price_source || 'MANUAL').trim().toUpperCase();
   const rawSourcePriceLabel = typeof record.source_price_label === 'string'
     ? record.source_price_label.trim()
-    : typeof record.last_ref_label === 'string'
+    : record.source_price_label === undefined && sourcePrice === 'AUTO' && typeof record.last_ref_label === 'string'
       ? record.last_ref_label.trim()
       : null;
   const displayPrice = Number(record.display_price);
-  const sourcePrice = String(record.price_source || 'MANUAL').trim().toUpperCase();
   const goldDisplayPrice = kind === 'GOLD' && sourcePrice === 'AUTO'
     ? goldGramPriceFromSourceLabel(rawSourcePriceLabel)
     : null;
@@ -228,15 +228,21 @@ export function normalizeReferenceOverlayConfig(
   const customSourceLabel = readReferenceText(record.source_label) || readReferenceText(record.subtitle);
   const customDisplayValueLabel = readReferenceText(record.display_value_label);
   const title = copy.title;
+  // Also handle older APIs that return an obsolete AUTO label in MANUAL mode.
+  const sourcePriceLabel = kind === 'IRON' && sourcePrice === 'MANUAL'
+    ? normalizedDisplayPrice !== null
+      ? formatReferenceNumber(normalizedDisplayPrice * IRON62_USD_PER_TON_TO_MFC_USDT_DIVISOR)
+      : null
+    : rawSourcePriceLabel;
 
   return {
     enabled: true,
     kind,
     symbol,
     title,
-    valueLabel: sourcePrice === 'MANUAL' && customDisplayValueLabel ? customDisplayValueLabel : copy.valueLabel,
+    valueLabel: kind !== 'IRON' && sourcePrice === 'MANUAL' && customDisplayValueLabel ? customDisplayValueLabel : copy.valueLabel,
     sourceLabel: customSourceLabel || copy.sourceLabel,
-    sourcePriceLabel: kind === 'IRON' ? localizedIronSourcePriceLabel(rawSourcePriceLabel, t) : rawSourcePriceLabel,
+    sourcePriceLabel: kind === 'IRON' ? localizedIronSourcePriceLabel(sourcePriceLabel, t) : sourcePriceLabel,
     description: copy.description,
     lineTitle: copy.lineTitle || title,
     lineColor: String(record.line_color || '#f0b90b').trim(),

@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import {branding} from '../src/config/branding';
 import React from 'react';
 import {Pressable, Text} from 'react-native';
 import ReactTestRenderer, {act} from 'react-test-renderer';
@@ -34,6 +35,26 @@ function textByTestId(
 }
 
 describe('mobile i18n foundation', () => {
+  afterEach(() => {
+    branding.legacyLocaleStorageKeys.length = 0;
+  });
+  it('migrates a configured legacy language and prefers the current setting', async () => {
+    branding.legacyLocaleStorageKeys.push('example.previous.locale');
+    await AsyncStorage.setItem('example.previous.locale', 'ja');
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = ReactTestRenderer.create(<LanguageProvider><Probe /></LanguageProvider>);
+    });
+    expect(textByTestId(renderer, 'locale')).toBe('ja');
+    await expect(AsyncStorage.getItem(MOBILE_LOCALE_STORAGE_KEY)).resolves.toBe('ja');
+    act(() => renderer.unmount());
+    await AsyncStorage.setItem(MOBILE_LOCALE_STORAGE_KEY, 'en');
+    await act(async () => {
+      renderer = ReactTestRenderer.create(<LanguageProvider><Probe /></LanguageProvider>);
+    });
+    expect(textByTestId(renderer, 'locale')).toBe('en');
+    act(() => renderer.unmount());
+  });
   beforeEach(async () => {
     await AsyncStorage.clear();
   });

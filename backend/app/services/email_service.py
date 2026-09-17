@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Optional
+from html import escape
 
 from app.core.config import settings
 
@@ -38,22 +39,28 @@ def _get_client() -> DmClient:
 
 
 def _subject(scene: str, code: str) -> str:
+    brand = _brand_name()
     # 固定风格：更像事务型验证码
     if scene == "login":
-        return f"Exchange login code: {code}"
+        return f"{brand} login code: {code}"
     if scene == "reset":
-        return f"Exchange password reset code: {code}"
+        return f"{brand} password reset code: {code}"
     if scene == "verify_email":
-        return f"Exchange email verification code: {code}"
+        return f"{brand} email verification code: {code}"
     if scene == "change_email":
-        return f"Exchange email change code: {code}"
-    return f"Exchange verification code: {code}"
+        return f"{brand} email change code: {code}"
+    return f"{brand} verification code: {code}"
+
+
+def _brand_name() -> str:
+    return str(settings.ALIYUN_DM_FROM_ALIAS or "Exchange").replace("\r", "").replace("\n", "").strip() or "Exchange"
 
 
 def _bodies(scene: str, code: str, expire_minutes: int) -> tuple[str, str]:
+    brand = _brand_name()
     # TextBody：强烈建议带，全球投递更稳
     text_body = (
-        f"Your Exchange verification code is: {code}\n\n"
+        f"Your {brand} verification code is: {code}\n\n"
         f"This code expires in {expire_minutes} minutes.\n\n"
         "If you didn’t request this, you can ignore this email.\n"
     )
@@ -74,7 +81,7 @@ def _bodies(scene: str, code: str, expire_minutes: int) -> tuple[str, str]:
     html_body = f"""
     <div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;color:#111">
       <p><b>{title}</b></p>
-      <p>Your Exchange verification code is:</p>
+      <p>Your {escape(brand)} verification code is:</p>
       <p style="font-size:22px;font-weight:bold;letter-spacing:2px;margin:8px 0">{code}</p>
       <p>This code expires in <b>{expire_minutes} minutes</b>.</p>
       <p style="color:#666">If you didn’t request this, you can ignore this email.</p>

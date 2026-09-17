@@ -1,6 +1,6 @@
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -17,6 +17,7 @@ from app.services.spot_query import (
     get_spot_balances,
 )
 from app.services.spot_fee_settings_service import load_spot_fee_settings
+from app.services.spot_fee_preview_service import get_spot_fee_payment_context
 
 router = APIRouter(
     prefix="/spot",
@@ -39,6 +40,16 @@ def spot_fee_settings(db: Session = Depends(get_db)):
         "rcb_fee_discount_rate": str(settings.rcb_fee_discount_rate),
         "min_rcb_fee_amount": str(settings.min_rcb_fee_amount),
     }
+
+
+@router.get("/fee-payment-context", summary="获取当前账户的现货手续费抵扣条件")
+def spot_fee_payment_context(
+    response: Response,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(get_current_user_id),
+):
+    response.headers["Cache-Control"] = "private, no-store"
+    return get_spot_fee_payment_context(db, int(user_id))
 
 
 # =========================

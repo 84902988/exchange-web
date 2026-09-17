@@ -3,6 +3,7 @@ import { Text } from 'react-native';
 import ReactTestRenderer, { act } from 'react-test-renderer';
 import type { MobileAboutPage } from '../src/api/about';
 import AboutPageScreen from '../src/screens/home/AboutPageScreen';
+import {branding} from '../src/config/branding';
 
 const mockFetchAboutPage = jest.fn();
 const mockFetchPublicSupportContact = jest.fn();
@@ -85,6 +86,19 @@ function textValues(renderer: ReactTestRenderer.ReactTestRenderer) {
 }
 
 describe('mobile about page screen', () => {
+  it('renders only explicitly supplied company notices', async () => {
+    branding.complianceLicenses.push({title: '示例登记信息', subtitle: 'Example registration'});
+    try {
+      mockFetchAboutPage.mockResolvedValue(page());
+      let renderer!: ReactTestRenderer.ReactTestRenderer;
+      await act(async () => { renderer = ReactTestRenderer.create(screen()); });
+      expect(textValues(renderer)).toContain('Example registration');
+      expect(renderer.root.findAllByProps({testID: 'about-compliance-licenses'}).length).toBeGreaterThan(0);
+      act(() => renderer.unmount());
+    } finally {
+      branding.complianceLicenses.length = 0;
+    }
+  });
   beforeEach(() => {
     jest.clearAllMocks();
     mockFetchPublicSupportContact.mockResolvedValue({
@@ -112,35 +126,12 @@ describe('mobile about page screen', () => {
         '我们的价值观',
         '用户至上',
         '用户的信任是持续发展的动力。',
-        'LICENSES & REGULATIONS',
-        '全球合规牌照',
-        '美国 TRUST 信托银行牌照',
-        'US TRUST Bank License',
-        'Dubai DFSA Qualified Investor Fund (QIF)',
-        'BVI 私募基金牌照',
-        'BVI Private Fund License',
-        '香港证监会9号资产管理牌照',
-        'HK SFC Type 9 Asset Management License',
-        '美国 FinCEN MSB 牌照',
-        'US FinCEN MSB License',
-        '美国 SEC 券商牌照',
-        'US SEC Broker-Dealer License',
-        'Mauritius FSC Investment Dealer License',
-        'Mauritius FSC Derivative Dealer License',
         '联系支持',
         '官方支持邮箱',
         'info@service.example',
       ]),
     );
-    const licenseAccessibilityLabels = new Set(
-      renderer.root
-        .findByProps({ testID: 'about-compliance-licenses' })
-        .findAll(
-          node => typeof node.props.accessibilityLabel === 'string',
-        )
-        .map(node => node.props.accessibilityLabel),
-    );
-    expect(licenseAccessibilityLabels.size).toBe(8);
+    expect(renderer.root.findAllByProps({ testID: 'about-compliance-licenses' })).toHaveLength(0);
     expect(textValues(renderer)).not.toContain('部分平台介绍内容暂未配置');
     expect(mockFetchAboutPage).toHaveBeenCalledWith({
       locale: 'zh-CN',

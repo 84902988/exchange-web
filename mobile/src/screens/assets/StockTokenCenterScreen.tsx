@@ -233,6 +233,7 @@ function LockCard({item, t}: {item: StockTokenLock; t: Translator}) {
         label={t('stockToken.dailyRelease')}
         value={`${formatDecimalAsPercent(item.dailyReleaseRate)}%`}
       />
+      <InlineNotice>{t('stockToken.releaseSnapshotNotice')}</InlineNotice>
       <InfoRow
         label={t('stockToken.lockPeriod')}
         value={t('stockToken.days', {count: item.lockDays})}

@@ -128,6 +128,9 @@ describe('mobile VIP RCB fee preference', () => {
     expect(mockUpdatePreference).toHaveBeenCalledWith(true);
     expect(preferenceSwitch(renderer).props.value).toBe(true);
     expect(screenText(renderer)).toContain('已开启 RCB 手续费抵扣');
+    act(() =>
+      renderer.root.findByProps({ accessibilityLabel: 'SVIP' }).props.onPress(),
+    );
     expect(screenText(renderer)).toContain('人数上限 88 人');
     expect(screenText(renderer)).toContain('分红比例 5%');
     act(() => renderer.unmount());
@@ -237,5 +240,79 @@ describe('mobile VIP RCB fee preference', () => {
     expect(mockUpdatePreference).not.toHaveBeenCalled();
     act(() => renderer.unmount());
     await AsyncStorage.removeItem(MOBILE_LOCALE_STORAGE_KEY);
+  });
+
+  it('switches level groups without changing account fees or fetching again', async () => {
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = ReactTestRenderer.create(<VipCenterScreen />);
+      await flushPromises();
+    });
+    const tab = (label: string) =>
+      renderer.root.findByProps({ accessibilityLabel: label });
+    expect(tab('VIP').props.accessibilityState.selected).toBe(true);
+    expect(screenText(renderer)).not.toContain('SVIP 2');
+    expect(screenText(renderer)).toContain('30 日交易量 ≥ 10,000 USDT');
+
+    act(() => tab('SVIP').props.onPress());
+    expect(tab('SVIP').props.accessibilityRole).toBe('tab');
+    expect(tab('SVIP').props.accessibilityState.selected).toBe(true);
+    expect(tab('VIP').props.accessibilityState.selected).toBe(false);
+    expect(screenText(renderer)).toContain('SVIP 2');
+    expect(screenText(renderer)).not.toContain('30 日交易量 ≥ 10,000 USDT');
+    expect(screenText(renderer)).toContain('锁仓数量 ≥ 2,000 RCB');
+    expect(screenText(renderer)).toContain('当前费率来源：VIP');
+    expect(preferenceSwitch(renderer).props.value).toBe(false);
+
+    act(() => tab('VIP').props.onPress());
+    expect(screenText(renderer)).not.toContain('SVIP 2');
+    expect(mockFetchOverview).toHaveBeenCalledTimes(1);
+    expect(mockUpdatePreference).not.toHaveBeenCalled();
+    act(() => renderer.unmount());
+  });
+
+  it('opens the current SVIP group and only marks the actual current level', async () => {
+    mockFetchOverview.mockResolvedValue({
+      ...overview,
+      effectiveFeeSource: 'SVIP',
+      effectiveLevelCode: 'SVIP2',
+    });
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = ReactTestRenderer.create(<VipCenterScreen />);
+      await flushPromises();
+    });
+    expect(
+      renderer.root.findByProps({ accessibilityLabel: 'SVIP' }).props
+        .accessibilityState.selected,
+    ).toBe(true);
+    expect(screenText(renderer)).not.toContain('VIP 1');
+    expect(screenText(renderer)).toContain('SVIP 2');
+    const currentBadges = () =>
+      renderer.root
+        .findAllByType(Text)
+        .filter(node => node.props.children === '当前等级');
+    const before = currentBadges().length;
+    act(() =>
+      renderer.root.findByProps({ accessibilityLabel: 'VIP' }).props.onPress(),
+    );
+    expect(currentBadges()).toHaveLength(before - 1);
+    expect(screenText(renderer)).toContain('当前费率来源：SVIP');
+    act(() => renderer.unmount());
+  });
+
+  it('shows an empty group without mixing in levels from the other group', async () => {
+    mockFetchOverview.mockResolvedValue({ ...overview, svipLevels: [] });
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = ReactTestRenderer.create(<VipCenterScreen />);
+      await flushPromises();
+    });
+    act(() =>
+      renderer.root.findByProps({ accessibilityLabel: 'SVIP' }).props.onPress(),
+    );
+    expect(screenText(renderer)).toContain('暂无该分组的等级信息');
+    expect(screenText(renderer)).not.toContain('30 日交易量 ≥ 10,000 USDT');
+    act(() => renderer.unmount());
   });
 });

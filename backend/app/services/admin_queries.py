@@ -11839,7 +11839,7 @@ def _admin_reference_overlay_row(row: Dict[str, Any]) -> Dict[str, Any]:
     last_ref_price_text = "" if row.get("last_ref_price") is None else _admin_amount_display(row.get("last_ref_price"))
     effective_display_price = last_ref_price_text if price_source == "AUTO" and last_ref_price_text else display_price_text
     effective_display_label = row.get("display_value_label") or ""
-    source_price_label = row.get("last_ref_label") or ""
+    source_price_label = (row.get("last_ref_label") or "") if price_source == "AUTO" else ""
     if price_source == "AUTO" and reference_type == "GOLD":
         gold_display_price = _admin_gold_gram_display_price(source_price_label)
         if gold_display_price:
@@ -11847,8 +11847,11 @@ def _admin_reference_overlay_row(row: Dict[str, Any]) -> Dict[str, Any]:
             effective_display_label = f"{gold_display_price} USD/g"
         elif effective_display_price:
             effective_display_label = f"{effective_display_price} USD/g"
-    elif price_source == "AUTO" and reference_type == "IRON" and effective_display_price:
+    elif reference_type == "IRON" and effective_display_price:
         effective_display_label = f"{effective_display_price} USD/公斤"
+        if price_source == "MANUAL":
+            ton_price = _admin_amount_display(_parse_decimal(effective_display_price) * Decimal("1000"))
+            source_price_label = f"{ton_price} USD/吨"
     elif not effective_display_label and effective_display_price:
         effective_display_label = f"{effective_display_price} {row.get('display_unit') or ''}".strip()
     if price_source == "MANUAL" and market_status == "UNKNOWN" and not row.get("price_time"):
@@ -15514,7 +15517,7 @@ def _admin_active_meta(value: Any) -> tuple[str, str]:
 
 def _admin_percent_number_display(value: Any) -> str:
     amount = _parse_decimal(value)
-    text_value = format((amount * Decimal("100")).quantize(Decimal("0.0001")).normalize(), "f")
+    text_value = format((amount * Decimal("100")).normalize(), "f")
     return "0" if text_value == "-0" else text_value
 
 

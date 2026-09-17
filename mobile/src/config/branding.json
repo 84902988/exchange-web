@@ -1,0 +1,14 @@
+{
+  "displayName": "Exchange",
+  "supportEmail": "",
+  "complianceLicenses": [],
+  "legacyLocaleStorageKeys": [],
+  "blackCard": {
+    "enabled": false,
+    "supportEmail": "",
+    "backgroundUrl": "",
+    "imageUrl": ""
+  },
+  "blackCardTranslations": {},
+  "legacyFavoritesStorageKeys": []
+}

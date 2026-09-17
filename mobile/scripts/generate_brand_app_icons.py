@@ -3,40 +3,34 @@
 from __future__ import annotations
 
 import base64
+import argparse
 import io
 import json
-import re
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageColor
 
 
 MOBILE_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = MOBILE_ROOT.parent
-MASTER_SVG = REPO_ROOT / "web/public/icons/logo-1.svg"
-FALLBACK_LOGO = MOBILE_ROOT / "src/assets/brand/app-logo.png"
-BACKGROUND = (8, 10, 13, 255)
+# The system applies the launcher mask. Fill the entire canvas so iOS does
+# not show an inset icon with dark corners inside its rounded square.
+BACKGROUND = (30, 41, 59, 255)
 
 
 def load_master_logo() -> Image.Image:
-    if MASTER_SVG.is_file():
-        text = MASTER_SVG.read_text(encoding="utf-8")
-        match = re.search(r"base64,([^\"]+)", text)
-        if match:
-            return Image.open(io.BytesIO(base64.b64decode(match.group(1)))).convert("RGBA")
-    return Image.open(FALLBACK_LOGO).convert("RGBA")
+    # Draw a neutral code-native mark; no client artwork is bundled by default.
+    image = Image.new('RGBA', (512, 512), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((84, 143, 366, 183), radius=20, fill='white')
+    draw.polygon([(325, 93), (429, 163), (325, 233)], fill='white')
+    draw.rounded_rectangle((146, 329, 428, 369), radius=20, fill='white')
+    draw.polygon([(187, 279), (83, 349), (187, 419)], fill='white')
+    return image
 
 
 def composite_icon(logo: Image.Image, size: int, logo_ratio: float, *, round_icon: bool = False) -> Image.Image:
     canvas = Image.new("RGBA", (size, size), BACKGROUND)
-    draw = ImageDraw.Draw(canvas)
-    for radius_ratio, alpha in ((0.46, 18), (0.36, 24), (0.26, 30)):
-        radius = int(size * radius_ratio)
-        center = size // 2
-        draw.ellipse(
-            (center - radius, center - radius, center + radius, center + radius),
-            fill=(205, 151, 32, alpha),
-        )
     target = max(1, int(size * logo_ratio))
     resized = logo.resize((target, target), Image.Resampling.LANCZOS)
     offset = ((size - target) // 2, (size - target) // 2)
@@ -92,10 +86,33 @@ def generate_ios(logo: Image.Image) -> None:
 
 
 def main() -> None:
-    logo = load_master_logo()
+    global REPO_ROOT, MOBILE_ROOT, BACKGROUND
+    parser = argparse.ArgumentParser(description='Render neutral or externally supplied application icons')
+    parser.add_argument('--root', type=Path, default=REPO_ROOT)
+    parser.add_argument('--logo', type=Path)
+    parser.add_argument('--background', default='#1E293B')
+    args = parser.parse_args()
+    REPO_ROOT = args.root.resolve()
+    MOBILE_ROOT = REPO_ROOT / 'mobile'
+    BACKGROUND = ImageColor.getrgb(args.background) + (255,)
+    logo = Image.open(args.logo).convert('RGBA') if args.logo else load_master_logo()
     generate_android(logo)
     generate_ios(logo)
-    print("Exchange Android and iOS icons generated.")
+    bundled = MOBILE_ROOT / 'src/assets/brand/app-logo.png'
+    bundled.parent.mkdir(parents=True, exist_ok=True)
+    composite_icon(logo, 512, .82).save(bundled, optimize=True)
+    colors = MOBILE_ROOT / 'android/app/src/main/res/values/colors.xml'
+    colors.write_text('<resources>\n    <color name="launcher_background">'+args.background+'</color>\n</resources>\n', encoding='utf-8')
+    public = REPO_ROOT / 'web/public'
+    icons = public / 'icons'
+    icons.mkdir(parents=True, exist_ok=True)
+    for filename, size in [('app-logo-256.png',256),('app-favicon-32.png',32),('app-apple-touch-icon.png',180)]:
+        composite_icon(logo,size,.82).save(icons/filename,optimize=True)
+    composite_icon(logo,64,.82).save(public/'favicon.ico',sizes=[(16,16),(32,32),(48,48),(64,64)])
+    data=io.BytesIO();composite_icon(logo,256,.82).save(data,format='PNG',optimize=True)
+    encoded=base64.b64encode(data.getvalue()).decode('ascii')
+    (icons/'logo-1.svg').write_text('<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256"><image width="256" height="256" href="data:image/png;base64,'+encoded+'"/></svg>\n',encoding='utf-8')
+    print("Neutral or configured Android, iOS and web icons generated.")
 
 
 if __name__ == "__main__":

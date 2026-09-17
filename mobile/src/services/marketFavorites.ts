@@ -1,3 +1,4 @@
+import {branding} from '../config/branding';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 export const MARKET_FAVORITES_STORAGE_KEY =
@@ -51,13 +52,29 @@ export function subscribeMarketFavoriteSymbols(
   return () => listeners.delete(listener);
 }
 
+async function readStoredFavorites() {
+  const current = await AsyncStorage.getItem(MARKET_FAVORITES_STORAGE_KEY);
+  if (current !== null) return current;
+  for (const key of branding.legacyFavoritesStorageKeys) {
+    const previous = await AsyncStorage.getItem(key);
+    if (previous === null) continue;
+    try {
+      const symbols = normalizeMarketFavoriteSymbols(JSON.parse(previous));
+      const migrated = JSON.stringify({version: 1, symbols});
+      await AsyncStorage.setItem(MARKET_FAVORITES_STORAGE_KEY, migrated).catch(() => undefined);
+      return migrated;
+    } catch { /* Ignore an invalid legacy value. */ }
+  }
+  return null;
+}
+
 export function loadMarketFavoriteSymbols() {
   if (cachedSymbols) {
     return Promise.resolve([...cachedSymbols]);
   }
   if (loadPromise) return loadPromise;
 
-  loadPromise = AsyncStorage.getItem(MARKET_FAVORITES_STORAGE_KEY)
+  loadPromise = readStoredFavorites()
     .then(raw => {
       if (!raw) return [];
       try {

@@ -6,6 +6,7 @@ import type {
 } from '../src/api/mobileContent';
 import type { MarketInstrument } from '../src/api/market';
 import {
+  MOBILE_HOME_CONTENT_REFRESH_MS,
   MOBILE_HOME_MARKET_REFRESH_MS,
   useMobileHomeData,
   type MobileHomeDataState,
@@ -275,8 +276,8 @@ describe('useMobileHomeData', () => {
         error: null,
       });
       mockFetchMobileMarkets
-        .mockResolvedValueOnce([{...market('market-1'), price: 100}])
-        .mockResolvedValueOnce([{...market('market-1'), price: 101}]);
+        .mockResolvedValueOnce([{ ...market('market-1'), price: 100 }])
+        .mockResolvedValueOnce([{ ...market('market-1'), price: 101 }]);
 
       let renderer!: ReactTestRenderer.ReactTestRenderer;
       act(() => {
@@ -321,11 +322,126 @@ describe('useMobileHomeData', () => {
       const cleanup = await startFocus();
 
       act(() => {
-        jest.advanceTimersByTime(MOBILE_HOME_MARKET_REFRESH_MS * 3);
+        jest.advanceTimersByTime(MOBILE_HOME_CONTENT_REFRESH_MS * 3);
       });
 
       expect(mockLoadMobileContentBootstrap).not.toHaveBeenCalled();
       expect(mockFetchMobileMarkets).not.toHaveBeenCalled();
+      act(() => {
+        cleanup?.();
+        renderer.unmount();
+      });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('refreshes operator copy while staying on home and stops after leaving', async () => {
+    jest.useFakeTimers();
+    try {
+      const updated = snapshot('updated');
+      updated.homeConfig.quickEntries = [
+        {
+          id: 'DEPOSIT',
+          title: 'Deposit',
+          description: 'Updated deposit copy',
+        },
+      ];
+      mockLoadMobileContentBootstrap
+        .mockResolvedValueOnce({ snapshot: snapshot('initial'), error: null })
+        .mockResolvedValue({ snapshot: updated, error: null });
+      mockFetchMobileMarkets.mockResolvedValue([]);
+      let renderer!: ReactTestRenderer.ReactTestRenderer;
+      act(() => {
+        renderer = ReactTestRenderer.create(<Probe />);
+      });
+      const cleanup = await startFocus();
+      expect(latestState?.content?.revision).toBe('initial');
+
+      await act(async () => {
+        jest.advanceTimersByTime(MOBILE_HOME_CONTENT_REFRESH_MS);
+      });
+      expect(mockLoadMobileContentBootstrap).toHaveBeenCalledTimes(2);
+      expect(latestState?.content?.homeConfig.quickEntries[0].description).toBe(
+        'Updated deposit copy',
+      );
+      expect(latestState?.contentLoading).toBe(false);
+
+      act(() => {
+        cleanup?.();
+        renderer.unmount();
+      });
+      await act(async () => {
+        jest.advanceTimersByTime(MOBILE_HOME_CONTENT_REFRESH_MS * 2);
+      });
+      expect(mockLoadMobileContentBootstrap).toHaveBeenCalledTimes(2);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('does not overlap content requests and ignores a late polling response', async () => {
+    jest.useFakeTimers();
+    try {
+      const pending = deferred<MobileContentLoadResult>();
+      mockLoadMobileContentBootstrap
+        .mockResolvedValueOnce({ snapshot: snapshot('initial'), error: null })
+        .mockReturnValue(pending.promise);
+      mockFetchMobileMarkets.mockResolvedValue([]);
+      let renderer!: ReactTestRenderer.ReactTestRenderer;
+      act(() => {
+        renderer = ReactTestRenderer.create(<Probe />);
+      });
+      const cleanup = await startFocus();
+      await act(async () => {
+        jest.advanceTimersByTime(MOBILE_HOME_CONTENT_REFRESH_MS);
+      });
+      await act(async () => {
+        jest.advanceTimersByTime(MOBILE_HOME_CONTENT_REFRESH_MS * 2);
+      });
+      expect(mockLoadMobileContentBootstrap).toHaveBeenCalledTimes(2);
+      expect(latestState?.content?.revision).toBe('initial');
+      act(() => {
+        cleanup?.();
+      });
+      await act(async () => {
+        pending.resolve({
+          snapshot: snapshot('late'),
+          source: 'network',
+          error: null,
+        });
+      });
+      expect(latestState?.content?.revision).toBe('initial');
+      act(() => {
+        renderer.unmount();
+      });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('retries content on the next interval after a failed refresh', async () => {
+    jest.useFakeTimers();
+    try {
+      mockLoadMobileContentBootstrap
+        .mockResolvedValueOnce({ snapshot: snapshot('initial'), error: null })
+        .mockRejectedValueOnce(new Error('offline'))
+        .mockResolvedValue({ snapshot: snapshot('recovered'), error: null });
+      mockFetchMobileMarkets.mockResolvedValue([]);
+      let renderer!: ReactTestRenderer.ReactTestRenderer;
+      act(() => {
+        renderer = ReactTestRenderer.create(<Probe />);
+      });
+      const cleanup = await startFocus();
+      await act(async () => {
+        jest.advanceTimersByTime(MOBILE_HOME_CONTENT_REFRESH_MS);
+      });
+      expect(latestState?.contentError).toBeTruthy();
+      await act(async () => {
+        jest.advanceTimersByTime(MOBILE_HOME_CONTENT_REFRESH_MS);
+      });
+      expect(latestState?.content?.revision).toBe('recovered');
+      expect(latestState?.contentError).toBeNull();
       act(() => {
         cleanup?.();
         renderer.unmount();

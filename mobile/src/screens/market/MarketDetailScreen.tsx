@@ -7,12 +7,9 @@ import React, {
   useState,
 } from 'react';
 import {
-  Animated,
-  Easing,
   Pressable,
   StyleSheet,
   Text,
-  useWindowDimensions,
   View,
 } from 'react-native';
 import { usePreventRemove } from '@react-navigation/native';
@@ -54,16 +51,6 @@ export function getMarketDetailScreenOptions(fullscreen: boolean) {
       };
 }
 
-export function getMarketDetailFullscreenPresentation(
-  requested: boolean,
-  isLandscape: boolean,
-) {
-  return {
-    fullscreen: requested && isLandscape,
-    transitioning: requested !== isLandscape,
-  } as const;
-}
-
 export default function MarketDetailScreen({ navigation, route }: Props) {
   const params = useMemo(
     () => parseMarketDetailRouteParams(route.params),
@@ -86,59 +73,7 @@ function ValidMarketDetail({
   const [interval, setInterval] = useState<KlineInterval>(
     params.initialInterval ?? '1m',
   );
-  const { height, width } = useWindowDimensions();
-  const isLandscape = width > height;
   const [fullscreenRequested, setFullscreenRequested] = useState(false);
-  const orientationTransitionRef = useRef<View>(null);
-  const orientationTransitionDots = useMemo(
-    () => [
-      new Animated.Value(0.35),
-      new Animated.Value(0.35),
-      new Animated.Value(0.35),
-    ],
-    [],
-  );
-  const fullscreenPresentation = getMarketDetailFullscreenPresentation(
-    fullscreenRequested,
-    isLandscape,
-  );
-
-  useEffect(() => {
-    if (!fullscreenPresentation.transitioning) {
-      orientationTransitionDots.forEach(dot => {
-        dot.stopAnimation();
-        dot.setValue(0.35);
-      });
-      return undefined;
-    }
-
-    const animations = orientationTransitionDots.map((dot, index) =>
-      Animated.loop(
-        Animated.sequence([
-          Animated.delay(index * 120),
-          Animated.timing(dot, {
-            toValue: 1,
-            duration: 180,
-            easing: Easing.inOut(Easing.ease),
-            useNativeDriver: true,
-          }),
-          Animated.timing(dot, {
-            toValue: 0.35,
-            duration: 180,
-            easing: Easing.inOut(Easing.ease),
-            useNativeDriver: true,
-          }),
-          Animated.delay((orientationTransitionDots.length - index - 1) * 120),
-        ]),
-      ),
-    );
-    animations.forEach(animation => animation.start());
-
-    return () => animations.forEach(animation => animation.stop());
-  }, [
-    fullscreenPresentation.transitioning,
-    orientationTransitionDots,
-  ]);
 
   useLayoutEffect(() => {
     navigation.setOptions(getMarketDetailScreenOptions(false));
@@ -146,9 +81,8 @@ function ValidMarketDetail({
 
   const requestFullscreen = useCallback(
     (next: boolean) => {
-      orientationTransitionRef.current?.setNativeProps({
-        style: { opacity: 1 },
-      });
+      // Rotation is a best-effort native request. iPad multitasking and Android
+      // windowing can keep a portrait viewport; the chart and exit must remain usable.
       setFullscreenRequested(next);
       navigation.setOptions(getMarketDetailScreenOptions(next));
     },
@@ -173,7 +107,7 @@ function ValidMarketDetail({
 
   const sharedUi = {
     active,
-    fullscreen: fullscreenPresentation.fullscreen,
+    fullscreen: fullscreenRequested,
     interval,
     onBack: handleBack,
     onEnterFullscreen: handleEnterFullscreen,
@@ -188,45 +122,6 @@ function ValidMarketDetail({
       ) : (
         <ContractMarketDetail params={params} {...sharedUi} />
       )}
-      <View
-        pointerEvents={fullscreenPresentation.transitioning ? 'auto' : 'none'}
-        ref={orientationTransitionRef}
-        style={[
-          styles.orientationTransition,
-          fullscreenPresentation.transitioning
-            ? null
-            : styles.orientationTransitionHidden,
-        ]}
-        testID="market-detail-orientation-transition"
-      >
-        <View
-          accessibilityLabel="正在切换全屏"
-          accessibilityRole="progressbar"
-          style={styles.orientationTransitionDots}
-          testID="market-detail-orientation-transition-dots"
-        >
-          {orientationTransitionDots.map((opacity, index) => (
-            <Animated.View
-              key={index}
-              style={[
-                styles.orientationTransitionDot,
-                {
-                  opacity,
-                  transform: [
-                    {
-                      scale: opacity.interpolate({
-                        inputRange: [0.35, 1],
-                        outputRange: [0.82, 1],
-                      }),
-                    },
-                  ],
-                },
-              ]}
-              testID={`market-detail-orientation-transition-dot-${index + 1}`}
-            />
-          ))}
-        </View>
-      </View>
     </View>
   );
 }
@@ -463,29 +358,6 @@ function InvalidRoute({ onBack }: { onBack: () => void }) {
 
 const styles = StyleSheet.create({
   detailRoot: { flex: 1, backgroundColor: colors.bg },
-  orientationTransition: {
-    position: 'absolute',
-    top: 0,
-    right: 0,
-    bottom: 0,
-    left: 0,
-    zIndex: 100,
-    backgroundColor: colors.bg,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  orientationTransitionHidden: { opacity: 0 },
-  orientationTransitionDots: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 9,
-  },
-  orientationTransitionDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: colors.primary,
-  },
   pressed: { opacity: 0.8, transform: [{ scale: 0.992 }] },
   invalidSafe: {
     flex: 1,

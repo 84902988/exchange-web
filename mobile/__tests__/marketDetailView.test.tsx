@@ -491,6 +491,22 @@ describe('MarketDetailView', () => {
     expect(nativeChartMounts).toBe(1);
     expect(nativeChartUnmounts).toBe(0);
 
+    // The native rotation request may be ignored or arrive after fullscreen.
+    // Resize the same chart across tablet, phone and narrow-window viewports.
+    for (const [width, height] of [[820, 1180], [1180, 820], [375, 1024], [390, 844]]) {
+      act(() => {
+        const metrics = {width, height, scale: 1, fontScale: 1};
+        Dimensions.set({screen: metrics, window: metrics});
+      });
+      const exit = renderer.root.findByProps({testID: 'market-detail-fullscreen-button'});
+      expect(exit.props.disabled).toBe(false);
+      act(() => exit.props.onPress());
+      expect(baseProps.onExitFullscreen).toHaveBeenCalled();
+      expect(nativeChartProps?.height).toBeGreaterThan(0);
+      expect(nativeChartMounts).toBe(1);
+      expect(nativeChartUnmounts).toBe(0);
+    }
+
     for (let index = 0; index < 20; index += 1) {
       act(() => {
         renderer.update(

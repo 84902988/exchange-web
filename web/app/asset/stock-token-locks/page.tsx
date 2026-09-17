@@ -12,6 +12,7 @@ import {
   type StockTokenLockItem,
 } from "@/lib/api/modules/stockToken";
 import { fallbackSiteConfig, getSiteConfig, type SiteConfig } from "@/lib/api/modules/site";
+import { formatDailyReleaseRate } from "@/lib/stockTokenDisplay";
 
 type AssetTranslator = (key: string, namespace?: "asset") => string;
 
@@ -115,12 +116,6 @@ function toNumber(value: string) {
 function formatPercent(value: number) {
   const percent = Math.min(Math.max(value, 0), 100);
   return `${percent.toFixed(2).replace(/\.?0+$/, "")}%`;
-}
-
-function formatDailyReleaseRate(value: string) {
-  const rate = toNumber(value);
-  const percent = rate > 1 ? rate : rate * 100;
-  return formatPercent(percent);
 }
 
 function releasedPercent(item: StockTokenLockItem) {
@@ -487,6 +482,9 @@ export default function StockTokenLocksPage() {
                             {formatDateOnly(item.release_start_at)} - {formatDateOnly(item.release_finish_at)}
                           </span>
                         </div>
+                        <p className="text-xs leading-5 text-white/45 md:col-span-2">
+                          {t("stockTokenReleaseSnapshotNotice", "asset")}
+                        </p>
                       </div>
 
                       <div className="flex shrink-0 flex-col items-start gap-2 lg:items-end">

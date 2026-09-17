@@ -1,3 +1,4 @@
+import {branding} from '../config/branding';
 import {assetEn, assetJa, assetZhCN, assetZhTW} from './assetCatalog';
 import {
   appShellEn,
@@ -218,9 +219,9 @@ const zhCN = {
   'home.bankPortalA11y': '银行端口，进入专属银行服务',
   'home.bankPortalOpenFailedTitle': '无法打开银行端口',
   'home.bankPortalOpenFailedDescription': '请稍后重试或联系平台客服。',
-  'home.about': '关于 Exchange',
+  'home.about': '关于 {{brandName}}',
   'home.aboutDescription': '了解平台故事、愿景与价值观',
-  'home.aboutA11y': '关于平台，了解 Exchange',
+  'home.aboutA11y': '关于平台，了解 {{brandName}}',
   'home.pinned': '置顶',
   'home.unread': '未读',
   'home.assetTotal': '总资产估值',
@@ -658,7 +659,7 @@ const zhCN = {
   'vip.spotTaker': '现货 Taker',
   'vip.rcbPayPercent': 'RCB 抵扣后支付比例',
   'vip.feePreferenceTitle': '使用 RCB 抵扣现货手续费',
-  'vip.feePreferenceDescription': '开启后，符合条件的现货手续费将按平台规则从 RCB 余额抵扣',
+  'vip.feePreferenceDescription': '仅使用现货账户的可用 RCB 抵扣。RCB 在资金账户时，请先划转到现货账户；现货 RCB 不足、抵扣暂停或换算价格不可用时，将使用 USDT 扣费。',
   'vip.feePreferenceA11y': '使用 RCB 抵扣手续费',
   'vip.feePreferenceLoading': '正在读取抵扣设置…',
   'vip.feePreferenceLoadError': 'RCB 手续费抵扣设置加载失败：{{message}}',
@@ -668,7 +669,7 @@ const zhCN = {
   'vip.feePreferenceSaveFailed': '保存失败，已恢复原设置。{{message}}',
   'vip.growthData': '成长数据',
   'vip.volume30d': '30 日交易量',
-  'vip.rcbAvailable': 'RCB 可用',
+  'vip.rcbAvailable': 'RCB 可用（资金＋现货）',
   'vip.rcbLocked': 'RCB 锁仓',
   'vip.openRcbLock': '进入 RCB 锁仓',
   'vip.rcbLockDescription': '查看等级门槛、锁仓周期与到期记录',
@@ -676,6 +677,7 @@ const zhCN = {
   'vip.dividends': '我的分红',
   'vip.dividendDescription': '查看 SVIP 分红资格、汇总与发放记录',
   'vip.levelFees': '等级费率',
+  'vip.noLevels': '暂无该分组的等级信息',
   'vip.currentBadge': '当前等级',
   'vip.feeLine': 'Maker {{maker}} · Taker {{taker}}',
   'vip.volumeThreshold': '30 日交易量 ≥ {{amount}} USDT',
@@ -889,9 +891,9 @@ const zhTW: Record<TranslationKey, string> = {
   'home.bankPortalA11y': '銀行端口，進入專屬銀行服務',
   'home.bankPortalOpenFailedTitle': '無法開啟銀行端口',
   'home.bankPortalOpenFailedDescription': '請稍後重試或聯絡平台客服。',
-  'home.about': '關於 Exchange',
+  'home.about': '關於 {{brandName}}',
   'home.aboutDescription': '了解平台故事、願景與價值觀',
-  'home.aboutA11y': '關於平台，了解 Exchange',
+  'home.aboutA11y': '關於平台，了解 {{brandName}}',
   'home.pinned': '置頂',
   'home.unread': '未讀',
   'home.assetTotal': '總資產估值',
@@ -1329,7 +1331,7 @@ const zhTW: Record<TranslationKey, string> = {
   'vip.spotTaker': '現貨 Taker',
   'vip.rcbPayPercent': 'RCB 抵扣後支付比例',
   'vip.feePreferenceTitle': '使用 RCB 抵扣現貨手續費',
-  'vip.feePreferenceDescription': '開啟後，符合條件的現貨手續費將按平台規則從 RCB 餘額抵扣',
+  'vip.feePreferenceDescription': '僅使用現貨帳戶的可用 RCB 抵扣。RCB 在資金帳戶時，請先劃轉至現貨帳戶；現貨 RCB 不足、抵扣暫停或換算價格不可用時，將使用 USDT 扣費。',
   'vip.feePreferenceA11y': '使用 RCB 抵扣手續費',
   'vip.feePreferenceLoading': '正在讀取抵扣設定…',
   'vip.feePreferenceLoadError': 'RCB 手續費抵扣設定載入失敗：{{message}}',
@@ -1339,7 +1341,7 @@ const zhTW: Record<TranslationKey, string> = {
   'vip.feePreferenceSaveFailed': '儲存失敗，已恢復原設定。{{message}}',
   'vip.growthData': '成長資料',
   'vip.volume30d': '30 日交易量',
-  'vip.rcbAvailable': 'RCB 可用',
+  'vip.rcbAvailable': 'RCB 可用（資金＋現貨）',
   'vip.rcbLocked': 'RCB 鎖倉',
   'vip.openRcbLock': '進入 RCB 鎖倉',
   'vip.rcbLockDescription': '查看等級門檻、鎖倉週期與到期記錄',
@@ -1347,6 +1349,7 @@ const zhTW: Record<TranslationKey, string> = {
   'vip.dividends': '我的分紅',
   'vip.dividendDescription': '查看 SVIP 分紅資格、彙總與發放記錄',
   'vip.levelFees': '等級費率',
+  'vip.noLevels': '暫無此分組的等級資訊',
   'vip.currentBadge': '目前等級',
   'vip.feeLine': 'Maker {{maker}} · Taker {{taker}}',
   'vip.volumeThreshold': '30 日交易量 ≥ {{amount}} USDT',
@@ -1555,9 +1558,9 @@ const en: Record<TranslationKey, string> = {
   'home.bankPortalA11y': 'Bank Portal, open dedicated banking services',
   'home.bankPortalOpenFailedTitle': 'Unable to open Bank Portal',
   'home.bankPortalOpenFailedDescription': 'Please try again later or contact support.',
-  'home.about': 'About Exchange',
+  'home.about': 'About {{brandName}}',
   'home.aboutDescription': 'Learn about our story, vision and values',
-  'home.aboutA11y': 'About Exchange',
+  'home.aboutA11y': 'About {{brandName}}',
   'home.pinned': 'Pinned',
   'home.unread': 'Unread',
   'home.assetTotal': 'Estimated total assets',
@@ -1995,7 +1998,7 @@ const en: Record<TranslationKey, string> = {
   'vip.spotTaker': 'Spot Taker',
   'vip.rcbPayPercent': 'Payment percentage after RCB discount',
   'vip.feePreferenceTitle': 'Use RCB to pay spot trading fees',
-  'vip.feePreferenceDescription': 'When enabled, eligible spot trading fees are deducted from your RCB balance under platform rules',
+  'vip.feePreferenceDescription': 'Fees use available RCB in your spot account only. Transfer RCB from funding to spot first. Fees fall back to USDT if spot RCB is insufficient, RCB payments are paused, or the conversion price is unavailable.',
   'vip.feePreferenceA11y': 'Use RCB to pay trading fees',
   'vip.feePreferenceLoading': 'Loading fee-payment preference…',
   'vip.feePreferenceLoadError': 'Could not load the RCB fee-payment setting: {{message}}',
@@ -2005,7 +2008,7 @@ const en: Record<TranslationKey, string> = {
   'vip.feePreferenceSaveFailed': 'Could not save. The previous setting was restored. {{message}}',
   'vip.growthData': 'Progress data',
   'vip.volume30d': '30-day trading volume',
-  'vip.rcbAvailable': 'RCB available',
+  'vip.rcbAvailable': 'RCB available (funding + spot)',
   'vip.rcbLocked': 'RCB locked',
   'vip.openRcbLock': 'Open RCB lockup',
   'vip.rcbLockDescription': 'View level thresholds, lock periods and maturity records',
@@ -2013,6 +2016,7 @@ const en: Record<TranslationKey, string> = {
   'vip.dividends': 'My Dividends',
   'vip.dividendDescription': 'View SVIP eligibility, totals and distribution records',
   'vip.levelFees': 'Level fees',
+  'vip.noLevels': 'No levels available in this group',
   'vip.currentBadge': 'Current level',
   'vip.feeLine': 'Maker {{maker}} · Taker {{taker}}',
   'vip.volumeThreshold': '30-day trading volume ≥ {{amount}} USDT',
@@ -2221,9 +2225,9 @@ const ja: Record<TranslationKey, string> = {
   'home.bankPortalA11y': 'バンクポータル、専用バンキングサービスを開く',
   'home.bankPortalOpenFailedTitle': 'バンクポータルを開けません',
   'home.bankPortalOpenFailedDescription': '後でもう一度お試しいただくか、サポートへお問い合わせください。',
-  'home.about': 'Exchangeについて',
+  'home.about': '{{brandName}}について',
   'home.aboutDescription': 'プラットフォームの歩み、ビジョン、価値観をご紹介します',
-  'home.aboutA11y': 'Exchangeについて',
+  'home.aboutA11y': '{{brandName}}について',
   'home.pinned': '固定',
   'home.unread': '未読',
   'home.assetTotal': '総資産評価額',
@@ -2661,7 +2665,7 @@ const ja: Record<TranslationKey, string> = {
   'vip.spotTaker': '現物 Taker',
   'vip.rcbPayPercent': 'RCB割引後の支払割合',
   'vip.feePreferenceTitle': 'RCBで現物取引手数料を支払う',
-  'vip.feePreferenceDescription': '有効にすると、対象となる現物取引手数料がプラットフォーム規則に従ってRCB残高から差し引かれます',
+  'vip.feePreferenceDescription': '手数料には現物口座の利用可能RCBのみを使用します。資金口座のRCBは先に現物口座へ振り替えてください。残高不足、RCB支払い停止、換算価格が取得できない場合はUSDTで徴収されます。',
   'vip.feePreferenceA11y': 'RCBで取引手数料を支払う',
   'vip.feePreferenceLoading': '手数料支払設定を読み込んでいます…',
   'vip.feePreferenceLoadError': 'RCB手数料支払設定を読み込めませんでした：{{message}}',
@@ -2671,7 +2675,7 @@ const ja: Record<TranslationKey, string> = {
   'vip.feePreferenceSaveFailed': '保存できなかったため、以前の設定に戻しました。{{message}}',
   'vip.growthData': '進捗データ',
   'vip.volume30d': '30日間の取引高',
-  'vip.rcbAvailable': '利用可能RCB',
+  'vip.rcbAvailable': '利用可能RCB（資金＋現物）',
   'vip.rcbLocked': 'ロック中のRCB',
   'vip.openRcbLock': 'RCBロックを開く',
   'vip.rcbLockDescription': 'レベル条件、ロック期間、満期記録を確認',
@@ -2679,6 +2683,7 @@ const ja: Record<TranslationKey, string> = {
   'vip.dividends': '配当履歴',
   'vip.dividendDescription': 'SVIP配当資格、集計、配布記録を確認',
   'vip.levelFees': 'レベル別手数料率',
+  'vip.noLevels': 'このグループのレベル情報はありません',
   'vip.currentBadge': '現在のレベル',
   'vip.feeLine': 'Maker {{maker}} · Taker {{taker}}',
   'vip.volumeThreshold': '30日間の取引高 ≥ {{amount}} USDT',
@@ -2768,11 +2773,14 @@ export function translate(
   key: TranslationKey,
   params?: TranslationParams,
 ) {
-  const template = catalogs[locale][key] || catalogs[defaultLocale][key];
-  if (!params) return template;
+  const configured = key.startsWith('blackCard.')
+    ? branding.blackCardTranslations[locale]?.[key]
+    : undefined;
+  const template = configured || catalogs[locale][key] || catalogs[defaultLocale][key];
+  const values: TranslationParams = {brandName: branding.displayName, ...params};
   return template.replace(/\{\{(\w+)\}\}/g, (match, name: string) =>
-    Object.prototype.hasOwnProperty.call(params, name)
-      ? String(params[name])
+    Object.prototype.hasOwnProperty.call(values, name)
+      ? String(values[name])
       : match,
   );
 }

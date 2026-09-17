@@ -376,6 +376,56 @@ def test_home_config_admin_drives_sections_limits_copy_and_order(
     assert bootstrap["home"]["hero"] is not None
 
 
+def test_home_quick_entry_english_edit_refreshes_cached_bootstrap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db, _factory = _database()
+    _seed(db)
+    monkeypatch.setattr(
+        mobile_content_service,
+        "_active_mobile_market_symbols",
+        lambda _db: {"BTCUSDT", "RCBUSDT", "ETHUSDT", "NVDAUSDT_PERP"},
+    )
+    before_en = get_cached_mobile_content_bootstrap(db, locale="en")
+    before_zh = get_cached_mobile_content_bootstrap(db, locale="zh")
+    payload = {
+        "app_name": "Example Mobile",
+        "logo_url": LOGO_URL,
+        "home_section_asset_summary": "1",
+        "home_section_quick_entries": "1",
+        "home_section_market_shortcuts": "1",
+        "home_section_promos": "1",
+        "home_section_announcements": "1",
+        "home_market_shortcut_limit": "4",
+        "home_promo_limit": "8",
+        "home_announcement_limit": "3",
+    }
+    for index, symbol in enumerate(
+        ["BTCUSDT", "RCBUSDT", "ETHUSDT", "NVDAUSDT_PERP"], start=1
+    ):
+        payload[f"home_market_shortcut_symbol_{index}"] = symbol
+    for index, (entry_id, spec) in enumerate(
+        mobile_content_service.MOBILE_HOME_QUICK_ENTRY_SPECS.items()
+    ):
+        prefix = f"home_quick_{entry_id.lower()}"
+        payload[f"{prefix}_enabled"] = "1"
+        payload[f"{prefix}_sort_order"] = str(index)
+        for field in ("title", "description"):
+            payload[f"{prefix}_{field}"] = spec[field]
+            for locale, suffix in mobile_content_service.ADMIN_I18N_LOCALES:
+                payload[f"{prefix}_{field}_i18n_{suffix}"] = spec[f"{field}_i18n"][locale]
+    payload["home_quick_deposit_description_i18n_en"] = "Updated deposit copy"
+
+    result = update_mobile_settings(db, payload)
+    assert result["ok"] is True
+    after_en = get_cached_mobile_content_bootstrap(db, locale="en")
+    after_zh = get_cached_mobile_content_bootstrap(db, locale="zh")
+    assert after_en["revision"] != before_en["revision"]
+    assert after_en["home"]["config"]["quick_entries"][0]["description"] == "Updated deposit copy"
+    assert after_zh["home"]["config"]["quick_entries"] == before_zh["home"]["config"]["quick_entries"]
+    db.close()
+
+
 def test_home_config_rejects_unsafe_operator_copy_without_overwriting_current() -> None:
     db, _factory = _database()
     _seed(db)

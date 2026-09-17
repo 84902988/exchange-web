@@ -1,3 +1,4 @@
+import {branding} from '../../config/branding';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   FlatList,
@@ -45,7 +46,7 @@ const REQUIRED_SECTION_IDS = new Set<MobileAboutSectionId>([
   'values',
 ]);
 
-const COMPLIANCE_LICENSE_NOTICES: Array<{title: string; subtitle: string}> = [];
+const COMPLIANCE_LICENSE_NOTICES = branding.complianceLicenses;
 
 export default function AboutPageScreen({ navigation }: Props) {
   const { locale, t } = useLanguage();
@@ -122,7 +123,7 @@ export default function AboutPageScreen({ navigation }: Props) {
     <AppScreen contentStyle={styles.screen} scroll={false}>
       <ActionHeader
         title={t('about.title')}
-        subtitle="Exchange"
+        subtitle={branding.displayName}
         backAccessibilityLabel={t('common.back')}
         onBack={navigation.goBack}
         right={
@@ -262,6 +263,7 @@ export default function AboutPageScreen({ navigation }: Props) {
 }
 
 function ComplianceLicenseNotices() {
+  if (COMPLIANCE_LICENSE_NOTICES.length === 0) return null;
   return (
     <View testID="about-compliance-licenses" style={styles.licenseSection}>
       <Text style={styles.licenseEyebrow}>LICENSES &amp; REGULATIONS</Text>

@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import {branding} from '../config/branding';
 import React, {
   createContext,
   useCallback,
@@ -34,13 +35,26 @@ const defaultContext: LanguageContextValue = {
 
 const LanguageContext = createContext<LanguageContextValue>(defaultContext);
 
+async function loadStoredLocale() {
+  const current = await AsyncStorage.getItem(MOBILE_LOCALE_STORAGE_KEY);
+  if (isMobileLocale(current)) return current;
+  for (const key of branding.legacyLocaleStorageKeys) {
+    const previous = await AsyncStorage.getItem(key);
+    if (isMobileLocale(previous)) {
+      await AsyncStorage.setItem(MOBILE_LOCALE_STORAGE_KEY, previous).catch(() => {});
+      return previous;
+    }
+  }
+  return current;
+}
+
 export function LanguageProvider({children}: {children: ReactNode}) {
   const [locale, setLocaleState] = useState<MobileLocale>(defaultLocale);
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
     let active = true;
-    AsyncStorage.getItem(MOBILE_LOCALE_STORAGE_KEY)
+    loadStoredLocale()
       .then(storedLocale => {
         if (active && isMobileLocale(storedLocale)) {
           setLocaleState(storedLocale);

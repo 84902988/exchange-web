@@ -1,3 +1,4 @@
+import {branding} from '../src/config/branding';
 import {
   createTranslator,
   supportedLocales,
@@ -26,7 +27,10 @@ describe('mobile localization release readiness', () => {
         const sourceValue = sourceTranslator(key);
         const value = translator(key);
 
-        if (!value.trim()) {
+        const unpublishedCardContent = !branding.blackCard.enabled &&
+          key.startsWith('blackCard.marketing.') &&
+          !['blackCard.marketing.pageTitle', 'blackCard.marketing.informationOnlyNotice'].includes(key);
+        if (!value.trim() && !unpublishedCardContent) {
           issues.push(`${locale}:${key}:empty`);
         }
 

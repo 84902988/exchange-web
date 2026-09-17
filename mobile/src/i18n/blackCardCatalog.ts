@@ -1,7 +1,7 @@
 export const blackCardZhCN = {
-  "blackCard.marketing.pageTitle": "Exchange 黑卡",
+  "blackCard.marketing.pageTitle": "{{brandName}} 黑卡",
   "blackCard.marketing.pageSubtitle": "卡片服务",
-  "blackCard.marketing.heroTitle": "Exchange 黑卡",
+  "blackCard.marketing.heroTitle": "{{brandName}} 黑卡",
   "blackCard.marketing.heroSubtitle": "",
   "blackCard.marketing.cardImageA11y": "卡片示意图",
   "blackCard.marketing.featuresTitle": "",
@@ -48,9 +48,9 @@ export const blackCardZhCN = {
 } as const;
 
 export const blackCardZhTW = {
-  "blackCard.marketing.pageTitle": "Exchange 黑卡",
+  "blackCard.marketing.pageTitle": "{{brandName}} 黑卡",
   "blackCard.marketing.pageSubtitle": "卡片服務",
-  "blackCard.marketing.heroTitle": "Exchange 黑卡",
+  "blackCard.marketing.heroTitle": "{{brandName}} 黑卡",
   "blackCard.marketing.heroSubtitle": "",
   "blackCard.marketing.cardImageA11y": "卡片示意圖",
   "blackCard.marketing.featuresTitle": "",
@@ -97,9 +97,9 @@ export const blackCardZhTW = {
 } as const;
 
 export const blackCardEn = {
-  "blackCard.marketing.pageTitle": "Exchange Black Card",
+  "blackCard.marketing.pageTitle": "{{brandName}} Black Card",
   "blackCard.marketing.pageSubtitle": "Card services",
-  "blackCard.marketing.heroTitle": "Exchange Black Card",
+  "blackCard.marketing.heroTitle": "{{brandName}} Black Card",
   "blackCard.marketing.heroSubtitle": "",
   "blackCard.marketing.cardImageA11y": "Card illustration",
   "blackCard.marketing.featuresTitle": "",
@@ -146,9 +146,9 @@ export const blackCardEn = {
 } as const;
 
 export const blackCardJa = {
-  "blackCard.marketing.pageTitle": "Exchange ブラックカード",
+  "blackCard.marketing.pageTitle": "{{brandName}} ブラックカード",
   "blackCard.marketing.pageSubtitle": "カードサービス",
-  "blackCard.marketing.heroTitle": "Exchange ブラックカード",
+  "blackCard.marketing.heroTitle": "{{brandName}} ブラックカード",
   "blackCard.marketing.heroSubtitle": "",
   "blackCard.marketing.cardImageA11y": "カードのイメージ",
   "blackCard.marketing.featuresTitle": "",

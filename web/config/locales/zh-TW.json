@@ -1,6 +1,6 @@
 {
   "common": {
-    "title": "Exchange",
+    "title": "{{brandName}}",
     "login": "登錄",
     "register": "註冊",
     "logout": "退出",
@@ -692,6 +692,7 @@
     "convertedAmount": "已轉換數量",
     "timeRule": "时間規則：",
     "afterDaysDailyRelease": "{days} 天后每日釋放 {rate}",
+    "stockTokenReleaseSnapshotNotice": "本批次按建立時確定的每日釋放比例執行，後續設定調整不改變本批次的比例。",
     "lockTime": "锁定时間：",
     "releaseFinishTime": "釋放完成时間：",
     "convertibleTokenAmount": "可轉換 {symbol}：{amount}",
@@ -1386,8 +1387,8 @@
     "coins": "貨幣",
     "kycVerification": "KYC 認證",
     "rcbDeduction": "RCB抵扣手續費",
-    "feeSystemDesc": "Exchange平台採用分級費率制度，根據您的交易量和持倉量自動調整交易費率。",
-    "apiServiceDesc": "Exchange提供API服務，您可以通過API進行交易、查詢行情等操作。",
+    "feeSystemDesc": "{{brandName}}平台採用分級費率制度，根據您的交易量和持倉量自動調整交易費率。",
+    "apiServiceDesc": "{{brandName}}提供API服務，您可以通過API進行交易、查詢行情等操作。",
     "kycCompleted": "已完成KYC認證",
     "kycNotCompleted": "未完成KYC認證",
     "username": "用戶名",

@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import {branding} from '../src/config/branding';
 import {
   __resetMarketFavoritesForTests,
   getCachedMarketFavoriteSymbols,
@@ -10,6 +11,18 @@ import {
 } from '../src/services/marketFavorites';
 
 describe('market favorite persistence', () => {
+  afterEach(() => {
+    branding.legacyFavoritesStorageKeys.length = 0;
+  });
+  it('migrates configured old favorites without overwriting a current empty list', async () => {
+    branding.legacyFavoritesStorageKeys.push('example.old.favorites');
+    await AsyncStorage.setItem('example.old.favorites', JSON.stringify({version: 1, symbols: ['btcusdt']}));
+    await expect(loadMarketFavoriteSymbols()).resolves.toEqual(['BTCUSDT']);
+    expect(JSON.parse((await AsyncStorage.getItem(MARKET_FAVORITES_STORAGE_KEY))!).symbols).toEqual(['BTCUSDT']);
+    __resetMarketFavoritesForTests();
+    await AsyncStorage.setItem(MARKET_FAVORITES_STORAGE_KEY, JSON.stringify({version: 1, symbols: []}));
+    await expect(loadMarketFavoriteSymbols()).resolves.toEqual([]);
+  });
   beforeEach(async () => {
     __resetMarketFavoritesForTests();
     await AsyncStorage.clear();

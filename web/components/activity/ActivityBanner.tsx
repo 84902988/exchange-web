@@ -1,4 +1,5 @@
 "use client";
+import {applicationName} from '@/lib/branding';
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
@@ -44,7 +45,7 @@ export default function ActivityBanner({ banners }: Props) {
         : [
             {
               id: 0,
-              title: `Exchange ${t("activityCenter", "activity")}`,
+              title: `${applicationName} ${t("activityCenter", "activity")}`,
               subtitle: t("activityHeroSubtitle", "activity"),
               media_type: "image",
               media_url: "",

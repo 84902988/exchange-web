@@ -28,11 +28,11 @@ test('contract terminal reuses the shared selector and isolates symbol-scoped pr
 test('contract browser title follows the symbol-scoped realtime display price', () => {
   const source = readSource('components/contract/ContractMarketHeader.tsx');
 
-  expect(source).toContain("originalDocumentTitleRef.current = document.title || 'Exchange'");
+  expect(source).toContain("originalDocumentTitleRef.current = document.title || applicationName");
   expect(source).toContain("displayPrice && displayPrice !== '--'");
-  expect(source).toContain('`${titlePrice} ${displaySymbol} 合约交易 | Exchange`');
+  expect(source).toContain('`${titlePrice} ${displaySymbol} 合约交易 | ${applicationName}`');
   expect(source).toContain('Math.max(1000 - (now - titleUpdatedAtRef.current), 0)');
-  expect(source).toContain("document.title = originalDocumentTitleRef.current || 'Exchange'");
+  expect(source).toContain("document.title = originalDocumentTitleRef.current || applicationName");
   expect(source).toContain('}, [displayPrice, displaySymbol]);');
 });
 

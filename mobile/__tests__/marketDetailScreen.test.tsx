@@ -1,4 +1,5 @@
 import React from 'react';
+import {Dimensions} from 'react-native';
 import ReactTestRenderer, {act} from 'react-test-renderer';
 
 const mockGoBack = jest.fn();
@@ -56,9 +57,7 @@ jest.mock('../src/components/market/MarketDetailView', () => {
   };
 });
 
-import MarketDetailScreen, {
-  getMarketDetailFullscreenPresentation,
-} from '../src/screens/market/MarketDetailScreen';
+import MarketDetailScreen from '../src/screens/market/MarketDetailScreen';
 
 const navigation = {
   goBack: mockGoBack,
@@ -93,30 +92,13 @@ const contractRoute = {
 } as any;
 
 describe('MarketDetailScreen', () => {
-  it('covers orientation changes and only exposes the settled layout', () => {
-    expect(getMarketDetailFullscreenPresentation(false, false)).toEqual({
-      fullscreen: false,
-      transitioning: false,
-    });
-    expect(getMarketDetailFullscreenPresentation(true, false)).toEqual({
-      fullscreen: false,
-      transitioning: true,
-    });
-    expect(getMarketDetailFullscreenPresentation(true, true)).toEqual({
-      fullscreen: true,
-      transitioning: false,
-    });
-    expect(getMarketDetailFullscreenPresentation(false, true)).toEqual({
-      fullscreen: false,
-      transitioning: true,
-    });
-  });
-
   beforeEach(() => {
     jest.clearAllMocks();
     preventRemoveEnabled = false;
     preventRemoveCallback = null;
     detailProps = null;
+    const metrics = {width: 390, height: 844, scale: 1, fontScale: 1};
+    Dimensions.set({screen: metrics, window: metrics});
     mockFetchSpotKlines.mockResolvedValue([]);
     mockUseSpotMarketRealtime.mockReturnValue({
       ticker: {
@@ -196,11 +178,11 @@ describe('MarketDetailScreen', () => {
       detailProps?.onEnterFullscreen();
     });
     expect(
-      renderer.root.findByProps({
+      renderer.root.findAllByProps({
         testID: 'market-detail-orientation-transition',
-      }).props.pointerEvents,
-    ).toBe('auto');
-    expect(detailProps?.fullscreen).toBe(false);
+      }),
+    ).toHaveLength(0);
+    expect(detailProps?.fullscreen).toBe(true);
     expect(preventRemoveEnabled).toBe(true);
     expect(mockSetOptions).toHaveBeenLastCalledWith({
       orientation: 'landscape',
@@ -225,6 +207,68 @@ describe('MarketDetailScreen', () => {
       detailProps?.onBack();
     });
     expect(mockGoBack).toHaveBeenCalledTimes(1);
+    act(() => renderer.unmount());
+  });
+
+  it.each([
+    ['iPad portrait', 820, 1180],
+    ['iPad narrow window', 375, 1024],
+    ['iPhone portrait', 390, 844],
+    ['Android phone portrait', 412, 915],
+    ['Android tablet portrait', 800, 1280],
+    ['tablet already landscape', 1180, 820],
+  ])('can enter and exit fullscreen when %s never rotates', (_name, width, height) => {
+    const metrics = {width, height, scale: 1, fontScale: 1};
+    Dimensions.set({screen: metrics, window: metrics});
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = ReactTestRenderer.create(
+        <MarketDetailScreen navigation={navigation} route={contractRoute} />,
+      );
+    });
+    expect(detailProps?.fullscreen).toBe(false);
+    expect(renderer.root.findAllByProps({accessibilityRole: 'progressbar'})).toHaveLength(0);
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      act(() => detailProps?.onEnterFullscreen());
+      expect(detailProps?.fullscreen).toBe(true);
+      expect(preventRemoveEnabled).toBe(true);
+      expect(renderer.root.findAllByProps({accessibilityRole: 'progressbar'})).toHaveLength(0);
+      act(() => detailProps?.onExitFullscreen());
+      expect(detailProps?.fullscreen).toBe(false);
+      expect(preventRemoveEnabled).toBe(false);
+      expect(mockGoBack).not.toHaveBeenCalled();
+    }
+    act(() => detailProps?.onBack());
+    expect(mockGoBack).toHaveBeenCalledTimes(1);
+    act(() => renderer.unmount());
+  });
+
+  it('keeps fullscreen and interval selection across late rotation and window resizing', () => {
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = ReactTestRenderer.create(
+        <MarketDetailScreen navigation={navigation} route={contractRoute} />,
+      );
+    });
+    act(() => {
+      detailProps?.onEnterFullscreen();
+      detailProps?.onIntervalChange('15m');
+    });
+    for (const [width, height] of [[1180, 820], [375, 1024], [820, 1180]]) {
+      act(() => {
+        const metrics = {width, height, scale: 1, fontScale: 1};
+        Dimensions.set({screen: metrics, window: metrics});
+        renderer.update(<MarketDetailScreen navigation={navigation} route={contractRoute} />);
+      });
+      expect(detailProps?.fullscreen).toBe(true);
+      expect(detailProps?.interval).toBe('15m');
+      expect(renderer.root.findAllByProps({accessibilityRole: 'progressbar'})).toHaveLength(0);
+    }
+    act(() => preventRemoveCallback?.());
+    expect(detailProps?.fullscreen).toBe(false);
+    expect(detailProps?.interval).toBe('15m');
+    expect(mockGoBack).not.toHaveBeenCalled();
     act(() => renderer.unmount());
   });
 

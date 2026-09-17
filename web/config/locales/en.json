@@ -1,6 +1,6 @@
 {
   "common": {
-    "title": "Exchange",
+    "title": "{{brandName}}",
     "login": "Login",
     "register": "Register",
     "logout": "Logout",
@@ -692,6 +692,7 @@
     "convertedAmount": "Converted",
     "timeRule": "Time rule:",
     "afterDaysDailyRelease": "After {days} days, daily release {rate}",
+    "stockTokenReleaseSnapshotNotice": "This batch uses the daily release rate set when it was created. Later configuration changes do not change this batch's rate.",
     "lockTime": "Lock time:",
     "releaseFinishTime": "Release finish time:",
     "convertibleTokenAmount": "Convertible {symbol}: {amount}",
@@ -1386,8 +1387,8 @@
     "coins": "Coins",
     "kycVerification": "KYC Verification",
     "rcbDeduction": "RCB Deduction Fee",
-    "feeSystemDesc": "Exchange platform adopts a tiered fee system, automatically adjusting trading fees based on your trading volume and holdings.",
-    "apiServiceDesc": "Exchange provides API services, allowing you to trade, query market information, and perform other operations through APIs.",
+    "feeSystemDesc": "{{brandName}} platform adopts a tiered fee system, automatically adjusting trading fees based on your trading volume and holdings.",
+    "apiServiceDesc": "{{brandName}} provides API services, allowing you to trade, query market information, and perform other operations through APIs.",
     "kycCompleted": "KYC Verified",
     "kycNotCompleted": "KYC Not Completed",
     "username": "Username",

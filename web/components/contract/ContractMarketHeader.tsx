@@ -1,4 +1,5 @@
 'use client';
+import {applicationName} from '@/lib/branding';
 
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useLocaleContext } from '@/contexts/LocaleContext';
@@ -591,22 +592,22 @@ export default function ContractMarketHeader({
   const displaySymbol = formatContractDisplaySymbol(marketSymbol);
 
   useEffect(() => {
-    originalDocumentTitleRef.current = document.title || 'Exchange';
+    originalDocumentTitleRef.current = document.title || applicationName;
 
     return () => {
       if (titleUpdateTimerRef.current !== null) {
         window.clearTimeout(titleUpdateTimerRef.current);
         titleUpdateTimerRef.current = null;
       }
-      document.title = originalDocumentTitleRef.current || 'Exchange';
+      document.title = originalDocumentTitleRef.current || applicationName;
     };
   }, []);
 
   useEffect(() => {
     const titlePrice = displayPrice && displayPrice !== '--' ? displayPrice : '';
     const nextTitle = titlePrice
-      ? `${titlePrice} ${displaySymbol} 合约交易 | Exchange`
-      : `${displaySymbol} 合约交易 | Exchange`;
+      ? `${titlePrice} ${displaySymbol} 合约交易 | ${applicationName}`
+      : `${displaySymbol} 合约交易 | ${applicationName}`;
     const now = Date.now();
     const remainingMs = Math.max(1000 - (now - titleUpdatedAtRef.current), 0);
     const applyTitle = () => {

@@ -68,6 +68,11 @@ backend/data/geoip/
 Thumbs.db
 
 # Local artifacts, archives, and temporary work
+tmp/
+.branding/
+*.branding.local.json
+web/.next-*/
+web/public/downloads/
 docs/
 .codex/
 *-clipboard-*
