@@ -36,6 +36,8 @@ Use a Node version compatible with `mobile/package.json`, plus Xcode, Ruby,
 Bundler, and the operator's existing Apple signing setup on the Mac.
 
 ```sh
+cd "$EXPORT_DIR"
+npm ci
 cd "$EXPORT_DIR/web"
 npm ci
 cd "$EXPORT_DIR/mobile"
@@ -47,11 +49,17 @@ bundle exec pod install
 cd ..
 ```
 
-The mobile parity tests import web valuation source, so the full source export
-and web dependencies are required for this verification. Do not remove those
+The mobile parity tests import web valuation/chart source, including the root
+`lightweight-charts` dependency, so the full source export and root, web, and
+mobile dependencies are required for this verification. Do not remove those
 tests to make a mobile-only snapshot pass. Retain the validated
 `package-lock.json` files, `mobile/Gemfile.lock`, and `mobile/ios/Podfile.lock` in
 the source handoff; review changes to dependency locks before release.
+
+After a macOS, Ruby, or CPU architecture change, reinstall or rebuild native
+Ruby gem extensions for the current runtime. A successful `bundle check` confirms
+that gem specifications are present; it does not prove that their native
+extensions can load or that CocoaPods can generate and build the project.
 
 **Run `bundle exec pod install` in the actual Mac checkout after dependency
 installation or relocation.** Copied `Pods`, `node_modules`, an old workspace,
@@ -61,6 +69,14 @@ for the current location. With the current prebuilt React Native configuration,
 it also sets `SWIFT_ENABLE_EXPLICIT_MODULES=NO` and configures
 `RCT_REMOVE_LEGACY_ARCH=1`. Regenerate these through the Podfile post-install;
 do not repair stale paths by copying generated projects from another checkout.
+
+Lockfiles pin dependency versions but do not make generated files independent of
+their checkout location. The Hermes local podspec checksum can change when
+`HERMES_CLI_PATH` contains a different absolute wrapper path. Review that change
+against the resolved versions and other podspec checksums; do not assume a strict
+deployment install will succeed after relocation. Also review any app project,
+`Info.plist`, and aggregated `PrivacyInfo.xcprivacy` changes generated during pod
+installation before including them in the source handoff.
 
 Open `ios/ExchangeMobile.xcworkspace` after pod installation. Check the local
 Node path used by Xcode; recreate machine-specific `.xcode.env.local` settings
