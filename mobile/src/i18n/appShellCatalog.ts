@@ -1,5 +1,5 @@
 export const appShellZhCN = {
-  'appShell.starting': '正在启动',
+  'appShell.starting': 'loading',
   'appShell.userAvatarA11y': '用户头像',
   'appShell.accountInitial': '账',
   'appShell.errorTitle': '页面暂时无法显示',
@@ -10,7 +10,7 @@ export const appShellZhCN = {
 };
 
 export const appShellZhTW = {
-  'appShell.starting': '正在啟動',
+  'appShell.starting': 'loading',
   'appShell.userAvatarA11y': '使用者頭像',
   'appShell.accountInitial': '帳',
   'appShell.errorTitle': '頁面暫時無法顯示',
@@ -21,7 +21,7 @@ export const appShellZhTW = {
 };
 
 export const appShellEn = {
-  'appShell.starting': 'Starting up',
+  'appShell.starting': 'loading',
   'appShell.userAvatarA11y': 'User avatar',
   'appShell.accountInitial': 'AC',
   'appShell.errorTitle': 'This page is temporarily unavailable',
@@ -32,7 +32,7 @@ export const appShellEn = {
 };
 
 export const appShellJa = {
-  'appShell.starting': '起動中',
+  'appShell.starting': 'loading',
   'appShell.userAvatarA11y': 'ユーザーアバター',
   'appShell.accountInitial': 'ア',
   'appShell.errorTitle': 'このページは一時的に表示できません',

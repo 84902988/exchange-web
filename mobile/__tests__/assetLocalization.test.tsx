@@ -36,7 +36,7 @@ describe('asset read-only UI localization', () => {
               hidden={false}
               isLoggedIn
               snapshotAvailable
-              totalUsdt={42}
+              totalUsd={42}
               valuationComplete
               onToggleHidden={jest.fn()}
             />

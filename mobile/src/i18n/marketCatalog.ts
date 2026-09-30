@@ -1,4 +1,10 @@
 export const marketZhCN = {
+  'markets.cfd.all': '全部',
+  'markets.cfd.metals': '贵金属',
+  'markets.cfd.commodities': '大宗商品',
+  'markets.cfd.forex': '外汇',
+  'markets.cfd.indices': '指数',
+  'markets.cfd.other': '其他',
   'markets.category.overview': '总览',
   'markets.category.crypto': '加密货币',
   'markets.category.stock': '股票',
@@ -113,6 +119,12 @@ export const marketZhCN = {
 export type MarketTranslationKey = keyof typeof marketZhCN;
 
 export const marketZhTW: Record<MarketTranslationKey, string> = {
+  'markets.cfd.all': '全部',
+  'markets.cfd.metals': '貴金屬',
+  'markets.cfd.commodities': '大宗商品',
+  'markets.cfd.forex': '外匯',
+  'markets.cfd.indices': '指數',
+  'markets.cfd.other': '其他',
   'markets.category.overview': '總覽',
   'markets.category.crypto': '加密貨幣',
   'markets.category.stock': '股票',
@@ -225,6 +237,12 @@ export const marketZhTW: Record<MarketTranslationKey, string> = {
 };
 
 export const marketEn: Record<MarketTranslationKey, string> = {
+  'markets.cfd.all': 'All',
+  'markets.cfd.metals': 'Precious metals',
+  'markets.cfd.commodities': 'Commodities',
+  'markets.cfd.forex': 'Forex',
+  'markets.cfd.indices': 'Indices',
+  'markets.cfd.other': 'Other',
   'markets.category.overview': 'Overview',
   'markets.category.crypto': 'Crypto',
   'markets.category.stock': 'Stocks',
@@ -347,6 +365,12 @@ export const marketEn: Record<MarketTranslationKey, string> = {
 };
 
 export const marketJa: Record<MarketTranslationKey, string> = {
+  'markets.cfd.all': 'すべて',
+  'markets.cfd.metals': '貴金属',
+  'markets.cfd.commodities': '商品',
+  'markets.cfd.forex': '外国為替',
+  'markets.cfd.indices': '指数',
+  'markets.cfd.other': 'その他',
   'markets.category.overview': '概要',
   'markets.category.crypto': '暗号資産',
   'markets.category.stock': '株式',

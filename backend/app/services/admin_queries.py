@@ -1578,6 +1578,26 @@ def _validate_contract_address(chain_key: str, contract_address: Optional[str], 
     return value
 
 
+def _validate_native_deposit_config(db: Session, asset_id: int, chain_id: int,
+                                    payload: Dict[str, Any], errors: list[str]) -> None:
+    if not _parse_bool01(payload.get("native_deposit_enabled")):
+        return
+    from app.services.native_deposit_service import native_configuration_errors
+    row = db.execute(text("""
+        SELECT a.symbol, c.native_symbol, c.chain_key
+        FROM assets a JOIN chains c ON c.id = :chain_id WHERE a.id = :asset_id
+    """), {"asset_id": asset_id, "chain_id": chain_id}).mappings().first()
+    if not row:
+        errors.append("原生币对应的币种或网络不存在。")
+        return
+    errors.extend(native_configuration_errors(
+        chain_key=row["chain_key"], symbol=row["symbol"], native_symbol=row["native_symbol"],
+        contract_address=payload.get("contract_address"), decimals=payload.get("decimals"),
+        withdraw_enabled=bool(_parse_bool01(payload.get("withdraw_enabled"))),
+        collection_real_send_enabled=bool(_parse_bool01(payload.get("collection_real_send_enabled"))),
+    ))
+
+
 def _validate_chain_wallet_address(
     chain_key: str,
     address: Optional[str],
@@ -1923,8 +1943,9 @@ def _asset_chain_config_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "chain_native_symbol": row.get("chain_native_symbol") or "",
         "chain_enabled": int(row.get("chain_enabled") or 0),
         "contract_address": contract_address,
-        "contract_address_display": _short_address_display(contract_address) if contract_address else "原生币",
-        "contract_address_label": "合约" if contract_address else "原生币",
+        "native_deposit_enabled": bool(row.get("native_deposit_enabled")),
+        "contract_address_display": _short_address_display(contract_address) if contract_address else ("原生币" if row.get("native_deposit_enabled") else "未配置"),
+        "contract_address_label": "合约" if contract_address else ("原生币" if row.get("native_deposit_enabled") else "未配置"),
         "collection_address": collection_address,
         "collection_address_display": _short_address_display(collection_address),
         "hot_wallet_address": hot_wallet_address,
@@ -2658,6 +2679,8 @@ def admin_create_asset_chain_config(db: Session, payload: Dict[str, Any]) -> Dic
     if not asset_row or not chain_row:
         return {"ok": False, "errors": ["币种或网络不存在，请刷新后重试。"]}
 
+    _validate_native_deposit_config(db, asset_id, chain_id, payload, errors)
+
     duplicate_row = db.execute(
         text(
             """
@@ -2782,11 +2805,11 @@ def admin_create_asset_chain_config(db: Session, payload: Dict[str, Any]) -> Dic
             text(
                 f"""
                 INSERT INTO asset_chains
-                  (asset_id, chain_id, contract_address, decimals, deposit_enabled, withdraw_enabled,
+                  (asset_id, chain_id, contract_address, decimals, deposit_enabled, native_deposit_enabled, withdraw_enabled,
                    enabled, min_deposit, min_withdraw, review_threshold_amount, force_manual_review,
                    daily_withdraw_count_limit, confirmations, sort{collection_column_sql}, created_at, updated_at)
                 VALUES
-                  (:asset_id, :chain_id, :contract_address, :decimals, :deposit_enabled, :withdraw_enabled,
+                  (:asset_id, :chain_id, :contract_address, :decimals, :deposit_enabled, :native_deposit_enabled, :withdraw_enabled,
                    :enabled, :min_deposit, :min_withdraw, :review_threshold_amount, :force_manual_review,
                    :daily_withdraw_count_limit, :confirmations, :sort{collection_value_sql}, UTC_TIMESTAMP(), UTC_TIMESTAMP())
                 """
@@ -2795,6 +2818,7 @@ def admin_create_asset_chain_config(db: Session, payload: Dict[str, Any]) -> Dic
                 "asset_id": asset_id,
                 "chain_id": chain_id,
                 "contract_address": contract_address,
+                "native_deposit_enabled": _parse_bool01(payload.get("native_deposit_enabled")),
                 "decimals": _parse_int(payload.get("decimals"), 0),
                 "deposit_enabled": deposit_enabled,
                 "withdraw_enabled": withdraw_enabled,
@@ -2848,6 +2872,8 @@ def admin_update_asset_chain_config(db: Session, asset_chain_id: int, payload: D
         identity = _asset_chain_identity(db, int(asset_chain_id))
         if not identity:
             return {"ok": False, "errors": ["币种-网络配置不存在，请刷新后重试。"]}
+
+        _validate_native_deposit_config(db, int(identity["asset_id"]), int(identity["chain_id"]), payload, errors)
 
         chain_key = _normalize_chain_key(identity.get("chain_key"))
         deposit_enabled = _parse_bool01(payload.get("deposit_enabled"))
@@ -2933,7 +2959,8 @@ def admin_update_asset_chain_config(db: Session, asset_chain_id: int, payload: D
             text(
                 f"""
                 UPDATE asset_chains
-                SET contract_address=:contract_address, decimals=:decimals, min_deposit=:min_deposit,
+                SET contract_address=:contract_address, native_deposit_enabled=:native_deposit_enabled,
+                    decimals=:decimals, min_deposit=:min_deposit,
                     min_withdraw=:min_withdraw, review_threshold_amount=:review_threshold_amount,
                     force_manual_review=:force_manual_review, daily_withdraw_count_limit=:daily_withdraw_count_limit,
                     confirmations=:confirmations, deposit_enabled=:deposit_enabled, withdraw_enabled=:withdraw_enabled,
@@ -2944,6 +2971,7 @@ def admin_update_asset_chain_config(db: Session, asset_chain_id: int, payload: D
             {
                 "asset_chain_id": int(asset_chain_id),
                 "contract_address": contract_address,
+                "native_deposit_enabled": _parse_bool01(payload.get("native_deposit_enabled")),
                 "decimals": _parse_int(payload.get("decimals"), 0),
                 "min_deposit": min_deposit_value,
                 "min_withdraw": min_withdraw_value,

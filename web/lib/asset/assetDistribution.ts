@@ -1,4 +1,5 @@
 import type { SpotMarketTickerItem } from "../api/modules/spot";
+import {assetPrices} from "./portfolioValuation";
 
 
 export type AssetValuationInput = {
@@ -15,38 +16,11 @@ export type AssetValuationDistributionItem = {
   percent: number | null;
 };
 
-function positiveFiniteNumber(value: unknown): number | null {
-  if (value === null || value === undefined || value === "") return null;
-  const numeric = typeof value === "number" ? value : Number(value);
-  return Number.isFinite(numeric) && numeric > 0 ? numeric : null;
-}
-
-function tickerAssetSymbol(ticker: SpotMarketTickerItem): string {
-  const baseAsset = String(ticker.base_asset || "").trim().toUpperCase();
-  if (baseAsset) return baseAsset;
-
-  const symbol = String(ticker.symbol || "").trim().toUpperCase();
-  return symbol.endsWith("USDT") ? symbol.slice(0, -4) : symbol;
-}
-
-function tickerLastPrice(ticker: SpotMarketTickerItem): number | null {
-  return positiveFiniteNumber(
-    ticker.last_price ?? ticker.price ?? ticker.last ?? ticker.close,
-  );
-}
-
 export function buildAssetValuationDistribution(
   assets: AssetValuationInput[],
   tickers: SpotMarketTickerItem[],
 ): AssetValuationDistributionItem[] {
-  const priceByAsset = new Map<string, number>();
-  for (const ticker of tickers) {
-    const assetSymbol = tickerAssetSymbol(ticker);
-    const price = tickerLastPrice(ticker);
-    if (assetSymbol && price !== null) {
-      priceByAsset.set(assetSymbol, price);
-    }
-  }
+  const priceByAsset = assetPrices(tickers);
 
   const valuations = assets.map((asset) => {
     const symbol = String(asset.symbol || "").trim().toUpperCase();
@@ -56,7 +30,7 @@ export function buildAssetValuationDistribution(
       symbol,
       amount,
       precision: asset.displayPrecision,
-      usdtValue: price === null ? null : amount * price,
+      usdtValue: amount === 0 ? 0 : price === null || !Number.isFinite(amount * price) ? null : amount * price,
     };
   });
 

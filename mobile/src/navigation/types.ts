@@ -110,5 +110,6 @@ export type RootStackParamList = {
   HelpCenter: undefined;
   HelpArticle: { articleId: string; title: string };
   AboutPage: undefined;
+  Bank: undefined;
   LanguageSettings: undefined;
 };

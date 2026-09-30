@@ -36,6 +36,7 @@ import MobileKlineChart, {
   type KlineReferencePriceLine,
 } from '../trade/MobileKlineChart';
 import type { KlineInterval } from '../trade/kline.utils';
+import MarketLogo from '../markets/MarketLogo';
 
 type DetailTab = 'depth' | 'trades' | 'info';
 
@@ -63,6 +64,7 @@ export type MarketDetailViewProps = {
   symbol: string;
   symbolLabel: string;
   baseAsset: string;
+  logoUrl?: string | null;
   quoteAsset: string;
   category?: AdvancedChartCategory;
   price: number | null;
@@ -97,6 +99,7 @@ export default function MarketDetailView({
   symbol,
   symbolLabel,
   baseAsset,
+  logoUrl,
   quoteAsset,
   category,
   price,
@@ -185,6 +188,7 @@ export default function MarketDetailView({
         ) : (
           <PortraitHeader
             baseAsset={baseAsset}
+            logoUrl={logoUrl}
             market={market}
             symbolLabel={symbolLabel}
             onBack={onBack}
@@ -501,11 +505,13 @@ function IndicatorToolbar({
 
 function PortraitHeader({
   baseAsset,
+  logoUrl,
   market,
   symbolLabel,
   onBack,
 }: {
   baseAsset: string;
+  logoUrl?: string | null;
   market: 'spot' | 'contract';
   symbolLabel: string;
   onBack: () => void;
@@ -527,7 +533,7 @@ function PortraitHeader({
         <ArrowLeft color={colors.text} size={24} strokeWidth={2.2} />
       </Pressable>
       <View style={styles.assetAvatar}>
-        <Text style={styles.assetAvatarText}>{baseAsset.slice(0, 2)}</Text>
+        <MarketLogo label={baseAsset} logoUrl={logoUrl} size={30} />
       </View>
       <Text numberOfLines={1} style={styles.headerSymbol}>
         {symbolLabel}
@@ -1161,9 +1167,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginLeft: 2,
     marginRight: 9,
-    backgroundColor: colors.gold,
   },
-  assetAvatarText: { ...typography.heavy, color: colors.black, fontSize: 10 },
   headerSymbol: {
     ...typography.heavy,
     flexShrink: 1,

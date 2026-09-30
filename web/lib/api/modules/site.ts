@@ -37,6 +37,7 @@ export type SiteConfig = {
   site_name: string;
   site_slogan?: string;
   logo_url?: string;
+  bank_portal_url?: string | null;
   support_email?: string;
   risk_disclaimer?: string;
   footer_disclaimer?: string;

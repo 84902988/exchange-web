@@ -406,7 +406,7 @@ export default function AssetsScreen() {
       accountMeta.map(item => ({
         key: item.key,
         label: t(item.labelKey),
-        value: accountValuations[item.key].totalUsdt,
+        value: accountValuations[item.key].totalUsd ?? null,
         color: item.color,
       })),
     [accountValuations, t],
@@ -444,9 +444,9 @@ export default function AssetsScreen() {
             }
             snapshotAvailable={Boolean(isLoggedIn && snapshot)}
             stale={assetSnapshotState.stale}
-            totalUsdt={isLoggedIn ? snapshot?.totalUsdt ?? null : null}
+            totalUsd={isLoggedIn ? snapshot?.totalUsd ?? null : null}
             valuationComplete={Boolean(
-              isLoggedIn && snapshot?.valuationComplete,
+              isLoggedIn && snapshot?.usdValuationComplete,
             )}
             onToggleHidden={() => setHidden(current => !current)}
           />
@@ -480,7 +480,7 @@ export default function AssetsScreen() {
             <Text style={styles.retryText}>{t('common.reload')}</Text>
           </Pressable>
         </View>
-      ) : snapshot && !snapshot.valuationComplete ? (
+      ) : snapshot && !snapshot.usdValuationComplete ? (
         <Text style={styles.error}>
           {snapshot.missingPriceSymbols.length > 0
             ? t('assets.missingPrices', {
@@ -497,7 +497,7 @@ export default function AssetsScreen() {
               accountValuations={accountValuations}
               distributionItems={distributionItems}
               hidden={hidden}
-              valuationComplete={Boolean(snapshot?.valuationComplete)}
+              valuationComplete={Boolean(snapshot?.usdValuationComplete)}
               valuationRows={valuationRows}
             />
           ) : null}
@@ -816,7 +816,7 @@ function AccountSummaryRow({
   hidden: boolean;
 }) {
   const { t } = useLanguage();
-  const value = valuation.totalUsdt;
+  const value = valuation.totalUsd ?? null;
   const coinCount = valuation.positiveAssetCount;
   return (
     <View style={styles.metricRow}>
@@ -830,8 +830,8 @@ function AccountSummaryRow({
         {hidden
           ? '******'
           : value === null
-          ? '-- USDT'
-          : `${formatAssetNumber(value, 2)} USDT`}
+          ? '-- USD'
+          : `${formatAssetNumber(value, 2)} USD`}
       </Text>
     </View>
   );
@@ -876,9 +876,9 @@ function formatAccountValuation(
   hidden: boolean,
 ) {
   if (hidden) return '******';
-  return valuation.totalUsdt === null
-    ? '-- USDT'
-    : `${formatAssetNumber(valuation.totalUsdt, 2)} USDT`;
+  return valuation.totalUsd == null
+    ? '-- USD'
+    : `${formatAssetNumber(valuation.totalUsd, 2)} USD`;
 }
 
 function getErrorMessage(error: unknown, fallback: string) {

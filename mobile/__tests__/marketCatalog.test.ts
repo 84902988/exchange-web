@@ -70,6 +70,18 @@ describe('mobile market catalog', () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
+  it('retains the server CFD classifications through API mapping', async () => {
+    fetchMock.mockImplementation((input: RequestInfo | URL) => Promise.resolve(jsonResponse(
+      String(input).includes('/market/mobile/overview') ? {
+        overview_cards: [], sections: [{key: 'contract_cfd', items: ['GOLD', 'COMMODITY', 'FOREX', 'INDEX'].map((market_category, i) => ({
+          symbol: `CFD${i}_PERP`, category: 'contract_cfd', market_category, price: '10',
+          tradable: true, trade_market: 'contract', trade_symbol: `CFD${i}_PERP`, trade_status: 'ENABLED',
+        }))}],
+      } : {items: []},
+    )));
+    expect((await fetchMobileMarkets()).map(item => item.cfdGroup)).toEqual(['metals', 'commodities', 'forex', 'indices']);
+  });
+
   it('single-flights concurrent catalog loads', async () => {
     let release!: (response: Response) => void;
     const gate = new Promise<Response>(resolve => {

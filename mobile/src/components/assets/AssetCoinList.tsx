@@ -72,9 +72,9 @@ function AssetCoinList({
                 <Text numberOfLines={2} style={styles.valuationValue}>
                   {hidden
                     ? '***'
-                    : !item.valuationComplete || item.valueUsdt === null
-                    ? '-- USDT'
-                    : `${formatAssetNumber(item.valueUsdt, 2)} USDT`}
+                    : !item.valuationComplete || item.valueUsd == null
+                    ? '-- USD'
+                    : `${formatAssetNumber(item.valueUsd, 2)} USD`}
                 </Text>
               </View>
             </View>

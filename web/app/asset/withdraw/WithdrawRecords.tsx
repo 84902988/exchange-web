@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import AssetsAPI, { type CoinItem } from "@/lib/api/modules/assets";
 import { ApiError } from "@/lib/api";
@@ -12,6 +12,8 @@ import { useAuth } from "@/lib/authContext";
 import { privateQueryKey } from "@/lib/authPrivateQueries";
 
 import type { Language } from "@/utils/language";
+import {confirmationRecordStatus, findWithdrawalConfirmation} from './withdrawConfirmation';
+import {getWithdrawConfirmationCopy} from './withdrawConfirmationCopy';
 
 import {
   clsx,
@@ -334,6 +336,7 @@ function withdrawRecordKey(record: DisplayWithdrawBase, index: number) {
 }
 
 export default function WithdrawRecords({
+  currentLanguage,
   coins = [],
   coinSymbol,
   networkCode,
@@ -346,6 +349,8 @@ export default function WithdrawRecords({
 }: Props) {
   const { t } = useLocaleContext();
   const { userIdentityKey } = useAuth();
+  const queryClient = useQueryClient();
+  const confirmationCopy = getWithdrawConfirmationCopy(currentLanguage);
   const withdrawSendIncompleteMessage = t("assetWithdrawRecordsWithdrawFundsAreFrozenButOnChainSubmissionIsNot", "asset");
   const withdrawSendSubmitFailedMessage = t("assetWithdrawRecordsChainSendingTaskSubmissionFailedPleaseContinueFromWithdrawRecords", "asset");
   const [page, setPage] = useState(1);
@@ -367,6 +372,35 @@ export default function WithdrawRecords({
     () => typeof document === "undefined" || document.visibilityState === "visible"
   );
   const lastWithdrawStatusRef = useRef<Map<string, string>>(new Map());
+  const [pendingConfirmId, setPendingConfirmId] = useState<number | null>(null);
+  const [moneyBusy, setMoneyBusy] = useState(false);
+  const [recoveryBusy, setRecoveryBusy] = useState(false);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+  // Confirmation, explicit send, and cancellation share one synchronous lock.
+  const confirmationLockRef = useRef(false);
+  const recoveryLockRef = useRef(false);
+  const pendingConfirmRef = useRef<number | null>(null);
+  const actionGenerationRef = useRef(0);
+  const actionContextRef = useRef('');
+  actionContextRef.current = JSON.stringify([userIdentityKey, coinSymbol, networkCode, page]);
+  useEffect(() => {
+    actionGenerationRef.current += 1;
+    pendingConfirmRef.current = null;
+    setPendingConfirmId(null);
+    setActiveVerifyId(null);
+    setVerifyBusyId(null);
+    setSubmitBusyId(null);
+    setCancelBusyId(null);
+    setVerifyMessage('');
+    setVerifyError('');
+    setVerifyCode('');
+    setResendCooldown(0);
+    return () => { actionGenerationRef.current += 1; };
+  }, [userIdentityKey, coinSymbol, networkCode, page]);
 
   const clearActionNotice = () => {
     setVerifyMessage("");
@@ -651,6 +685,7 @@ export default function WithdrawRecords({
   };
 
   const sendVerificationCode = async (withdrawId: number, resent = false) => {
+    if (confirmationLockRef.current || recoveryLockRef.current || pendingConfirmRef.current !== null) return;
     setVerifyBusyId(withdrawId);
     setVerifyError("");
     setVerifyMessage("");
@@ -681,63 +716,126 @@ export default function WithdrawRecords({
     await sendVerificationCode(withdrawId, true);
   };
 
+  const recoverRecordConfirmation = async (withdrawId: number, verificationError = '') => {
+    if (recoveryLockRef.current) return;
+    recoveryLockRef.current = true;
+    setRecoveryBusy(true);
+    const generation = actionGenerationRef.current;
+    const context = actionContextRef.current;
+    const isCurrent = () => actionGenerationRef.current === generation && actionContextRef.current === context;
+    pendingConfirmRef.current = withdrawId;
+    setPendingConfirmId(withdrawId);
+    setVerifyBusyId(withdrawId);
+    setVerifyError('');
+    setVerifyMessage('');
+    try {
+      const record = await findWithdrawalConfirmation(withdrawId, async offset => {
+        const response = await WithdrawAPI.listWithdraws({limit: 20, offset});
+        if (!Array.isArray(response?.items)) throw new Error('Invalid withdrawal records');
+        return response.items;
+      }, isCurrent);
+      if (!isCurrent() || !record) return;
+      const status = confirmationRecordStatus(record)!;
+      pendingConfirmRef.current = null;
+      setPendingConfirmId(null);
+      queryClient.setQueryData<WithdrawListResp>(
+        privateQueryKey(userIdentityKey, 'withdraws', page, pageSize),
+        current => current ? {...current, items: (current.items ?? []).map(item => {
+          if ('user_transfer_direction' in item) return item;
+          return Number(item.withdraw_id ?? item.id) === withdrawId ? {...item, ...record, status} : item;
+        })} : current,
+      );
+      if (status === 'VERIFYING') {
+        setActiveVerifyId(withdrawId);
+        setVerifyError(verificationError);
+      } else {
+        setActiveVerifyId(null);
+        setVerifyCode('');
+        setResendCooldown(0);
+        void (onBalanceRefresh ?? onRefreshBalances)?.();
+      }
+    } catch {
+      // Retain the original id and explicit read-only recovery, not a failure claim.
+    } finally {
+      recoveryLockRef.current = false;
+      if (mountedRef.current) setRecoveryBusy(false);
+      if (isCurrent()) setVerifyBusyId(null);
+    }
+  };
+
   const confirmVerification = async (withdrawId: number) => {
+    if (confirmationLockRef.current || recoveryLockRef.current || pendingConfirmRef.current !== null) return;
     const code = verifyCode.replace(/\D/g, "").slice(0, 6);
     if (code.length < 4) {
       setVerifyError(t("assetWithdrawRecordsPleaseEnterAValidVerificationCode", "asset"));
       return;
     }
+    confirmationLockRef.current = true;
+    setMoneyBusy(true);
+    const generation = actionGenerationRef.current;
+    const context = actionContextRef.current;
+    const isCurrent = () => actionGenerationRef.current === generation && actionContextRef.current === context;
     setVerifyBusyId(withdrawId);
     setVerifyError("");
     setVerifyMessage("");
     try {
-      await WithdrawAPI.confirmWithdraw({ withdraw_id: withdrawId, code });
+      const confirmed = await WithdrawAPI.confirmWithdraw({ withdraw_id: withdrawId, code });
+      if (!isCurrent()) return;
+      if (Number(confirmed.withdraw_id) !== withdrawId || confirmed.status !== 'FROZEN') throw new Error('Unconfirmed withdrawal response');
       setActiveVerifyId(null);
       setVerifyCode("");
       setResendCooldown(0);
       setVerifyMessage(t("assetWithdrawRecordsWithdrawFundsFrozenSubmittingOnChainProcessing", "asset"));
       void withdrawsQuery.refetch();
       void (onBalanceRefresh ?? onRefreshBalances)?.();
-      void (async () => {
+      await (async () => {
         try {
           const result = await WithdrawAPI.sendWithdrawTx({ withdraw_id: withdrawId });
+          if (!isCurrent()) return;
           const nextStatus = normalizeWithdrawStatus(result?.status);
           if (!result?.ok || nextStatus === "FAILED" || nextStatus === "REJECTED") {
             throw new Error(result?.message || result?.error || withdrawSendIncompleteMessage);
           }
           setVerifyMessage(t("assetWithdrawRecordsWithdrawSubmittedForOnChainProcessing", "asset"));
         } catch (error) {
+          if (!isCurrent()) return;
           console.warn("withdraw send task submit failed", error);
           setVerifyMessage("");
           setVerifyError(withdrawSendSubmitFailedMessage);
         } finally {
-          void withdrawsQuery.refetch();
+          if (isCurrent()) void withdrawsQuery.refetch();
         }
       })();
     } catch (error) {
-      setVerifyError(getWithdrawActionErrorMessage(
-        error,
-        t("assetWithdrawRecordsConfirmationFailedPleaseTryAgainLater", "asset"),
-        t
+      if (isCurrent()) await recoverRecordConfirmation(withdrawId, getWithdrawActionErrorMessage(
+        error, t('assetWithdrawRecordsConfirmationFailedPleaseTryAgainLater', 'asset'), t,
       ));
     } finally {
-      setVerifyBusyId(null);
+      confirmationLockRef.current = false;
+      if (mountedRef.current) setMoneyBusy(false);
+      if (isCurrent()) setVerifyBusyId(null);
     }
   };
 
   const cancelWithdraw = async (withdrawId: number, status?: string) => {
+    if (confirmationLockRef.current || recoveryLockRef.current || pendingConfirmRef.current !== null) return;
     const normalized = normalizeWithdrawStatus(status);
     const confirmMessage =
       normalized === "FROZEN"
         ? t("assetWithdrawRecordsCancelThisWithdrawFrozenFundsWillBeReturnedToFunding", "asset")
         : t("assetWithdrawRecordsCancelThisWithdraw", "asset");
     if (!window.confirm(confirmMessage)) return;
-
+    confirmationLockRef.current = true;
+    setMoneyBusy(true);
+    const generation = actionGenerationRef.current;
+    const context = actionContextRef.current;
+    const isCurrent = () => actionGenerationRef.current === generation && actionContextRef.current === context;
     setCancelBusyId(withdrawId);
     setVerifyError("");
     setVerifyMessage("");
     try {
       await WithdrawAPI.cancelWithdraw({ withdraw_id: withdrawId });
+      if (!isCurrent()) return;
       if (activeVerifyId === withdrawId) {
         setActiveVerifyId(null);
         setVerifyCode("");
@@ -745,25 +843,36 @@ export default function WithdrawRecords({
       }
       setVerifyMessage(t("assetWithdrawRecordsWithdrawCanceled", "asset"));
       await withdrawsQuery.refetch();
+      if (!isCurrent()) return;
       try {
         await (onBalanceRefresh ?? onRefreshBalances)?.();
       } catch (refreshError) {
         console.warn("refresh balances after withdraw cancel failed", refreshError);
       }
     } catch (error) {
+      if (!isCurrent()) return;
       console.warn("cancel withdraw failed", error);
       setVerifyError(t("assetWithdrawRecordsCancelFailedPleaseTryAgainLater", "asset"));
     } finally {
-      setCancelBusyId(null);
+      confirmationLockRef.current = false;
+      if (mountedRef.current) setMoneyBusy(false);
+      if (isCurrent()) setCancelBusyId(null);
     }
   };
 
   const submitFrozenWithdraw = async (withdrawId: number) => {
+    if (confirmationLockRef.current || recoveryLockRef.current || pendingConfirmRef.current !== null) return;
+    confirmationLockRef.current = true;
+    setMoneyBusy(true);
+    const generation = actionGenerationRef.current;
+    const context = actionContextRef.current;
+    const isCurrent = () => actionGenerationRef.current === generation && actionContextRef.current === context;
     setSubmitBusyId(withdrawId);
     setVerifyError("");
     setVerifyMessage("");
     try {
       const result = await WithdrawAPI.sendWithdrawTx({ withdraw_id: withdrawId });
+      if (!isCurrent()) return;
       const nextStatus = normalizeWithdrawStatus(result?.status);
       if (!result?.ok || nextStatus === "FAILED" || nextStatus === "REJECTED") {
         onToast?.(withdrawSendSubmitFailedMessage);
@@ -773,10 +882,13 @@ export default function WithdrawRecords({
       onToast?.(t("assetWithdrawRecordsWithdrawSubmitted", "asset"));
       await withdrawsQuery.refetch();
     } catch (error) {
+      if (!isCurrent()) return;
       console.warn("withdraw send task submit failed", error);
       onToast?.(withdrawSendSubmitFailedMessage);
     } finally {
-      setSubmitBusyId(null);
+      confirmationLockRef.current = false;
+      if (mountedRef.current) setMoneyBusy(false);
+      if (isCurrent()) setSubmitBusyId(null);
     }
   };
 
@@ -844,6 +956,14 @@ export default function WithdrawRecords({
       </div>
 
       <div className="mt-4 min-w-0 max-w-full overflow-hidden">
+        {pendingConfirmId != null ? <div role="status" className="mb-3 rounded-xl border border-amber-400/30 bg-amber-400/10 px-4 py-3 text-sm text-amber-200">
+          <div>{confirmationCopy.title} · #{pendingConfirmId}</div>
+          <div>{confirmationCopy.message}</div>
+          <button type="button" disabled={moneyBusy || recoveryBusy || verifyBusyId != null}
+            onClick={() => void recoverRecordConfirmation(pendingConfirmId)}
+            className="mt-2 rounded-lg border border-white/20 px-3 py-2 disabled:opacity-50"
+          >{confirmationCopy.refresh}</button>
+        </div> : null}
         {(verifyMessage || verifyError) ? (
           <div
             className={clsx(
@@ -943,18 +1063,20 @@ export default function WithdrawRecords({
                   : formatNetworkLabel(chainKey);
                 const internalDirectionLabel = isInternalRecord ? formatChannelLabel(chainKey, t) : "";
                 const hasTxHash = Boolean(tx.trim());
-                const canContinueVerify = !isInternalRecord && withdrawId > 0 && isVerifyingStatus(r.status);
+                const canContinueVerify = !isInternalRecord && withdrawId > 0 && !hasTxHash && pendingConfirmId !== withdrawId && isVerifyingStatus(r.status);
                 const canContinueSubmit =
                   !isInternalRecord &&
                   withdrawId > 0 &&
-                  normalizeWithdrawStatus(r.status) === "FROZEN" &&
+                  pendingConfirmId !== withdrawId &&
+                  ['FROZEN', 'APPROVED'].includes(normalizeWithdrawStatus(r.status)) &&
                   !hasTxHash;
                 const canCancelWithdraw =
                   !isInternalRecord && withdrawId > 0 && !hasTxHash && isCancelableWithdrawStatus(r.status);
-                const isActiveVerify = activeVerifyId === withdrawId;
+                const isActiveVerify = activeVerifyId === withdrawId && canContinueVerify;
                 const isBusy = verifyBusyId === withdrawId;
                 const isCanceling = cancelBusyId === withdrawId;
                 const isSubmitting = submitBusyId === withdrawId;
+                const actionsDisabled = moneyBusy || recoveryBusy || pendingConfirmId != null;
                 const normalizedStatus = normalizeWithdrawStatus(r.status);
                 const failureReason =
                   !isInternalRecord && getWithdrawStatusMeta(r.status, undefined, t).kind === "failed"
@@ -1040,10 +1162,10 @@ export default function WithdrawRecords({
                               <button
                                 type="button"
                                 onClick={() => submitFrozenWithdraw(withdrawId)}
-                                disabled={isSubmitting}
+                                disabled={actionsDisabled || isSubmitting}
                                 className={clsx(
                                   "rounded-lg px-2 py-1 text-xs font-semibold",
-                                  isSubmitting
+                                  actionsDisabled || isSubmitting
                                     ? "bg-white/10 text-white/40"
                                     : "bg-white text-black hover:bg-white/90"
                                 )}
@@ -1057,7 +1179,7 @@ export default function WithdrawRecords({
                               <button
                                 type="button"
                                 onClick={() => startVerification(withdrawId)}
-                                disabled={isBusy}
+                                disabled={actionsDisabled || isBusy}
                                 className={clsx(
                                   "rounded-lg px-2 py-1 text-xs font-semibold",
                                   isBusy
@@ -1074,10 +1196,10 @@ export default function WithdrawRecords({
                               <button
                                 type="button"
                                 onClick={() => cancelWithdraw(withdrawId, r.status)}
-                                disabled={isCanceling || isSubmitting}
+                                disabled={actionsDisabled || isCanceling || isSubmitting}
                                 className={clsx(
                                   "rounded-lg border px-2 py-1 text-xs font-semibold",
-                                  isCanceling || isSubmitting
+                                  actionsDisabled || isCanceling || isSubmitting
                                     ? "border-white/10 bg-white/5 text-white/40"
                                     : "border-red-400/40 bg-red-500/10 text-red-100 hover:bg-red-500/20"
                                 )}

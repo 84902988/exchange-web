@@ -280,6 +280,151 @@ describe('SpotMarketRealtimeStore', () => {
     jest.useRealTimers();
   });
 
+  it('does not show a late bootstrap failure after a fresh socket snapshot', async () => {
+    const bootstrap = deferred<SpotMarketView>();
+    const harness = createHarness({marketViewPromise: bootstrap.promise});
+    harness.store.acquire('screen');
+    harness.open();
+    harness.emit(marketSnapshotFrame());
+
+    bootstrap.reject(new Error('snapshot timed out'));
+    await flushPromises();
+
+    expect(harness.store.getSnapshot().error).toBeNull();
+    expect(harness.store.getSnapshot().ticker?.lastPrice).toBe(101);
+    // Display recovery must not grant execution authority.
+    expect(harness.store.getSnapshot().executable).toBe(false);
+  });
+
+  it('clears bootstrap errors only after fresh ticker and depth recover', async () => {
+    const bootstrap = deferred<SpotMarketView>();
+    const harness = createHarness({marketViewPromise: bootstrap.promise});
+    harness.store.acquire('screen');
+    harness.open();
+    bootstrap.reject(new Error('snapshot timed out'));
+    await flushPromises();
+
+    harness.emit(tickerFrame({ts: BASE_SERVER_TIME_MS}));
+    jest.advanceTimersByTime(80);
+    expect(harness.store.getSnapshot().error).toBe('snapshot timed out');
+
+    harness.emit(depthFrame({ts: BASE_SERVER_TIME_MS + 1}));
+    jest.advanceTimersByTime(80);
+    expect(harness.store.getSnapshot().error).toBeNull();
+    expect(harness.store.getSnapshot().depth.bids[0].price).toBe(100);
+  });
+
+  it('does not lose batched socket data when the bootstrap fails', async () => {
+    const bootstrap = deferred<SpotMarketView>();
+    const harness = createHarness({marketViewPromise: bootstrap.promise});
+    harness.store.acquire('screen');
+    harness.open();
+    harness.emit(tickerFrame({price: 103, ts: BASE_SERVER_TIME_MS}));
+    harness.emit(depthFrame({bid: 102, ask: 104, ts: BASE_SERVER_TIME_MS + 1}));
+    bootstrap.reject(new Error('snapshot timed out'));
+    await flushPromises();
+    jest.advanceTimersByTime(80);
+
+    expect(harness.store.getSnapshot().error).toBeNull();
+    expect(harness.store.getSnapshot().ticker?.lastPrice).toBe(103);
+    expect(harness.store.getSnapshot().depth.bids[0].price).toBe(102);
+  });
+
+  it('keeps bootstrap errors when socket data is stale or for another symbol', async () => {
+    const bootstrap = deferred<SpotMarketView>();
+    const harness = createHarness({marketViewPromise: bootstrap.promise});
+    harness.store.acquire('screen');
+    harness.open();
+    bootstrap.reject(new Error('snapshot unavailable'));
+    await flushPromises();
+    harness.emit(tickerFrame({freshness: 'STALE', stale: true, ts: BASE_SERVER_TIME_MS}));
+    harness.emit(depthFrame({ts: BASE_SERVER_TIME_MS + 1}));
+    harness.emit({...tickerFrame({ts: BASE_SERVER_TIME_MS + 2}), symbol: 'ETHUSDT'});
+    harness.emit({type: 'spot_ticker_update', symbol: 'BTCUSDT', ticker: {}});
+    jest.advanceTimersByTime(80);
+    expect(harness.store.getSnapshot().error).toBe('snapshot unavailable');
+
+    harness.emit(tickerFrame({ts: BASE_SERVER_TIME_MS + 3}));
+    jest.advanceTimersByTime(80);
+    expect(harness.store.getSnapshot().error).toBeNull();
+  });
+
+  it('does not hide a bootstrap failure with data from a disconnected socket', async () => {
+    const bootstrap = deferred<SpotMarketView>();
+    const harness = createHarness({marketViewPromise: bootstrap.promise});
+    harness.store.acquire('screen');
+    harness.open();
+    harness.emit(marketSnapshotFrame());
+    harness.reconnecting();
+    bootstrap.reject(new Error('snapshot unavailable'));
+    await flushPromises();
+
+    expect(harness.store.getSnapshot().error).toBe('snapshot unavailable');
+    expect(harness.store.getSnapshot().executable).toBe(false);
+    harness.open();
+    harness.emit(tickerFrame({ts: BASE_SERVER_TIME_MS + 1}));
+    jest.advanceTimersByTime(80);
+    expect(harness.store.getSnapshot().error).toBe('snapshot unavailable');
+    harness.emit(depthFrame({ts: BASE_SERVER_TIME_MS + 2}));
+    jest.advanceTimersByTime(80);
+    expect(harness.store.getSnapshot().error).toBeNull();
+  });
+
+  it('does not reuse a previous screen activation to hide a new bootstrap failure', async () => {
+    const bootstrap = deferred<SpotMarketView>();
+    const harness = createHarness({marketViewPromise: bootstrap.promise});
+    const release = harness.store.acquire('screen');
+    harness.open();
+    harness.emit(marketSnapshotFrame());
+    release();
+    harness.store.acquire('screen');
+    harness.open();
+    bootstrap.reject(new Error('new snapshot unavailable'));
+    await flushPromises();
+
+    expect(harness.store.getSnapshot().ticker?.lastPrice).toBe(101);
+    expect(harness.store.getSnapshot().error).toBe('new snapshot unavailable');
+    expect(harness.store.getSnapshot().executable).toBe(false);
+  });
+
+  it('keeps a new bootstrap error when reordered LIVE frames precede the high-water', async () => {
+    const bootstrap = deferred<SpotMarketView>();
+    const harness = createHarness({marketViewPromise: bootstrap.promise});
+    const release = harness.store.acquire('screen');
+    harness.open();
+    harness.emit(marketSnapshotFrame());
+    release();
+    harness.store.acquire('screen');
+    harness.open();
+    bootstrap.reject(new Error('new snapshot unavailable'));
+    await flushPromises();
+    harness.emit(tickerFrame({ts: BASE_SERVER_TIME_MS - 2}));
+    harness.emit(depthFrame({ts: BASE_SERVER_TIME_MS - 1}));
+    jest.advanceTimersByTime(80);
+    expect(harness.store.getSnapshot().error).toBe('new snapshot unavailable');
+    expect(harness.store.getSnapshot().executable).toBe(false);
+  });
+
+  it('requires newer evidence after a degraded frame before clearing an error', async () => {
+    const bootstrap = deferred<SpotMarketView>();
+    const harness = createHarness({marketViewPromise: bootstrap.promise});
+    harness.store.acquire('screen');
+    harness.open();
+    harness.emit(tickerFrame({ts: BASE_SERVER_TIME_MS}));
+    harness.emit(depthFrame({ts: BASE_SERVER_TIME_MS}));
+    harness.emit(depthFrame({ts: BASE_SERVER_TIME_MS + 1, freshness: 'STALE', stale: true}));
+    bootstrap.reject(new Error('snapshot unavailable'));
+    await flushPromises();
+    harness.emit(depthFrame({ts: BASE_SERVER_TIME_MS + 1}));
+    jest.advanceTimersByTime(80);
+    expect(harness.store.getSnapshot().error).toBe('snapshot unavailable');
+    expect(harness.store.getSnapshot().executable).toBe(false);
+
+    harness.emit(depthFrame({ts: BASE_SERVER_TIME_MS + 2}));
+    jest.advanceTimersByTime(80);
+    expect(harness.store.getSnapshot().error).toBeNull();
+  });
+
   it('reference-counts owners and runs REST plus WebSocket in parallel', async () => {
     const bootstrap = deferred<SpotMarketView>();
     const harness = createHarness({marketViewPromise: bootstrap.promise});

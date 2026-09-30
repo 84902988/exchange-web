@@ -737,6 +737,12 @@ def _inspect_mobile_uploaded_image(url: Any) -> dict[str, Any]:
     }
 
 
+def get_public_bank_portal_url(db: Session) -> Optional[str]:
+    """Share the configured portal with web without creating settings on reads."""
+    row = db.query(MobileContentSettings.home_config).order_by(MobileContentSettings.id.asc()).first()
+    return normalize_mobile_home_config(row.home_config if row else None)["bank_portal_url"]
+
+
 def get_or_create_mobile_settings(db: Session) -> MobileContentSettings:
     row = db.query(MobileContentSettings).order_by(MobileContentSettings.id.asc()).first()
     if row is None:

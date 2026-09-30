@@ -161,6 +161,7 @@ jest.mock('../src/components/markets/MarketSectionList', () => ({
 }));
 
 import MarketsScreen from '../src/screens/markets/MarketsScreen';
+import MarketCfdTabs from '../src/components/markets/MarketCfdTabs';
 
 async function renderMarketsScreen() {
   let renderer: ReactTestRenderer.ReactTestRenderer;
@@ -184,6 +185,24 @@ describe('MarketsScreen authoritative trading routing', () => {
     mockGetCachedMobileMarkets.mockReturnValue(mockMarkets);
     mockFetchMobileMarkets.mockResolvedValue(mockMarkets);
     jest.spyOn(Alert, 'alert').mockImplementation(jest.fn());
+  });
+
+  it('filters CFD groups without changing the authoritative trade route', async () => {
+    mockRouteParams = {category: 'cfd'};
+    const rows = ['metals', 'commodities', 'forex', 'indices', 'other'].map((cfdGroup, index) => ({
+      ...mockMarkets.find(item => item.category === 'cfd'),
+      id: `group-${index}`, symbol: `GROUP${index}_PERP`, tradeSymbol: `GROUP${index}_PERP`,
+      category: 'cfd', cfdGroup,
+    }));
+    mockGetCachedMobileMarkets.mockReturnValue(rows);
+    mockFetchMobileMarkets.mockResolvedValue(rows);
+    renderer = await renderMarketsScreen();
+    expect(mockSectionListProps?.sections[0].items).toHaveLength(5);
+    await act(async () => renderer!.root.findByType(MarketCfdTabs).props.onChange('forex'));
+    expect(mockSectionListProps?.sections[0].items.map((item: {symbol: string}) => item.symbol)).toEqual(['GROUP2_PERP']);
+    expect(mockSectionListProps?.sections[0].items[0].tradeSymbol).toBe('GROUP2_PERP');
+    await act(async () => renderer!.root.findByType(MarketCfdTabs).props.onChange('all'));
+    expect(mockSectionListProps?.sections[0].items).toHaveLength(5);
   });
 
   afterEach(async () => {

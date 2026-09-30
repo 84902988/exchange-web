@@ -35,10 +35,16 @@ import {
 import { useAuth } from '../../store/authStore';
 import { useLanguage } from '../../i18n';
 import { colors, typography } from '../../theme';
+import DepositProgress from '../../components/assets/action/DepositProgress';
 
 type RootNavigation = NativeStackNavigationProp<RootStackParamList>;
 
 export default function DepositScreen() {
+  const {isLoggedIn, user} = useAuth();
+  return <DepositScreenContent key={isLoggedIn ? user?.id ?? 'signed-in' : 'guest'} />;
+}
+
+function DepositScreenContent() {
   const navigation = useNavigation<RootNavigation>();
   const { isLoggedIn } = useAuth();
   const { t } = useLanguage();
@@ -439,6 +445,7 @@ export default function DepositScreen() {
           )}
         </>
       )}
+      {isLoggedIn && address ? <DepositProgress key={`${address.symbol}:${address.network}:${address.address}`} address={address} /> : null}
     </AppScreen>
   );
 }

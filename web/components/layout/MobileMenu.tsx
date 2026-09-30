@@ -98,6 +98,16 @@ export default function MobileMenu({
                   >
                     {menuT(item.labelKey)}
                   </button>
+                ) : item.isExternal ? (
+                  <a
+                    href={item.href}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    onClick={onClose}
+                    className="block text-sm font-medium text-white/85 hover:text-white transition-colors"
+                  >
+                    {menuT(item.labelKey)}
+                  </a>
                 ) : (
                   <Link
                     href={item.href}

@@ -19,7 +19,7 @@ import { colors, typography } from '../../theme';
 
 type Props = {
   isLoggedIn: boolean;
-  totalUsdt: number | null;
+  totalUsd: number | null;
   valuationComplete: boolean;
   snapshotAvailable: boolean;
   hidden: boolean;
@@ -31,7 +31,7 @@ type Props = {
 
 function AssetOverviewCard({
   isLoggedIn,
-  totalUsdt,
+  totalUsd,
   valuationComplete,
   snapshotAvailable,
   hidden,
@@ -43,11 +43,11 @@ function AssetOverviewCard({
   const { t } = useLanguage();
   const { width, fontScale } = useWindowDimensions();
   const compact = width <= 360 || fontScale >= 1.2;
-  const canDisplayTotal = !loading && valuationComplete && totalUsdt !== null;
+  const canDisplayTotal = !loading && valuationComplete && totalUsd !== null;
   const displayAmount = hidden
     ? '******'
     : canDisplayTotal
-    ? formatAssetNumber(totalUsdt, 2)
+    ? formatAssetNumber(totalUsd, 2)
     : '--';
   const Icon = hidden ? EyeOff : Eye;
   const StatusIcon = !isLoggedIn
@@ -94,7 +94,7 @@ function AssetOverviewCard({
             ) : null}
           </View>
           <Text maxFontSizeMultiplier={1.2} style={styles.amount}>
-            {displayAmount} USDT
+            {displayAmount} USD
           </Text>
         </View>
         <View
@@ -135,10 +135,11 @@ function AssetOverviewCard({
           </Text>
         </View>
       </View>
+      <Text style={styles.metricLabel}>{t('assets.usdEstimateBasis')}</Text>
       <View style={styles.footerRow}>
         <View style={styles.metric}>
           <Text style={styles.metricLabel}>{t('assets.pricingUnit')}</Text>
-          <Text style={styles.metricValue}>USDT</Text>
+          <Text style={styles.metricValue}>USD</Text>
         </View>
         <View style={styles.metric}>
           <Text style={styles.metricLabel}>{t('assets.assetView')}</Text>

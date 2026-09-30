@@ -35,6 +35,7 @@ SCHEDULED_JOB_QUEUE_NAMES = frozenset(
         QUEUE_EMAIL,
         QUEUE_PAYOUT,
         QUEUE_RELEASE,
+        QUEUE_TX_CONFIRM,
     }
 )
 

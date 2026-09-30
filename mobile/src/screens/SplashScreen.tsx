@@ -8,7 +8,7 @@ import { useAuth } from '../store/authStore';
 import { colors, typography } from '../theme';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Splash'>;
-const splashLogo = require('../assets/brand/app-logo.png');
+const splashLogo = require('../assets/brand/splash-logo.png');
 export const SPLASH_MIN_VISIBLE_MS = 120;
 export const SPLASH_MAX_WAIT_MS = 700;
 
@@ -61,11 +61,11 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: colors.bg,
+    backgroundColor: '#000000',
   },
   logoImage: {
-    width: 188,
-    height: 188,
+    width: 256,
+    height: 256,
   },
   title: {
     ...typography.heavy,

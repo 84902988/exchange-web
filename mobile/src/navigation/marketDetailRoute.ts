@@ -3,6 +3,7 @@ import type {
   MarketDetailReferencePriceLine,
   MarketDetailRouteParams,
 } from './types';
+import { normalizeLogoUrl } from './tradingRoute';
 
 const SYMBOL_PATTERN = /^[A-Z0-9][A-Z0-9._:-]{0,63}$/;
 const ASSET_PATTERN = /^[A-Z0-9][A-Z0-9._-]{0,31}$/;
@@ -116,6 +117,8 @@ export function parseMarketDetailRouteParams(
       ? (raw.initialInterval as MarketDetailRouteParams['initialInterval'])
       : '1m';
   const initialKlines = normalizeInitialKlines(raw.initialKlines);
+  const logoUrl = normalizeLogoUrl(raw.logoUrl);
+  const logo = logoUrl ? {logoUrl} : {};
   const preview = initialKlines.length > 0 ? {initialKlines} : {};
   if (raw.market === 'spot') {
     return {
@@ -124,6 +127,7 @@ export function parseMarketDetailRouteParams(
       baseAsset,
       quoteAsset,
       displayLabel,
+      ...logo,
       initialInterval,
       ...preview,
     };
@@ -137,6 +141,7 @@ export function parseMarketDetailRouteParams(
     baseAsset,
     quoteAsset,
     displayLabel,
+    ...logo,
     marketCategory: raw.marketCategory === 'stock' ? 'stock' : 'cfd',
     initialInterval,
     ...preview,

@@ -26,6 +26,7 @@ from app.services.stock_token_lock_service import (
     create_stock_token_lock_from_deposit,
 )
 from app.services.collection_candidate_registry import upsert_collection_candidate_from_deposit
+from app.services.native_deposit_service import extract_native_transfers, register_native_deposit
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 logger = logging.getLogger("moralis_webhook")
@@ -34,6 +35,17 @@ AVAXC_CHAIN_KEY = "avaxc"
 AVAXC_NATIVE_USDT_CONTRACT = "0x9702230a8ea53601f5cd2dc00fdbc13d4df4a8c7"
 SOLANA_CHAIN_KEY = "solana"
 SOLANA_USDT_MINT = "Es9vMFrzaCERmJfrF4H2FyFQ5jBqFaUG2RgxN6E7j3BP"
+
+
+def _enqueue_native_after_commit(deposit_ids: set[int]) -> bool:
+    try:
+        from app.tasks.native_deposit_tasks import enqueue_native_deposit
+        for deposit_id in sorted(deposit_ids):
+            enqueue_native_deposit(deposit_id)
+        return True
+    except Exception:
+        logger.exception("[moralis] native deposit confirmation enqueue failed")
+        return False
 
 
 # -------------------------
@@ -695,11 +707,13 @@ async def _moralis_webhook_impl(request: Request, db: Session) -> Dict[str, Any]
         or ""
     )
 
+    signature_verified = False
     if sig:
         try:
             # ✅ 你的 verify_signature 是 keyword-only，这里必须用关键字参数
             if not verify_signature(raw_body=raw, header_signature=sig, stream_id=str(stream_id)):
                 return {"ok": True, "ignored": True, "reason": "invalid_signature"}
+            signature_verified = True
         except Exception:
             logger.exception("[moralis] signature verification exception stream_id=%s", stream_id)
             return {"ok": True, "ignored": True, "reason": "signature_exception"}
@@ -712,6 +726,33 @@ async def _moralis_webhook_impl(request: Request, db: Session) -> Dict[str, Any]
     chain_type = _payload_chain_type(payload)
     transfers = _payload_transfers(payload)
     payload_confirmed = _is_confirmed_transfer(payload, {})
+    native_chain_key = {
+        "BSC": "bsc", "ETHEREUM": "ethereum", "POLYGON": "polygon",
+        "AVAXC": "avaxc", "OPTIMISM": "optimism",
+    }.get(chain_type)
+    native_transfers = extract_native_transfers(payload) if native_chain_key else []
+    native_ids: set[int] = set()
+    if native_transfers and signature_verified:
+        try:
+            for native_tx in native_transfers:
+                with db.begin_nested():
+                    native_deposit = register_native_deposit(db, native_chain_key, native_tx)
+                    if native_deposit and native_deposit.status in {"DETECTING", "PENDING", "CONFIRMING"}:
+                        native_ids.add(int(native_deposit.id))
+        except Exception:
+            db.rollback()
+            logger.exception("[moralis] native deposit registration failed")
+            return {"ok": False, "retryable": True, "reason": "native_deposit_storage_failed"}
+    if native_transfers and not transfers:
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            return {"ok": False, "retryable": True, "reason": "native_deposit_storage_failed"}
+        queued = _enqueue_native_after_commit(native_ids)
+        return {"ok": queued, "retryable": not queued,
+                "reason": "native_deposit_pending" if queued else "native_deposit_enqueue_failed",
+                "native_pending": len(native_ids), "signature_verified": signature_verified}
     if not transfers:
         reason = "unsupported_solana_payload" if _looks_like_solana_payload(payload) else "no_supported_transfer_list"
         logger.warning(
@@ -757,6 +798,10 @@ async def _moralis_webhook_impl(request: Request, db: Session) -> Dict[str, Any]
 
                 chain_key = chain_key_by_type[t_chain]
                 is_solana_chain = chain_key == "solana"
+                if not is_solana_chain and log_index < 0:
+                    # Negative indices are reserved for receipt-verified native value.
+                    skipped += 1
+                    continue
                 is_exact_address_chain = is_solana_chain
                 tx_hash = tx_hash_raw if is_exact_address_chain else tx_hash_raw.lower()
 
@@ -939,8 +984,12 @@ async def _moralis_webhook_impl(request: Request, db: Session) -> Dict[str, Any]
         db.commit()
     except Exception:
         db.rollback()
+        if native_ids:
+            return {"ok": False, "retryable": True, "reason": "native_deposit_storage_failed"}
         return {"ok": True}
 
+    if native_ids and not _enqueue_native_after_commit(native_ids):
+        return {"ok": False, "retryable": True, "reason": "native_deposit_enqueue_failed"}
     return {
         "ok": True,
         "handled": handled,
@@ -952,6 +1001,7 @@ async def _moralis_webhook_impl(request: Request, db: Session) -> Dict[str, Any]
         "credit_errors": credit_errors,
         "collection_candidate_ok": collection_candidate_ok,
         "confirmed": payload_confirmed,
+        "native_pending": len(native_ids),
     }
 
 
@@ -969,7 +1019,7 @@ async def moralis_webhook(request: Request):
             result.get("ok") if isinstance(result, dict) else None,
         )
         content = result if isinstance(result, dict) else {"ok": True, "ignored": True, "reason": "non_dict_response"}
-        return JSONResponse(status_code=200, content=content)
+        return JSONResponse(status_code=503 if content.get("retryable") else 200, content=content)
     except Exception:
         if db is not None:
             try:

@@ -16,6 +16,8 @@ import {
   type UserTransferRequestIntent,
 } from "@/lib/userTransferIntent";
 import type { Language } from "@/utils/language";
+import {confirmationRecordStatus, findWithdrawalConfirmation} from './withdrawConfirmation';
+import {getWithdrawConfirmationCopy} from './withdrawConfirmationCopy';
 import {
   getWithdrawFailureReason,
   getWithdrawProgress,
@@ -236,6 +238,34 @@ export default function WithdrawForm(props: Props) {
   const [result, setResult] = useState<ResultState | null>(null);
   const [internalError, setInternalError] = useState("");
   const internalTransferIntentRef = useRef<UserTransferRequestIntent | null>(null);
+  const [confirmationUncertain, setConfirmationUncertain] = useState(false);
+  const [checkingConfirmation, setCheckingConfirmation] = useState(false);
+  const [confirmingRequest, setConfirmingRequest] = useState(false);
+  const confirmationUncertainRef = useRef(false);
+  const confirmLockRef = useRef(false);
+  const recoveryLockRef = useRef(false);
+  const mountedRef = useRef(true);
+  const flowGenerationRef = useRef(0);
+  const flowContextRef = useRef({coinSymbol, networkCode});
+  flowContextRef.current = {coinSymbol, networkCode};
+  const confirmationCopy = getWithdrawConfirmationCopy(props.currentLanguage);
+  const setUncertain = (value: boolean) => {
+    confirmationUncertainRef.current = value;
+    setConfirmationUncertain(value);
+  };
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; flowGenerationRef.current += 1; };
+  }, []);
+  useEffect(() => {
+    flowGenerationRef.current += 1;
+    setUncertain(false);
+    setStep(1);
+    setWithdrawId(null);
+    setConfirmSnapshot(null);
+    setResult(null);
+    setVerifyCode('');
+  }, [coinSymbol, networkCode]);
 
   const optionItems = useMemo(
     () =>
@@ -424,7 +454,7 @@ export default function WithdrawForm(props: Props) {
   const resultWithdrawId = result?.kind === "withdraw" ? result.withdraw_id : undefined;
 
   useEffect(() => {
-    if (!resultWithdrawId || latestWithdrawRecords.length === 0) return;
+    if (confirmationUncertain || !resultWithdrawId || latestWithdrawRecords.length === 0) return;
     const latestRecord = latestWithdrawRecords.find((record) => getRecordWithdrawId(record) === resultWithdrawId);
     if (!latestRecord) return;
 
@@ -433,6 +463,8 @@ export default function WithdrawForm(props: Props) {
 
       const failureReason = getWithdrawFailureReason(latestRecord, t);
       const recordStatus = normalizeWithdrawStatus(latestRecord.status || prev.status) || prev.status;
+      // A list fetched before confirmation must not reopen verification.
+      if (recordStatus === 'VERIFYING' && prev.status !== 'VERIFYING') return prev;
       const recordTxHash = getWithdrawTxHash(latestRecord);
       const recordMeta = getWithdrawStatusMeta(recordStatus, failureReason || prev.message, t);
       const txHash = recordTxHash || prev.tx_hash;
@@ -472,9 +504,11 @@ export default function WithdrawForm(props: Props) {
         snapshot: nextSnapshot,
       };
     });
-  }, [latestWithdrawRecords, resultWithdrawId, t]);
+  }, [latestWithdrawRecords, resultWithdrawId, t, confirmationUncertain]);
 
   const resetFlow = () => {
+    if (confirmLockRef.current || recoveryLockRef.current || confirmationUncertainRef.current) return;
+    flowGenerationRef.current += 1;
     setStep(1);
     setConfirmSnapshot(null);
     setWithdrawId(null);
@@ -488,6 +522,7 @@ export default function WithdrawForm(props: Props) {
   };
 
   const resetAll = () => {
+    if (confirmLockRef.current || recoveryLockRef.current || confirmationUncertainRef.current) return;
     resetFlow();
     internalTransferIntentRef.current = null;
     setToAddress("");
@@ -499,6 +534,7 @@ export default function WithdrawForm(props: Props) {
   };
 
   const changeReceiverMode = (mode: ReceiverMode) => {
+    if (confirmLockRef.current || recoveryLockRef.current || confirmationUncertainRef.current) return;
     setReceiverMode(mode);
     resetFlow();
     setAmount("");
@@ -669,8 +705,55 @@ export default function WithdrawForm(props: Props) {
     onError: (e: unknown) => onError(mapWithdrawUserMessage(getErrorMessage(e, t("assetWithdrawFailedToSendVerificationCode", "asset")), t)),
   });
 
+  const recoverConfirmation = async (
+    id: number, snap: ConfirmSnapshot, generation: number, verificationError = '',
+  ) => {
+    if (recoveryLockRef.current) return;
+    const isCurrent = () => mountedRef.current && flowGenerationRef.current === generation &&
+      flowContextRef.current.coinSymbol === snap.symbol && flowContextRef.current.networkCode === snap.network;
+    if (!isCurrent()) return;
+    recoveryLockRef.current = true;
+    setCheckingConfirmation(true);
+    setUncertain(true);
+    setResult({ok: false, kind: 'withdraw', status: 'UNKNOWN', withdraw_id: id, snapshot: snap, fee: finalFee || fee});
+    setStep(3);
+    onError('');
+    try {
+      const record = await findWithdrawalConfirmation(id, async offset => {
+        const response = await WithdrawAPI.listWithdraws({limit: 20, offset});
+        if (!Array.isArray(response?.items)) throw new Error('Invalid withdrawal records');
+        return response.items;
+      }, isCurrent);
+      if (!isCurrent() || !record) return;
+      const status = confirmationRecordStatus(record)!;
+      setUncertain(false);
+      if (status === 'VERIFYING') {
+        setResult(null);
+        setStep(2);
+        if (verificationError) onError(verificationError);
+        return;
+      }
+      const reason = getWithdrawFailureReason(record, t);
+      const meta = getWithdrawStatusMeta(status, reason, t);
+      setResult({ok: meta.kind !== 'failed', kind: 'withdraw', status,
+        withdraw_id: id, snapshot: snap, fee: String(record.fee ?? finalFee ?? fee),
+        tx_hash: getWithdrawTxHash(record), message: reason});
+      setVerifyCode('');
+      setCodeSent(false);
+      setCodeCooldown(0);
+      // Refresh the existing record list; recovery never sends or creates a request.
+      onSuccessVerified();
+    } catch {
+      // Keep the original id and a read-only refresh action until a status is known.
+    } finally {
+      recoveryLockRef.current = false;
+      if (mountedRef.current) setCheckingConfirmation(false);
+    }
+  };
+
   const confirmMut = useMutation({
     mutationFn: async () => {
+      if (confirmLockRef.current || recoveryLockRef.current || confirmationUncertainRef.current) return;
       onError("");
       if (withdrawLocked) throw new Error(resolvedWithdrawLockedReason);
       if (!withdrawId) throw new Error(t("assetWithdrawMissingWithdrawId", "asset"));
@@ -678,75 +761,60 @@ export default function WithdrawForm(props: Props) {
       if (!code || code.length < 4) throw new Error(t("assetWithdrawPleaseEnterVerificationCode", "asset"));
       const snap = confirmSnapshot;
       if (!snap) throw new Error(t("assetWithdrawConfirmationInformationIsMissing", "asset"));
-      const resConfirm = await WithdrawAPI.confirmWithdraw({ withdraw_id: withdrawId, code });
-      if (String(resConfirm?.status ?? "") !== "FROZEN") {
-        throw new Error(resConfirm?.message || t("assetWithdrawVerificationCodeCheckFailed", "asset"));
-      }
-
-      const currentWithdrawId = withdrawId;
-      const resultFee = String((resConfirm?.fee_final ?? finalFee) || fee || "");
-      setResult({
-        ok: true,
-        kind: "withdraw",
-        status: "FROZEN",
-        message: "",
-        withdraw_id: currentWithdrawId,
-        snapshot: snap,
-        fee: resultFee,
-      });
-      setStep(3);
-      setVerifyCode("");
-      setCodeSent(false);
-      setCodeCooldown(0);
-      onSuccessVerified();
-
-      void (async () => {
+      confirmLockRef.current = true;
+      setConfirmingRequest(true);
+      const id = withdrawId;
+      const generation = flowGenerationRef.current;
+      const isCurrent = () => mountedRef.current && flowGenerationRef.current === generation &&
+        flowContextRef.current.coinSymbol === snap.symbol && flowContextRef.current.networkCode === snap.network;
+      try {
+        let resConfirm;
         try {
-          const resSend = await WithdrawAPI.sendWithdrawTx({ withdraw_id: currentWithdrawId });
-          const st = normalizeWithdrawStatus(resSend?.status || "PROCESSING") || "PROCESSING";
-          const txHash = String(resSend?.tx_hash ?? "").trim();
-          if (!resSend?.ok || st === "FAILED" || st === "REJECTED") {
-            throw new Error(resSend?.error || t("assetWithdrawAssetSendingFailed", "asset"));
+          resConfirm = await WithdrawAPI.confirmWithdraw({withdraw_id: id, code});
+          if (!isCurrent()) return;
+          if (Number(resConfirm?.withdraw_id) !== id || resConfirm?.status !== 'FROZEN') {
+            throw new Error(resConfirm?.message || t('assetWithdrawVerificationCodeCheckFailed', 'asset'));
           }
-          setResult((prev) => {
-            if (!prev || prev.kind !== "withdraw" || prev.withdraw_id !== currentWithdrawId) return prev;
-            return {
-              ...prev,
-              ok: true,
-              status: st,
-              tx_hash: txHash || prev.tx_hash,
-              message: prev.message,
-            };
-          });
         } catch (error) {
-          console.warn("withdraw send task submit failed", error);
-          setResult((prev) => {
-            if (!prev || prev.kind !== "withdraw" || prev.withdraw_id !== currentWithdrawId) return prev;
-            return {
-              ...prev,
-              ok: true,
-              status: "FROZEN",
-              message: mapWithdrawUserMessage(withdrawSendSubmitFailedMessage, t),
-            };
-          });
+          if (isCurrent()) await recoverConfirmation(id, snap, generation,
+            mapWithdrawUserMessage(getErrorMessage(error, t('assetWithdrawConfirmationFailed', 'asset')), t));
+          return;
+        }
+        setUncertain(false);
+        setResult({ok: true, kind: 'withdraw', status: 'FROZEN', message: '',
+          withdraw_id: id, snapshot: snap, fee: String((resConfirm.fee_final ?? finalFee) || fee || '')});
+        setStep(3);
+        setVerifyCode('');
+        setCodeSent(false);
+        setCodeCooldown(0);
+        onSuccessVerified();
+        try {
+          // Only the normal, positively acknowledged confirmation path sends once.
+          const resSend = await WithdrawAPI.sendWithdrawTx({withdraw_id: id});
+          if (!isCurrent()) return;
+          const status = normalizeWithdrawStatus(resSend?.status || 'PROCESSING') || 'PROCESSING';
+          if (!resSend?.ok || (resSend.withdraw_id != null && Number(resSend.withdraw_id) !== id) ||
+              status === 'FAILED' || status === 'REJECTED') {
+            throw new Error(t('assetWithdrawAssetSendingFailed', 'asset'));
+          }
+          setResult(prev => prev?.kind === 'withdraw' && prev.withdraw_id === id
+            ? {...prev, ok: true, status, tx_hash: String(resSend.tx_hash ?? '').trim() || prev.tx_hash} : prev);
+        } catch {
+          if (!isCurrent()) return;
+          setResult(prev => prev?.kind === 'withdraw' && prev.withdraw_id === id
+            ? {...prev, message: mapWithdrawUserMessage(withdrawSendSubmitFailedMessage, t)} : prev);
           onToast(mapWithdrawUserMessage(withdrawSendSubmitFailedMessage, t));
         } finally {
-          onSuccessVerified();
+          if (isCurrent()) onSuccessVerified();
         }
-      })();
+      } finally {
+        confirmLockRef.current = false;
+        if (mountedRef.current) setConfirmingRequest(false);
+      }
     },
-    onError: (e: unknown) => {
-      const msg = mapWithdrawUserMessage(getErrorMessage(e, t("assetWithdrawConfirmationFailed", "asset")), t);
-      onError(msg);
-      setResult({
-        ok: false,
-        kind: "withdraw",
-        status: "FAILED",
-        message: msg,
-        withdraw_id: withdrawId ?? undefined,
-        snapshot: confirmSnapshot ?? undefined,
-        fee: finalFee || fee || "",
-      });
+    onError: (error: unknown) => {
+      if (mountedRef.current) onError(mapWithdrawUserMessage(
+        getErrorMessage(error, t('assetWithdrawConfirmationFailed', 'asset')), t));
     },
   });
 
@@ -770,6 +838,7 @@ export default function WithdrawForm(props: Props) {
     (receiverMode === "internal" && !internalReady);
   const sendDisabled = withdrawLocked || sendCodeMut.isPending || !withdrawId || codeCooldown > 0;
   const confirmDisabled =
+    confirmationUncertain || checkingConfirmation || confirmingRequest ||
     withdrawLocked ||
     confirmMut.isPending ||
     !withdrawId ||
@@ -786,25 +855,25 @@ export default function WithdrawForm(props: Props) {
   const resultProgress =
     result?.kind === "withdraw" ? getWithdrawProgress(result.status, t) : null;
   const resultTitle =
-    result?.kind === "user_transfer"
+    confirmationUncertain ? confirmationCopy.title : result?.kind === "user_transfer"
       ? t("assetWithdrawPlatformTransferCompleted", "asset")
       : resultStatusMeta?.title ?? (result?.ok
         ? t("assetWithdrawOnChainWithdrawSubmitted", "asset")
         : t("assetWithdrawOnChainWithdrawFailed", "asset"));
   const resultMessage =
-    result?.kind === "user_transfer"
+    confirmationUncertain ? confirmationCopy.message : result?.kind === "user_transfer"
       ? result.message || t("assetWithdrawPlatformTransferCompleted", "asset")
       : (result?.message || resultStatusMeta?.message) ?? (result?.ok
         ? t("assetWithdrawTheSystemIsProcessingYourRequest", "asset")
         : t("assetWithdrawPleaseTryAgainLater", "asset"));
   const resultBadgeClass =
-    result?.kind === "withdraw"
+    confirmationUncertain ? 'border-amber-400/30 text-amber-300 bg-amber-400/10' : result?.kind === "withdraw"
       ? resultStatusMeta?.className
       : result?.ok
         ? "border-emerald-500/30 text-emerald-300 bg-emerald-500/10"
         : "border-red-500/30 text-red-300 bg-red-500/10";
   const resultBadgeText =
-    result?.kind === "withdraw" ? resultStatusMeta?.badge ?? result.status : result?.ok
+    confirmationUncertain ? confirmationCopy.title : result?.kind === "withdraw" ? resultStatusMeta?.badge ?? result.status : result?.ok
       ? t("assetWithdrawSuccess", "asset")
       : t("assetWithdrawFailed", "asset");
 
@@ -1159,11 +1228,14 @@ export default function WithdrawForm(props: Props) {
               <button
                 type="button"
                 onClick={() => {
+                  if (confirmLockRef.current || recoveryLockRef.current || confirmationUncertainRef.current) return;
+                  flowGenerationRef.current += 1;
                   setStep(1);
                   setVerifyCode("");
                   setCodeSent(false);
                   setCodeCooldown(0);
                 }}
+                disabled={confirmingRequest || confirmMut.isPending || checkingConfirmation}
                 className="w-full rounded-xl py-3 text-sm font-semibold border border-white/10 bg-black/10 hover:border-white/20"
               >
                 {t("assetWithdrawPrevious", "asset")}
@@ -1227,8 +1299,19 @@ export default function WithdrawForm(props: Props) {
             </div>
 
             <div className="mt-5 flex gap-3">
+              {confirmationUncertain ? <button
+                type="button"
+                disabled={confirmingRequest || checkingConfirmation || confirmMut.isPending}
+                onClick={() => {
+                  if (result?.withdraw_id && result.snapshot) {
+                    void recoverConfirmation(result.withdraw_id, result.snapshot, flowGenerationRef.current);
+                  }
+                }}
+                className="w-full rounded-xl py-3 text-sm font-semibold bg-white text-black disabled:opacity-50"
+              >{confirmationCopy.refresh}</button> : null}
               <button
                 type="button"
+                disabled={confirmingRequest || confirmationUncertain || checkingConfirmation || confirmMut.isPending}
                 onClick={() => {
                   resetAll();
                   onSuccessVerified();
@@ -1239,6 +1322,7 @@ export default function WithdrawForm(props: Props) {
               </button>
               <button
                 type="button"
+                disabled={confirmingRequest || confirmationUncertain || checkingConfirmation || confirmMut.isPending}
                 onClick={() => resetAll()}
                 className="w-full rounded-xl py-3 text-sm font-semibold border border-white/10 bg-black/10 hover:border-white/20"
               >

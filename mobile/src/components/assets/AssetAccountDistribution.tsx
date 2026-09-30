@@ -34,7 +34,7 @@ function AssetAccountDistribution({
         <Text style={styles.title}>{t('assets.distribution')}</Text>
         <Text style={styles.meta}>
           {valuationComplete
-            ? t('assets.usdtValuation')
+            ? t('assets.usdValuation')
             : t('assets.incompleteValuation')}
         </Text>
       </View>
@@ -64,8 +64,8 @@ function AssetAccountDistribution({
               {hidden
                 ? '******'
                 : item.value === null
-                  ? '-- USDT'
-                  : `${formatAssetNumber(item.value, 2)} USDT`}
+                  ? '-- USD'
+                  : `${formatAssetNumber(item.value, 2)} USD`}
             </Text>
           </View>
         ))}

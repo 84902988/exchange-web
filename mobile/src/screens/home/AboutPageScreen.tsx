@@ -179,9 +179,6 @@ export default function AboutPageScreen({ navigation }: Props) {
                   {page.subtitle}
                 </Text>
               ) : null}
-              <Text style={styles.source}>
-                {t('common.platformContentSource')}
-              </Text>
               <ContentLanguageNotice responseLocale={page.locale} />
             </View>
           }
@@ -406,12 +403,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
     lineHeight: 21,
     textAlign: 'center',
-  },
-  source: {
-    ...typography.caption,
-    marginTop: 12,
-    color: colors.textSubtle,
-    fontSize: 10,
   },
   sectionCard: {
     marginTop: 12,

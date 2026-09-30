@@ -6,6 +6,7 @@ import base64
 import argparse
 import io
 import json
+import shutil
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageColor
@@ -101,6 +102,12 @@ def main() -> None:
     bundled = MOBILE_ROOT / 'src/assets/brand/app-logo.png'
     bundled.parent.mkdir(parents=True, exist_ok=True)
     composite_icon(logo, 512, .82).save(bundled, optimize=True)
+    # Reuse the transparent native foreground; launcher backgrounds must not
+    # leak into the in-app loading screen when applying a branding profile.
+    shutil.copyfile(
+        MOBILE_ROOT / 'android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_foreground.png',
+        bundled.with_name('splash-logo.png'),
+    )
     colors = MOBILE_ROOT / 'android/app/src/main/res/values/colors.xml'
     colors.write_text('<resources>\n    <color name="launcher_background">'+args.background+'</color>\n</resources>\n', encoding='utf-8')
     public = REPO_ROOT / 'web/public'

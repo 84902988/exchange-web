@@ -50,7 +50,7 @@ function normalizeDisplayLabel(value: unknown) {
   return normalized;
 }
 
-function normalizeLogoUrl(value: unknown) {
+export function normalizeLogoUrl(value: unknown) {
   if (typeof value !== 'string') return null;
   const normalized = value.trim();
   const hasControlCharacter = Array.from(normalized).some(character => {

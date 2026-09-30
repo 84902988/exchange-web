@@ -1,5 +1,6 @@
 import { apiClient } from './client';
 import { formatFixedPrice } from '../utils/format';
+import {resolveCfdGroup, type CfdGroup} from '../utils/marketCfd';
 import {
   getFreshExpiringEntry,
   getOrCreateInFlightRequest,
@@ -40,6 +41,7 @@ export type MarketInstrument = {
   price: number | null;
   changePercent: number | null;
   pricePrecision: number;
+  cfdGroup?: CfdGroup;
   logoUrl?: string | null;
   source: 'api';
   overviewRank?: number;
@@ -304,6 +306,9 @@ function mapInstrument(row: unknown): MarketInstrument | null {
     displaySymbol,
     name,
     category: getCategory(row, symbol),
+    ...(getCategory(row, symbol) === 'cfd'
+      ? {cfdGroup: resolveCfdGroup(row.market_category || row.asset_type || row.category)}
+      : {}),
     price,
     changePercent,
     pricePrecision: readPrecision(row, price),

@@ -1,3 +1,4 @@
+import {fetchAssetUsdRate, usdtToUsd, type AssetUsdRate} from './assetUsdRate';
 import {
   fetchAssetAccountBalances,
   type AssetAccountBalance,
@@ -18,6 +19,7 @@ export type AssetValuationRow = AssetAccountBalance & {
   totalAmount: number | null;
   priceUsdt: number | null;
   valueUsdt: number | null;
+  valueUsd?: number | null;
   valuationComplete: boolean;
 };
 
@@ -27,15 +29,20 @@ export type AssetAccountValuation = {
   positiveAssetCount: number;
   knownValueUsdt: number;
   totalUsdt: number | null;
+  totalUsd?: number | null;
+  usdValuationComplete?: boolean;
   valuationComplete: boolean;
 };
 
 export type AssetSnapshot = {
   userId: string;
+  usdRate?: AssetUsdRate | null;
   rows: AssetValuationRow[];
   accounts: AssetAccountValuation[];
   knownTotalUsdt: number;
   totalUsdt: number | null;
+  totalUsd?: number | null;
+  usdValuationComplete?: boolean;
   valuationComplete: boolean;
   missingPriceSymbols: string[];
   incompleteSymbols: string[];
@@ -58,6 +65,7 @@ export type AssetSnapshotRepository = {
 };
 
 type AssetSnapshotRepositoryOptions = {
+  fetchUsdRate?: () => Promise<AssetUsdRate | null>;
   fetchBalances?: (userId: string) => Promise<AssetAccountBalance[]>;
   fetchTickerPayload?: (pairSymbols: string[]) => Promise<unknown>;
   now?: () => number;
@@ -74,7 +82,9 @@ export function calculateAssetSnapshot({
   fetchedAt,
   pricesUsdt,
   userId,
+  usdRate = null,
 }: {
+  usdRate?: AssetUsdRate | null;
   balances: AssetAccountBalance[];
   fetchedAt: number;
   pricesUsdt: Readonly<Record<string, number>>;
@@ -96,8 +106,13 @@ export function calculateAssetSnapshot({
 
   return {
     userId: normalizedUserId,
-    rows,
-    accounts,
+    usdRate,
+    rows: rows.map(row => ({...row, valueUsd: usdtToUsd(row.valueUsdt, usdRate?.rate)})),
+    accounts: accounts.map(account => ({...account,
+      totalUsd: usdtToUsd(account.totalUsdt, usdRate?.rate),
+      usdValuationComplete: account.valuationComplete && usdRate !== null})),
+    totalUsd: usdtToUsd(valuationComplete ? knownTotalUsdt : null, usdRate?.rate),
+    usdValuationComplete: valuationComplete && usdRate !== null,
     knownTotalUsdt,
     totalUsdt: valuationComplete ? knownTotalUsdt : null,
     valuationComplete,
@@ -178,6 +193,7 @@ export function buildAssetTickerBatchPath(pairSymbols: string[]) {
 
 export function createAssetSnapshotRepository({
   fetchBalances = () => fetchAssetAccountBalances(),
+  fetchUsdRate = fetchAssetUsdRate,
   fetchTickerPayload = pairSymbols =>
     publicApiClient.get<unknown>(buildAssetTickerBatchPath(pairSymbols)),
   now = Date.now,
@@ -233,6 +249,7 @@ export function createAssetSnapshotRepository({
         const pairSymbols = assetSymbols.map(
           symbol => `${symbol}${QUOTE_ASSET}`,
         );
+        const usdRatePromise = fetchUsdRate().catch(() => null);
         const pricesUsdt =
           pairSymbols.length === 0
             ? {}
@@ -240,12 +257,14 @@ export function createAssetSnapshotRepository({
                 await fetchTickerPayload(pairSymbols),
                 assetSymbols,
               );
+        const usdRate = await usdRatePromise;
         const fetchedAt = now();
         const snapshot = calculateAssetSnapshot({
           balances,
           fetchedAt,
           pricesUsdt,
           userId: userKey,
+          usdRate,
         });
         cache.delete(userKey);
         cache.set(userKey, { snapshot, fetchedAt });
@@ -307,6 +326,8 @@ export function getAssetAccountValuation(
       positiveAssetCount: 0,
       knownValueUsdt: 0,
       totalUsdt: snapshot ? 0 : null,
+      totalUsd: snapshot?.usdRate ? 0 : null,
+      usdValuationComplete: Boolean(snapshot?.usdRate),
       valuationComplete: Boolean(snapshot),
     }
   );

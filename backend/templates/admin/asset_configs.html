@@ -2184,6 +2184,14 @@
           <span class="field-help">EVM 合约地址非空时必须为 0x 开头且 42 位。修改前请确认链上合约。</span>
         </div>
         <div class="field">
+          <label for="asset_chain_native_deposit_new">原生币充值（无合约）</label>
+          <select id="asset_chain_native_deposit_new" class="config-input" name="native_deposit_enabled">
+            <option value="0">禁用：仅按合约识别代币</option>
+            <option value="1">启用：识别此网络的原生币</option>
+          </select>
+          <span class="field-help">原生币须与网络主币一致、合约留空、精度为 18；仍受充值开关控制。当前仅支持充值，请关闭提现和真实归集发送。</span>
+        </div>
+        <div class="field">
           <label for="asset_chain_decimals_new">精度</label>
           <input id="asset_chain_decimals_new" class="config-input small" type="number" min="0" name="decimals" value="18" />
         </div>
@@ -2305,7 +2313,7 @@
                       {% if item.contract_address %}
                         <div class="config-info-line">合约：<span class="address-preview" title="{{ item.contract_address }}">{{ item.contract_address_display }}</span></div>
                       {% else %}
-                        <div class="config-info-line"><strong>原生币</strong></div>
+                        <div class="config-info-line"><strong>{{ '原生币充值' if item.native_deposit_enabled else '未配置充值合约' }}</strong></div>
                       {% endif %}
                       <div class="config-info-line">网络：<span title="{{ item.chain_name }}">{{ item.chain_name or item.chain_key }}</span></div>
                       {% if item.collection_address %}
@@ -2374,6 +2382,7 @@
                         data-runtime-status="{{ item.runtime_status | e }}"
                         data-chain-name="{{ item.chain_name | e }}"
                         data-contract-address="{{ item.contract_address | e }}"
+                        data-native-deposit-enabled="{{ 1 if item.native_deposit_enabled else 0 }}"
                         data-collection-address="{{ (item.collection_address or '') | e }}"
                         data-hot-wallet-address="{{ (item.hot_wallet_address or '') | e }}"
                         data-decimals="{{ item.decimals }}"
@@ -2442,6 +2451,14 @@
                     <label for="asset_chain_edit_contract_address">合约地址</label>
                     <input id="asset_chain_edit_contract_address" class="config-input wallet-address-input" type="text" name="contract_address" />
                     <span class="field-help">谨慎修改：EVM 合约地址非空时必须为 0x 开头且 42 位。</span>
+                  </div>
+                  <div class="config-edit-field config-edit-field-wide">
+                    <label for="asset_chain_edit_native_deposit">原生币充值（无合约）</label>
+                    <select id="asset_chain_edit_native_deposit" class="config-input" name="native_deposit_enabled">
+                      <option value="0">禁用：仅按合约识别代币</option>
+                      <option value="1">启用：识别此网络的原生币</option>
+                    </select>
+                    <span class="field-help">启用须合约留空、币种与网络主币一致、精度为 18。当前仅支持充值，请关闭提现和真实归集发送。</span>
                   </div>
                   <div class="config-edit-field">
                     <label for="asset_chain_edit_decimals">链上精度</label>
@@ -3382,6 +3399,7 @@
           depositOnlyWarning.hidden = button.dataset.withdrawSupported === "1";
         }
         setFormField(assetChainEditForm, '[name="contract_address"]', button.dataset.contractAddress);
+        setFormField(assetChainEditForm, '[name="native_deposit_enabled"]', button.dataset.nativeDepositEnabled || "0");
         setFormField(assetChainEditForm, '[name="collection_address"]', button.dataset.collectionAddress);
         setFormField(assetChainEditForm, '[name="hot_wallet_address"]', button.dataset.hotWalletAddress);
         setFormField(assetChainEditForm, '[name="decimals"]', button.dataset.decimals);

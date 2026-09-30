@@ -5,6 +5,7 @@ import { useMarketFavorites } from '../../hooks/useMarketFavorites';
 import { useLanguage, type TranslationKey } from '../../i18n';
 import { colors, typography } from '../../theme';
 import MarketRow from '../common/MarketRow';
+import MarketFavoritesSheet from './MarketFavoritesSheet';
 
 export type HomeMarketRankingKey =
   | 'favorites'
@@ -41,6 +42,7 @@ export default function TabbedMarketList({
 }: Props) {
   const { t } = useLanguage();
   const [activeTab, setActiveTab] = useState<HomeMarketRankingKey>('hot');
+  const [managingFavorites, setManagingFavorites] = useState(false);
   const favorites = useMarketFavorites();
   const favoriteSet = useMemo(
     () => new Set(favorites.symbols.map(normalizeMarketIdentity)),
@@ -53,7 +55,7 @@ export default function TabbedMarketList({
         holdingSymbols,
         items,
         ranking: activeTab,
-      }).slice(0, 6),
+      }).slice(0, activeTab === 'favorites' ? undefined : 6),
     [activeTab, favorites.symbols, holdingSymbols, items],
   );
   const toggleFavorite = useCallback(
@@ -104,6 +106,17 @@ export default function TabbedMarketList({
         })}
       </ScrollView>
 
+      {activeTab === 'favorites' ? (
+        <Pressable
+          accessibilityRole="button"
+          onPress={() => setManagingFavorites(true)}
+          style={styles.manageButton}>
+          <Text style={styles.activeLabel}>
+            {t(favoriteSet.size ? 'home.marketManageFavorites' : 'home.marketAddFavorites')}
+          </Text>
+        </Pressable>
+      ) : null}
+
       <View style={styles.list}>
         {visibleItems.map(item => {
           const favorite = favoriteSet.has(
@@ -144,6 +157,16 @@ export default function TabbedMarketList({
           </Text>
         ) : null}
       </View>
+      {managingFavorites ? (
+        <MarketFavoritesSheet
+          items={items}
+          symbols={favorites.symbols}
+          error={favorites.error}
+          loading={favorites.loading}
+          onToggle={favorites.toggle}
+          onClose={() => setManagingFavorites(false)}
+        />
+      ) : null}
     </View>
   );
 }
@@ -272,6 +295,12 @@ function normalizeMarketIdentity(value: string) {
 }
 
 const styles = StyleSheet.create({
+  manageButton: {
+    minHeight: 44,
+    alignSelf: 'flex-end',
+    justifyContent: 'center',
+    paddingHorizontal: 12,
+  },
   pressed: { opacity: 0.72, transform: [{ scale: 0.98 }] },
   tabs: {
     minHeight: 42,

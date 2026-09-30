@@ -10,7 +10,7 @@ describe('market read-only UI localization', () => {
   it('keeps the complete market catalog explicit and aligned in all four languages', () => {
     const expectedKeys = Object.keys(marketZhCN).sort();
 
-    expect(expectedKeys).toHaveLength(108);
+    expect(expectedKeys).toHaveLength(114);
     expect(Object.keys(marketZhTW).sort()).toEqual(expectedKeys);
     expect(Object.keys(marketEn).sort()).toEqual(expectedKeys);
     expect(Object.keys(marketJa).sort()).toEqual(expectedKeys);

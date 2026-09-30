@@ -3,7 +3,7 @@
 {% block title %}手机端内容设置{% endblock %}
 {% block page_title %}手机端内容设置{% endblock %}
 {% block page_subtitle %}
-  <div class="page-subtitle">仅驱动手机端展示；数据与 PC 站点配置完全隔离。</div>
+  <div class="page-subtitle">管理手机端展示；银行链接同时用于网页导航与手机首页。</div>
 {% endblock %}
 
 {% block content %}
@@ -52,9 +52,9 @@
           <span class="muted">关闭模块后，手机端不再展示对应区域；活动和公告关闭后公开 bootstrap 也不查询对应列表。</span>
         </div>
         <div class="field" style="grid-column:1 / -1">
-          <label for="home_bank_portal_url">银行端口跳转链接</label>
+          <label for="home_bank_portal_url">银行跳转链接</label>
           <input id="home_bank_portal_url" name="home_bank_portal_url" type="url" inputmode="url" placeholder="https://bank.example.com/portal" maxlength="500" value="{{ form.home_bank_portal_url or '' }}" />
-          <span class="muted">选填。填写完整 HTTPS 地址后，手机首页会在“活动中心”下方显示“银行端口 / Bank Portal”；留空则不显示。点击后直接打开该链接。</span>
+          <span class="muted">手机首页“活动中心”下方和网页导航始终显示“银行 / Bank”。两端共用此链接：填写完整 HTTPS 地址并保存后，点击入口打开该地址；留空时，点击进入“银行服务尚未上线”页面。保存后刷新网页；新版 App 首页会自动更新，也可离开首页后返回。</span>
         </div>
         <div class="field">
           <label for="home_market_shortcut_limit">首页行情卡数量</label>

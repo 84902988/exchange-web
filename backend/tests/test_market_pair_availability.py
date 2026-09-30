@@ -16,6 +16,36 @@ from app.services.market import (
 )
 
 
+def test_mobile_overview_preserves_all_spot_listings_beyond_preview_limit(monkeypatch) -> None:
+    symbols = [f"TOKEN{index:02d}USDT" for index in range(12)]
+    pairs = [
+        {"symbol": symbol, "asset_type": "CRYPTO", "market_category": "CRYPTO"}
+        for symbol in symbols
+    ]
+    monkeypatch.setattr(market_service, "get_market_pairs", lambda **kwargs: {"items": pairs})
+    monkeypatch.setattr(market_service, "get_market_tickers", lambda **kwargs: [
+        {"symbol": symbol, "last_price": "0.100", "change_24h": "0"}
+        for symbol in symbols
+    ])
+    monkeypatch.setattr(market_service, "_mobile_stock_contract_rows", lambda db, preferred: [])
+    monkeypatch.setattr(market_service, "_mobile_cfd_contract_rows", lambda db: [])
+    monkeypatch.setattr(market_service, "_mobile_contract_trade_routes", lambda db, rows: {})
+
+    def overview():
+        payload = market_service.get_mobile_market_overview(object(), preferred_symbols=symbols[:4])
+        rows = next(s["items"] for s in payload["sections"] if s["key"] == "spot")
+        assert len(payload["overview_cards"]) == 6
+        assert all(row["tradable"] and row["trade_market"] == "spot" for row in rows)
+        assert all(row["trade_symbol"] == row["symbol"] and row["price"] == "0.100" for row in rows)
+        return {row["symbol"] for row in rows}
+
+    assert overview() == set(symbols)
+    # A new catalog member must not require an app release or priority-list edit.
+    symbols.append("NEWCOINUSDT")
+    pairs.append({"symbol": symbols[-1], "asset_type": "CRYPTO", "market_category": "CRYPTO"})
+    assert overview() == set(symbols)
+
+
 def test_mobile_overview_exposes_complete_pc_cfd_catalog(monkeypatch) -> None:
     catalog = [
         ("XAGUSDT_PERP", "XAGUSD", "GOLD"),

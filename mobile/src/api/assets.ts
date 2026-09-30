@@ -1432,6 +1432,60 @@ export async function fetchDepositAddress(
   return normalizeDepositAddress(payload, params);
 }
 
+export type DepositRecord = {
+  id: number;
+  symbol: string;
+  network: string;
+  address: string;
+  amount: string;
+  status: string;
+  txid: string;
+  confirmations: number;
+  confirmRequired: number;
+  createdAt: string;
+  credited: boolean | null;
+  creditDestination: string | null;
+};
+
+export function normalizeDepositRecords(payload: unknown) {
+  const code = 'INVALID_DEPOSIT_RECORDS_PAYLOAD';
+  const root = requirePayloadRecord(payload, code, '充值记录');
+  if (!Array.isArray(root.items)) invalidAssetPayload('充值记录格式无效', code);
+  const items: DepositRecord[] = root.items.map(item => {
+    const row = requirePayloadRecord(item, code, '充值记录');
+    return {
+      id: readRequiredIntegerField(row, ['id'], code, '充值单号', 1),
+      symbol: readRequiredAssetSymbolField(row, ['symbol'], code, '充值币种'),
+      network: readRequiredChainKeyField(row, ['chain_key'], code, '充值网络'),
+      address: readRequiredStringField(row, ['address'], code, '充值地址'),
+      amount: readRequiredPositiveDecimalField(row, ['amount'], code, '充值数量'),
+      status: (readString(row, ['status']) || 'UNKNOWN').toUpperCase(),
+      txid: readString(row, ['txid']) || '',
+      confirmations: readRequiredIntegerField(row, ['confirmations'], code, '确认数', 0),
+      confirmRequired: readRequiredIntegerField(row, ['confirm_required'], code, '所需确认数', 0),
+      createdAt: readString(row, ['created_at']) || '',
+      credited: typeof row.credited === 'boolean' ? row.credited : null,
+      creditDestination: readString(row, ['credit_destination']) || null,
+    };
+  });
+  return {items, total: readRequiredIntegerField(root, ['total'], code, '充值记录数', 0)};
+}
+
+export async function fetchDepositRecords(params: {
+  symbol: string; network: string; address: string; page?: number;
+}, options?: ApiRequestOptions) {
+  const result = normalizeDepositRecords(await apiClient.get<unknown>(withQuery('/asset/deposits', {
+    symbol: params.symbol.trim().toUpperCase(), network: params.network.trim().toLowerCase(),
+    q: params.address, page: params.page || 1, page_size: 20,
+  }), options));
+  // The server search also matches sender addresses. Only show this destination.
+  const matchAddress = (value: string) => /^0x/i.test(value) ? value.toLowerCase() : value;
+  return {...result, items: result.items.filter(row =>
+    row.symbol === params.symbol.toUpperCase() && row.network === params.network.toLowerCase()
+      && matchAddress(row.address) === matchAddress(params.address)),
+  };
+}
+
 export function normalizeWithdrawFeeEstimate(
   payload: unknown,
   expected?: { symbol: string; network: string; amount: string },
@@ -1777,6 +1831,74 @@ export async function confirmWithdraw(params: {
     code: params.code.trim(),
   });
   return normalizeWithdrawConfirmResponse(payload, params.withdrawId);
+}
+
+export type WithdrawRecord = {
+  withdrawId: number;
+  symbol: string;
+  chainKey: string;
+  toAddress: string;
+  amount: string;
+  fee: string;
+  feeCoin: string;
+  status: string;
+  txHash: string;
+  createdAt: string;
+};
+
+export function normalizeWithdrawRecords(payload: unknown): WithdrawRecord[] {
+  const code = 'INVALID_WITHDRAW_RECORDS_PAYLOAD';
+  const root = requirePayloadRecord(payload, code, '提现记录');
+  if (!Array.isArray(root.items)) invalidAssetPayload('提现记录格式无效', code);
+  return root.items.map(item => {
+    const row = requirePayloadRecord(item, code, '提现记录');
+    return {
+      withdrawId: readRequiredIntegerField(row, ['withdraw_id'], code, '提现单号', 1),
+      symbol: readRequiredAssetSymbolField(row, ['symbol'], code, '提现币种'),
+      chainKey: readRequiredChainKeyField(row, ['chain_key'], code, '提现网络'),
+      toAddress: readRequiredStringField(row, ['to_address'], code, '提现地址'),
+      amount: readRequiredPositiveDecimalField(row, ['amount'], code, '提现数量'),
+      fee: readRequiredNonNegativeDecimalField(row, ['fee'], code, '手续费'),
+      feeCoin: readRequiredAssetSymbolField(row, ['fee_coin'], code, '手续费币种'),
+      status: readRequiredStringField(row, ['status'], code, '提现状态').toUpperCase(),
+      txHash: readString(row, ['tx_hash']) || '',
+      createdAt: readString(row, ['created_at']) || '',
+    };
+  });
+}
+
+export async function fetchWithdrawRecords(offset = 0, options?: ApiRequestOptions) {
+  return normalizeWithdrawRecords(await apiClient.get<unknown>(
+    withQuery('/asset/withdraws', {limit: 20, offset}), options,
+  ));
+}
+
+export function normalizeWithdrawSendResponse(payload: unknown, expectedId: number) {
+  const code = 'INVALID_WITHDRAW_SEND_PAYLOAD';
+  const root = requirePayloadRecord(payload, code, '提现发送');
+  const id = readRequiredIntegerField(root, ['withdraw_id'], code, '提现单号', 1);
+  if (id !== expectedId || root.ok !== true || root.status !== 'PROCESSING') {
+    invalidAssetPayload('提现发送状态未确认，请刷新提现记录', code);
+  }
+  return {withdrawId: id, status: 'PROCESSING'};
+}
+
+export async function sendWithdrawTx(withdrawId: number) {
+  const payload = await apiClient.post<unknown>(
+    withQuery('/asset/withdraw/send', {withdraw_id: withdrawId}), {}, {retry: 'none'},
+  );
+  return normalizeWithdrawSendResponse(payload, withdrawId);
+}
+
+export async function cancelWithdraw(withdrawId: number) {
+  const code = 'INVALID_WITHDRAW_CANCEL_PAYLOAD';
+  const root = requirePayloadRecord(await apiClient.post<unknown>(
+    '/asset/withdraw/cancel', {withdraw_id: withdrawId}, {retry: 'none'},
+  ), code, '取消提现');
+  if (root.withdraw_id !== withdrawId || root.status !== 'CANCELED') {
+    invalidAssetPayload('取消提现状态未确认，请刷新提现记录', code);
+  }
+  return {withdrawId, status: 'CANCELED'};
 }
 
 export function normalizeAccountTransferResponse(

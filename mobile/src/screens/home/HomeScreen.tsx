@@ -174,14 +174,17 @@ export default function HomeScreen() {
   }, [navigation]);
   const openBankPortal = useCallback(() => {
     const url = content?.homeConfig.bankPortalUrl;
-    if (!url) return;
+    if (!url) {
+      navigation.navigate('Bank');
+      return;
+    }
     Linking.openURL(url).catch(() => {
       Alert.alert(
         t('home.bankPortalOpenFailedTitle'),
         t('home.bankPortalOpenFailedDescription'),
       );
     });
-  }, [content?.homeConfig.bankPortalUrl, t]);
+  }, [content?.homeConfig.bankPortalUrl, navigation, t]);
   const openAboutPage = useCallback(() => {
     navigation.navigate('AboutPage');
   }, [navigation]);
@@ -420,9 +423,7 @@ function GuestHome({
         siteName={content?.site.displayName}
       />
       <HomeActivityEntry onPress={onActivityCenter} />
-      {content?.homeConfig.bankPortalUrl ? (
-        <HomeBankPortalEntry onPress={onBankPortal} />
-      ) : null}
+      <HomeBankPortalEntry onPress={onBankPortal} />
       {content?.homeConfig.sections.marketShortcuts !== false ? (
         <MarketContent
           limit={content?.homeConfig.marketShortcutLimit ?? 4}
@@ -494,9 +495,7 @@ function LoggedInHome({
       ) : null}
       <QuickEntryRow entries={memberEntries} />
       <HomeActivityEntry onPress={onActivityCenter} />
-      {content?.homeConfig.bankPortalUrl ? (
-        <HomeBankPortalEntry onPress={onBankPortal} />
-      ) : null}
+      <HomeBankPortalEntry onPress={onBankPortal} />
       {content?.homeConfig.sections.marketShortcuts !== false &&
       marketShortcuts.length > 0 ? (
         <>

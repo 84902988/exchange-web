@@ -1,6 +1,19 @@
 import {parseMarketDetailRouteParams} from '../src/navigation/marketDetailRoute';
 
 describe('market detail route', () => {
+  it.each(['spot', 'contract'])('preserves the optional logo for %s details', market => {
+    const params = {
+      market,
+      symbol: 'BTCUSDT',
+      baseAsset: 'BTC',
+      quoteAsset: 'USDT',
+      displayLabel: 'BTC/USDT',
+    };
+    expect(parseMarketDetailRouteParams({...params, logoUrl: ' /uploads/btc.svg '}))
+      .toEqual(expect.objectContaining({logoUrl: '/uploads/btc.svg'}));
+    expect(parseMarketDetailRouteParams({...params, logoUrl: '/btc.png\ninvalid'}))
+      .not.toHaveProperty('logoUrl');
+  });
   it('normalizes a valid Spot route without inventing a symbol', () => {
     expect(
       parseMarketDetailRouteParams({

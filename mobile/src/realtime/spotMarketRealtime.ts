@@ -352,6 +352,8 @@ export class SpotMarketRealtimeStore {
   private displayPrecisionAuthority: SpotDisplayPrecisionAuthority | null =
     null;
   private generation = 0;
+  private transportHasFreshTicker = false;
+  private transportHasFreshDepth = false;
   private hasCurrentTransportDepth = false;
   private executionDomainReceivedAtMs: {
     ticker: number | null;
@@ -501,6 +503,7 @@ export class SpotMarketRealtimeStore {
 
   private activate() {
     const generation = ++this.generation;
+    this.resetTransportDisplayRecovery();
     this.resetExecutionAuthority();
     this.commit({
       ...this.state,
@@ -523,6 +526,11 @@ export class SpotMarketRealtimeStore {
       this.applyMarketView(view, 'REST');
     } catch (error) {
       if (!this.isActiveGeneration(generation)) return;
+      // The parallel socket may have recovered both display domains while
+      // this REST request was in flight. Do not replace that recovery with
+      // an obsolete bootstrap error, or overwrite batched socket updates.
+      this.flushPending();
+      if (this.hasRecoveredTransportDisplay()) return;
       this.commit({
         ...this.state,
         error:
@@ -674,6 +682,7 @@ export class SpotMarketRealtimeStore {
       this.commit({...this.state, phase: 'live'});
       return;
     }
+    this.resetTransportDisplayRecovery();
     if (status === 'connecting') {
       this.invalidateExecution('connecting');
       return;
@@ -685,6 +694,36 @@ export class SpotMarketRealtimeStore {
     if (status === 'stopped') {
       this.invalidateExecution('paused');
     }
+  }
+
+  private resetTransportDisplayRecovery() {
+    this.transportHasFreshTicker = false;
+    this.transportHasFreshDepth = false;
+  }
+
+  private hasRecoveredTransportDisplay() {
+    return (
+      this.transport.getStatus() === 'open' &&
+      this.transportHasFreshTicker &&
+      this.transportHasFreshDepth
+    );
+  }
+
+  private recordTransportTicker(ticker: SpotTicker) {
+    this.transportHasFreshTicker =
+      !ticker.stale &&
+      freshnessRank(ticker.freshness) >= 3 &&
+      ticker.lastPrice !== null &&
+      Number.isFinite(ticker.lastPrice) &&
+      ticker.lastPrice > 0;
+  }
+
+  private recordTransportDepth(depth: SpotOrderBook) {
+    this.transportHasFreshDepth =
+      !depth.stale &&
+      freshnessRank(depth.freshness) >= 3 &&
+      depth.bids.length > 0 &&
+      depth.asks.length > 0;
   }
 
   private invalidateExecution(phase: SpotMarketRealtimePhase) {
@@ -1172,6 +1211,18 @@ export class SpotMarketRealtimeStore {
 
     const marketDisplayChanged =
       tickerDecision.accepted || depthDecision.accepted;
+    if (source === 'WS') {
+      if (tickerDecision.accepted) {
+        this.recordTransportTicker(stableViewTicker);
+      } else if (tickerDecision.invalidateExecution) {
+        this.transportHasFreshTicker = false;
+      }
+      if (depthDecision.accepted) {
+        this.recordTransportDepth(view.depth);
+      } else if (depthDecision.invalidateExecution) {
+        this.transportHasFreshDepth = false;
+      }
+    }
     this.commit({
       ...this.state,
       ticker: nextTicker,
@@ -1187,7 +1238,10 @@ export class SpotMarketRealtimeStore {
         ? nextDepth.asks[0]?.price ?? null
         : null,
       source: marketDisplayChanged ? source : this.state.source,
-      error: null,
+      error:
+        source === 'REST' || this.hasRecoveredTransportDisplay()
+          ? null
+          : this.state.error,
       updatedAtMs:
         marketDisplayChanged || tradesDecision.accepted
         ? now
@@ -1212,10 +1266,12 @@ export class SpotMarketRealtimeStore {
     });
     if (!decision.accepted) {
       if (decision.invalidateExecution) {
+        this.transportHasFreshDepth = false;
         this.invalidateExecution(this.state.phase);
       }
       return;
     }
+    this.recordTransportDepth(depth);
     const base = this.pendingState || this.state;
     const now = this.now();
     const receivedAtMs = readExecutionReceivedAtMs(
@@ -1253,6 +1309,7 @@ export class SpotMarketRealtimeStore {
         ? depth.asks[0]?.price ?? null
         : null,
       source: 'WS',
+      error: this.hasRecoveredTransportDisplay() ? null : base.error,
       updatedAtMs: now,
       executionObservedAtMs: authority.observedAt,
       executionExpiresAtMs: authority.expiresAt,
@@ -1275,10 +1332,12 @@ export class SpotMarketRealtimeStore {
     });
     if (!decision.accepted) {
       if (decision.invalidateExecution) {
+        this.transportHasFreshTicker = false;
         this.invalidateExecution(this.state.phase);
       }
       return;
     }
+    this.recordTransportTicker(ticker);
     const base = this.pendingState || this.state;
     const mergedTicker: SpotTicker = {
       ...base.ticker,
@@ -1326,6 +1385,7 @@ export class SpotMarketRealtimeStore {
         ? base.depth.asks[0]?.price ?? null
         : null,
       source: 'WS',
+      error: this.hasRecoveredTransportDisplay() ? null : base.error,
       updatedAtMs: now,
       executionObservedAtMs: authority.observedAt,
       executionExpiresAtMs: authority.expiresAt,

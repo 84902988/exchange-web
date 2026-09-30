@@ -24,6 +24,8 @@ import {
 } from '@/lib/api/modules/contract';
 import { getSpotMarketTickers } from '@/lib/api/modules/spot';
 import { buildAssetValuationDistribution } from '@/lib/asset/assetDistribution';
+import {buildPortfolioValuation} from '@/lib/asset/portfolioValuation';
+import {fetchUsdValuationRate, normalizeUsdValuationRate, toUsd} from '@/lib/asset/usdValuationRate';
 
 import type { Language } from '@/utils/language';
 
@@ -322,22 +324,6 @@ function countHeldAssets(accountBalances: AccountBalanceItem[], accountKey: Acco
   return held.size;
 }
 
-function sumFrozen(accountBalances: AccountBalanceItem[], accountKey: AccountKey) {
-  return accountBalances
-    .filter((item) => String(item.account_key || '').toLowerCase() === accountKey)
-    .reduce((sum, item) => sum + safeNum(item.frozen), 0);
-}
-
-function sumAccountTotal(accountBalances: AccountBalanceItem[], accountKey: AccountKey, symbol = 'USDT') {
-  return accountBalances
-    .filter(
-      (item) =>
-        String(item.account_key || '').toLowerCase() === accountKey &&
-        String(item.symbol || '').toUpperCase() === symbol,
-    )
-    .reduce((sum, item) => sum + safeNum(item.available) + safeNum(item.frozen), 0);
-}
-
 function getTradeHref(symbol: string) {
   const normalized = String(symbol || '').toUpperCase();
   if (normalized === 'USDT') return null;
@@ -346,7 +332,8 @@ function getTradeHref(symbol: string) {
   return `/trade/spot?symbol=${normalized}USDT`;
 }
 
-function percentOf(value: number, total: number) {
+function percentOf(value: number | null, total: number | null) {
+  if (value === null || total === null) return null;
   if (total <= 0) return 0;
   return (value / total) * 100;
 }
@@ -414,6 +401,7 @@ export default function AssetPage() {
   const accountBalancesQuery = useQuery({
     queryKey: privateQueryKey(userIdentityKey, 'assetAccountBalances'),
     queryFn: () => AssetsAPI.getAccountBalances(),
+    refetchInterval: 25_000,
     enabled: userIdentityKey !== null,
     staleTime: 1000 * 30,
     retry: 0,
@@ -459,11 +447,17 @@ export default function AssetPage() {
   );
   const distributionTickersQuery = useQuery({
     queryKey: ['assetDistributionTickers', distributionSymbols],
+    refetchInterval: 25_000,
     queryFn: () => getSpotMarketTickers(distributionSymbols.map((symbol) => `${symbol}USDT`)),
     enabled: distributionSymbols.length > 0,
     staleTime: 1000 * 15,
     retry: 0,
   });
+  const usdRateQuery = useQuery({
+    queryKey: ['assetUsdValuationRate'], queryFn: fetchUsdValuationRate,
+    enabled: userIdentityKey !== null, staleTime: 15_000, refetchInterval: 25_000, retry: 0,
+  });
+  const usdRate = usdRateQuery.isError ? null : normalizeUsdValuationRate(usdRateQuery.data);
   const contractAccount = contractAccountQuery.data || zeroContractAccount;
   const fundingDetailRows = useMemo(
     () => buildAccountDetailRows(accountBalances, 'funding', coins),
@@ -490,10 +484,12 @@ export default function AssetPage() {
     const fundingUsdt = getBalance(accountBalances, 'funding');
     const spotUsdt = getBalance(accountBalances, 'spot');
     const contractUsdt = getBalance(accountBalances, 'contract');
-    const spotFrozen = sumFrozen(accountBalances, 'spot');
-    const fundingUsdtTotal = sumAccountTotal(accountBalances, 'funding');
-    const spotUsdtTotal = sumAccountTotal(accountBalances, 'spot');
-    const contractUsdtTotal = sumAccountTotal(accountBalances, 'contract');
+    const spotFrozen = spotUsdt.frozen;
+    const valuation = buildPortfolioValuation(accountBalances, distributionTickersQuery.isError ? [] : distributionTickersQuery.data || []);
+    const accountValue = (key: string) => accountBalancesQuery.isError ? null : valuation.accounts.has(key) ? toUsd(valuation.accounts.get(key)!, usdRate) : toUsd(0, usdRate);
+    const fundingUsdtTotal = accountValue('funding');
+    const spotUsdtTotal = accountValue('spot');
+    const contractUsdtTotal = accountValue('contract');
 
     return {
       fundingUsdt,
@@ -505,14 +501,11 @@ export default function AssetPage() {
       contractUsdtTotal,
       fundingHeldCount: countHeldAssets(accountBalances, 'funding'),
       spotHeldCount: countHeldAssets(accountBalances, 'spot'),
-      totalAssets: fundingUsdtTotal + spotUsdtTotal + contractUsdtTotal,
-      totalAvailable:
-        fundingUsdt.available +
-        spotUsdt.available +
-        contractUsdt.available,
-      totalFrozen: fundingUsdt.frozen + spotUsdt.frozen + contractUsdt.frozen,
+      totalAssets: toUsd(valuation.total, usdRate),
+      totalAvailable: toUsd(valuation.available, usdRate),
+      totalFrozen: toUsd(valuation.frozen, usdRate),
     };
-  }, [accountBalances]);
+  }, [accountBalances, accountBalancesQuery.isError, distributionTickersQuery.data, distributionTickersQuery.isError, usdRate]);
 
   const openTransfer = useCallback((from: AccountKey, to: AccountKey, coin = 'USDT') => {
     setTransferModal({
@@ -585,13 +578,15 @@ export default function AssetPage() {
 
   const assetDistribution = useMemo(() => {
     return buildAssetValuationDistribution(
-      visibleAssets,
-      distributionTickersQuery.data || [],
+      accountBalancesQuery.isError ? [] : visibleAssets,
+      distributionTickersQuery.isError ? [] : distributionTickersQuery.data || [],
     ).map((item, index) => ({
       ...item,
+      usdValue: toUsd(item.usdtValue, usdRate),
+      percent: usdRate === null ? null : item.percent,
       color: ['#26a17b', '#f7931a', '#627eea', '#f0b90b', '#00c087', '#8b5cf6'][index % 6],
     }));
-  }, [distributionTickersQuery.data, visibleAssets]);
+  }, [accountBalancesQuery.isError, distributionTickersQuery.data, distributionTickersQuery.isError, visibleAssets, usdRate]);
 
   const filteredAssets = useMemo(() => {
     const keyword = searchKeyword.trim().toLowerCase();
@@ -610,6 +605,8 @@ export default function AssetPage() {
   }, [accountBalancesQuery.error, coinsQuery.error, t]);
 
   const isLoading = accountBalancesQuery.isLoading || coinsQuery.isLoading;
+  const valuationLoading = isLoading || usdRateQuery.isLoading || (distributionSymbols.length > 0 && distributionTickersQuery.isLoading);
+  const formatValuation = (value: number | null) => accountBalancesQuery.isError || value === null ? '--' : formatNumber(value);
   const transferRecords = transferRecordsQuery.data?.items || [];
   const selectedAccountRows =
     accountDetailModal.account === 'funding'
@@ -642,6 +639,8 @@ export default function AssetPage() {
         coinsQuery.refetch(),
         contractAccountQuery.refetch(),
         transferRecordsQuery.refetch(),
+        usdRateQuery.refetch(),
+        ...(distributionSymbols.length ? [distributionTickersQuery.refetch()] : []),
       ]);
       const elapsed = Date.now() - startedAt;
       if (elapsed < 600) {
@@ -743,36 +742,39 @@ export default function AssetPage() {
           </div>
         ) : null}
 
+        {!valuationLoading && accountStats.totalAssets === null ? (
+          <p role="status" className="mb-4 text-sm text-amber-400">{t('incompleteValuation', 'asset')}</p>
+        ) : null}
         <section className="mb-6 grid grid-cols-1 gap-4 md:grid-cols-3">
           <SummaryCard
             label={t('totalAssetEstimate', 'asset')}
-            value={`${formatNumber(accountStats.totalAssets)} USDT`}
+            value={`${formatValuation(accountStats.totalAssets)} USD`}
             hint={t('totalAssetEstimateHint', 'asset')}
-            loading={isLoading}
+            loading={valuationLoading}
           />
           <SummaryCard
             label={t('availableAsset', 'asset')}
-            value={`${formatNumber(accountStats.totalAvailable)} USDT`}
+            value={`${formatValuation(accountStats.totalAvailable)} USD`}
             hint={t('availableAssetHint', 'asset')}
-            loading={isLoading}
+            loading={valuationLoading}
           />
           <SummaryCard
             label={t('frozenOccupied', 'asset')}
-            value={`${formatNumber(accountStats.totalFrozen)} USDT`}
+            value={`${formatValuation(accountStats.totalFrozen)} USD`}
             hint={t('frozenOccupiedHint', 'asset')}
-            loading={isLoading}
+            loading={valuationLoading}
           />
         </section>
 
         <section className="mb-6 grid grid-cols-1 gap-4 xl:grid-cols-[1.15fr_0.85fr]">
           <AccountDistributionSection
             items={accountDistribution}
-            loading={isLoading}
+            loading={valuationLoading}
             onTransferClick={() => openTransfer('funding', 'spot')}
           />
           <AssetDistributionSection
             items={assetDistribution}
-            loading={isLoading || distributionTickersQuery.isLoading}
+            loading={valuationLoading}
           />
         </section>
 
@@ -902,8 +904,8 @@ function AccountDistributionSection({
   items: Array<{
     key: string;
     title: string;
-    value: number;
-    percent: number;
+    value: number | null;
+    percent: number | null;
     description: string;
     actions: React.ReactNode;
   }>;
@@ -937,15 +939,15 @@ function AccountDistributionSection({
               </div>
               <div className="text-left md:text-right">
                 <div className="text-base font-semibold tabular-nums text-white">
-                  {loading ? '...' : `${formatNumber(item.value)} USDT`}
+                  {loading ? '...' : `${item.value === null ? '--' : formatNumber(item.value)} USD`}
                 </div>
-                <div className="mt-1 text-xs text-white/45">{formatNumber(item.percent, 2)}%</div>
+                <div className="mt-1 text-xs text-white/45">{formatDistributionPercent(item.percent)}</div>
               </div>
             </div>
             <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/10">
               <div
                 className="h-full rounded-full bg-[#f0b90b]"
-                style={{ width: `${Math.min(Math.max(item.percent, 0), 100)}%` }}
+                style={{ width: `${Math.min(Math.max(item.percent ?? 0, 0), 100)}%` }}
               />
             </div>
             <div className="mt-4 flex flex-wrap gap-2">{item.actions}</div>
@@ -964,7 +966,7 @@ function AssetDistributionSection({
     symbol: string;
     amount: number;
     precision: number;
-    usdtValue: number | null;
+    usdValue: number | null;
     percent: number | null;
     color: string;
   }>;
@@ -1003,7 +1005,7 @@ function AssetDistributionSection({
                 </div>
                 <div className="shrink-0 text-right">
                   <div className="text-xs font-medium tabular-nums text-white/75">
-                    {item.usdtValue === null ? '--' : `≈ ${formatUsdtAmount(item.usdtValue)} USDT`}
+                    {item.usdValue === null ? '--' : `≈ ${formatUsdtAmount(item.usdValue)} USD`}
                   </div>
                   <div className="text-[11px] text-white/45">{formatDistributionPercent(item.percent)}</div>
                 </div>

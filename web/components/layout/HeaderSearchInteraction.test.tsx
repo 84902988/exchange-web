@@ -7,6 +7,7 @@ const mockPrefetch = jest.fn();
 const mockRouter = { push: mockPush, prefetch: mockPrefetch };
 let mockPathname = '/notice';
 let mockSearchKey = '';
+let mockBankPortalUrl: string | null = null;
 
 jest.mock('next/navigation', () => ({
   usePathname: () => mockPathname,
@@ -31,6 +32,7 @@ jest.mock('@/contexts/LocaleContext', () => ({
       search: 'Search',
       closeSearch: 'Close search',
       searchPlaceholder: 'Search markets',
+      navBankPortal: 'Bank',
     }[key] || key),
   }),
 }));
@@ -41,7 +43,7 @@ jest.mock('@/lib/api/modules/site', () => ({
     site_name: 'Exchange',
     site_slogan: '',
   },
-  getSiteConfig: () => new Promise(() => undefined),
+  getSiteConfig: () => Promise.resolve({ site_name: 'Exchange', bank_portal_url: mockBankPortalUrl }),
 }));
 
 jest.mock('@/lib/api/modules/announcements', () => ({
@@ -61,12 +63,14 @@ describe('Header market search interaction', () => {
   beforeEach(() => {
     mockPathname = '/notice';
     mockSearchKey = '';
+    mockBankPortalUrl = null;
     mockPush.mockReset();
     mockPrefetch.mockReset();
   });
 
   test('opens and closes the search component from the header button', async () => {
     render(<Header />);
+    await screen.findByRole('link', { name: 'navHelpCenter' });
 
     const searchButton = screen.getByRole('button', { name: 'Search' });
     fireEvent.click(searchButton);
@@ -93,5 +97,24 @@ describe('Header market search interaction', () => {
     view.rerender(<Header />);
 
     await waitFor(() => expect(screen.queryByRole('combobox')).not.toBeInTheDocument());
+  });
+
+  test('shows the configured portal after Help Center as an external link', async () => {
+    mockBankPortalUrl = 'https://bank.example.com/portal';
+    render(<Header />);
+    await waitFor(() => expect(screen.getByRole('link', { name: 'Bank' })).toHaveAttribute('href', mockBankPortalUrl));
+    const link = screen.getByRole('link', { name: 'Bank' });
+    expect(link).toHaveAttribute('target', '_blank');
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+    expect(mockPrefetch).not.toHaveBeenCalledWith(mockBankPortalUrl);
+  });
+
+  test('opens the coming-soon page when no bank destination is configured', async () => {
+    render(<Header />);
+    const link = await screen.findByRole('link', { name: 'Bank' });
+    expect(link).toHaveAttribute('href', '/bank');
+    expect(link).not.toHaveAttribute('target', '_blank');
+    expect(screen.queryByRole('button', { name: 'Bank' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 });

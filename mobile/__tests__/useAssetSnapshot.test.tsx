@@ -7,6 +7,7 @@ import type {
 
 const mockLoadAssetSnapshot = jest.fn();
 const mockGetCachedAssetSnapshot = jest.fn();
+jest.mock('../src/hooks/useApplicationState', () => ({useApplicationActive: () => true}));
 let mockAuthState: {
   loading: boolean;
   user: { id: number | string } | null;

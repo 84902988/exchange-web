@@ -12,6 +12,7 @@ import MarketLogo from '../markets/MarketLogo';
 type Props = {
   item: MarketInstrument;
   favorite?: boolean;
+  favoriteDisabled?: boolean;
   favoriteAccessibilityLabel?: string;
   onPress?: (item: MarketInstrument) => void;
   onToggleFavorite?: (item: MarketInstrument) => void;
@@ -20,40 +21,42 @@ type Props = {
 export default function MarketRow({
   item,
   favorite = false,
+  favoriteDisabled = false,
   favoriteAccessibilityLabel,
   onPress,
   onToggleFavorite,
 }: Props) {
   const isUp = item.changePercent !== null && item.changePercent >= 0;
   const isDown = item.changePercent !== null && item.changePercent < 0;
+  const favoriteControl = onToggleFavorite ? (
+    <Pressable
+      accessibilityLabel={favoriteAccessibilityLabel}
+      accessibilityState={{selected: favorite, disabled: favoriteDisabled}}
+      disabled={favoriteDisabled}
+      accessibilityRole="button"
+      android_ripple={{
+        color: 'rgba(212, 175, 55, 0.14)',
+        borderless: true,
+      }}
+      onPress={event => {
+        event.stopPropagation();
+        onToggleFavorite(item);
+      }}
+      style={({ pressed }) => [
+        styles.favoriteButton,
+        pressed ? styles.pressed : null,
+      ]}
+    >
+      <Star
+        color={favorite ? colors.gold : colors.textSubtle}
+        fill={favorite ? colors.gold : 'transparent'}
+        size={18}
+        strokeWidth={1.8}
+      />
+    </Pressable>
+  ) : null;
   const content = (
     <>
-      {onToggleFavorite ? (
-        <Pressable
-          accessibilityLabel={favoriteAccessibilityLabel}
-          accessibilityRole="button"
-          android_ripple={{
-            color: 'rgba(212, 175, 55, 0.14)',
-            borderless: true,
-          }}
-          hitSlop={8}
-          onPress={event => {
-            event.stopPropagation();
-            onToggleFavorite(item);
-          }}
-          style={({ pressed }) => [
-            styles.favoriteButton,
-            pressed ? styles.pressed : null,
-          ]}
-        >
-          <Star
-            color={favorite ? colors.gold : colors.textSubtle}
-            fill={favorite ? colors.gold : 'transparent'}
-            size={18}
-            strokeWidth={1.8}
-          />
-        </Pressable>
-      ) : null}
       <View style={styles.identity}>
         <MarketLogo
           label={item.displaySymbol}
@@ -90,19 +93,22 @@ export default function MarketRow({
 
   if (onPress) {
     return (
-      <Pressable
-        accessibilityLabel={`${item.displaySymbol}，${formatMarketPrice(item)}`}
-        accessibilityRole="button"
-        android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
-        onPress={() => onPress(item)}
-        style={({ pressed }) => [styles.row, pressed ? styles.pressed : null]}
-      >
-        {content}
-      </Pressable>
+      <View style={styles.row}>
+        {favoriteControl}
+        <Pressable
+          accessibilityLabel={`${item.displaySymbol}，${formatMarketPrice(item)}`}
+          accessibilityRole="button"
+          android_ripple={{ color: 'rgba(212, 175, 55, 0.1)' }}
+          onPress={() => onPress(item)}
+          style={({ pressed }) => [styles.rowContent, pressed ? styles.pressed : null]}
+        >
+          {content}
+        </Pressable>
+      </View>
     );
   }
 
-  return <View style={styles.row}>{content}</View>;
+  return <View style={styles.row}>{favoriteControl}{content}</View>;
 }
 
 const styles = StyleSheet.create({
@@ -114,6 +120,14 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     borderBottomWidth: 1,
     borderBottomColor: colors.line,
+  },
+  rowContent: {
+    flex: 1,
+    minWidth: 0,
+    minHeight: 58,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
   },
   nameWrap: {
     flex: 1,
@@ -127,8 +141,8 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   favoriteButton: {
-    width: 34,
-    height: 40,
+    width: 44,
+    height: 44,
     marginRight: 4,
     alignItems: 'center',
     justifyContent: 'center',

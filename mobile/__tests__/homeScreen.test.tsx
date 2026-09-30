@@ -1,11 +1,12 @@
 import React from 'react';
-import {Linking, Text} from 'react-native';
+import {Alert, Linking, Text} from 'react-native';
 import ReactTestRenderer, { act } from 'react-test-renderer';
 import type { MobileContentSnapshot } from '../src/api/mobileContent';
 import type { MarketInstrument } from '../src/api/market';
 import SectionTitle from '../src/components/common/SectionTitle';
 import HomeScreen, { getHomeHoldingSymbols } from '../src/screens/home/HomeScreen';
 import type { AssetSnapshot } from '../src/services/assetSnapshot';
+import { branding } from '../src/config/brandingConfig';
 
 const mockNavigate = jest.fn();
 const mockUseAuth = jest.fn();
@@ -168,6 +169,26 @@ describe('HomeScreen real-data wiring', () => {
     });
   });
 
+  it.each([false, true])('opens the bank coming-soon screen for logged-in=%s when there is no URL', isLoggedIn => {
+    const alert = jest.spyOn(Alert, 'alert').mockImplementation(() => undefined);
+    mockUseAuth.mockReturnValue({isLoggedIn, loading: false, user: isLoggedIn ? {id: 7} : null});
+    const configured = content();
+    configured.homeConfig.bankPortalUrl = null;
+    mockUseMobileHomeData.mockReturnValue({
+      content: configured, markets: [], contentLoading: false, marketsLoading: false,
+      contentError: null, marketsError: null,
+    });
+    const renderer = renderHome();
+    act(() => renderer.root.findByProps({
+      accessibilityLabel: '银行，进入专属银行服务',
+    }).props.onPress());
+    expect(alert).not.toHaveBeenCalled();
+    expect(mockOpenURL).not.toHaveBeenCalled();
+    expect(mockNavigate).toHaveBeenCalledWith('Bank');
+    act(() => renderer.unmount());
+    alert.mockRestore();
+  });
+
   it('derives positive held symbols from the trusted asset snapshot in value order', () => {
     const snapshot = {
       rows: [
@@ -196,7 +217,7 @@ describe('HomeScreen real-data wiring', () => {
       accessibilityLabel: '活动中心，查看全部活动与奖励规则',
     });
     const aboutPage = renderer.root.findByProps({
-      accessibilityLabel: '关于平台，了解 Exchange',
+      accessibilityLabel: `关于平台，了解 ${branding.displayName}`,
     });
     act(() => {
       profile.props.onPress();
@@ -270,7 +291,7 @@ describe('HomeScreen real-data wiring', () => {
       accessibilityLabel: '充值，充值资产',
     });
     const bankPortalButton = renderer.root.findByProps({
-      accessibilityLabel: '银行端口，进入专属银行服务',
+      accessibilityLabel: '银行，进入专属银行服务',
     });
     const profileButton = renderer.root.findByProps({
       accessibilityLabel: '用户入口',
@@ -380,10 +401,10 @@ describe('HomeScreen real-data wiring', () => {
 
     expect(renderer.root.findAllByType(SectionTitle)).toHaveLength(0);
     expect(
-      renderer.root.findAllByProps({
-        accessibilityLabel: '银行端口，进入专属银行服务',
+      renderer.root.findByProps({
+        accessibilityLabel: '银行，进入专属银行服务',
       }),
-    ).toHaveLength(0);
+    ).toBeDefined();
     const depositButton = renderer.root.findByProps({
       accessibilityLabel: 'Deposit，Updated deposit copy',
     });

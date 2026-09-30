@@ -258,6 +258,10 @@ def recheck_deposit_chain_confirmation(db: Session, deposit_id: int) -> DepositT
     if not deposit:
         return DepositTxConfirmResult(int(deposit_id), "NOT_FOUND", "充值记录不存在", error_message="DEPOSIT_NOT_FOUND")
 
+    from app.services.native_deposit_service import NATIVE_LOG_INDEX, recheck_native_deposit
+    if int(deposit.log_index) == NATIVE_LOG_INDEX:
+        return recheck_native_deposit(db, deposit)
+
     status = str(deposit.status or "").strip().upper()
     tx_hash = str(deposit.txid or "").strip()
     if status in SUCCESS_STATUSES:

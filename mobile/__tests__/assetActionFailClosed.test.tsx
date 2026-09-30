@@ -18,6 +18,7 @@ const mockGoBack = jest.fn();
 const mockNavigate = jest.fn();
 
 jest.mock('@react-navigation/native', () => ({
+  useFocusEffect: (callback: () => void) => require('react').useEffect(callback, [callback]),
   useNavigation: () => ({
     goBack: mockGoBack,
     navigate: mockNavigate,
@@ -32,6 +33,7 @@ jest.mock('../src/api/assets', () => {
   const actual = jest.requireActual('../src/api/assets');
   return {
     ...actual,
+    fetchDepositRecords: jest.fn().mockResolvedValue({items: [], total: 0}),
     fetchAssetAccountBalances: (...args: unknown[]) =>
       mockFetchAssetAccountBalances(...args),
     fetchDepositAddress: (...args: unknown[]) =>

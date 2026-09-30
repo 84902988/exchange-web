@@ -64,6 +64,7 @@ import {
   type SpotOrderItem,
 } from '../../api/spot';
 import { useMarketScreenActive } from '../../hooks/useMarketScreenActive';
+import { useTradingMarketLogo } from '../../hooks/useTradingMarketLogo';
 import { useDeferredScreenContent } from '../../hooks/useDeferredScreenContent';
 import { usePrivateTradingRealtime } from '../../hooks/usePrivateTradingRealtime';
 import { useSpotMarketRealtime } from '../../hooks/useSpotMarketRealtime';
@@ -175,7 +176,7 @@ export default function TradeScreen() {
     () => normalizeSpotTradingRouteParams(route.params),
     [route.params],
   );
-  const { baseAsset, displayLabel, logoUrl, quoteAsset, symbol } = instrument;
+  const { baseAsset, displayLabel, quoteAsset, symbol } = instrument;
   const instrumentKey = `${symbol}|${baseAsset}|${quoteAsset}|${displayLabel}`;
   const { isLoggedIn, user } = useAuth();
   const orderIntentOwnerKey =
@@ -184,6 +185,9 @@ export default function TradeScreen() {
       : null;
   const orderIntentScope = `${orderIntentOwnerKey || 'anonymous'}|${symbol}`;
   const marketScreenActive = useMarketScreenActive();
+  const logoUrl = useTradingMarketLogo(
+    'spot', symbol, instrument.logoUrl, marketScreenActive,
+  );
   const deferredScreenContentReady =
     useDeferredScreenContent(marketScreenActive);
   const realtime = useSpotMarketRealtime(
@@ -2320,6 +2324,7 @@ export default function TradeScreen() {
       quoteAsset,
       displayLabel,
       initialInterval: klineInterval,
+      ...(logoUrl ? { logoUrl } : {}),
       ...(klines.length > 0 ? { initialKlines: klines.slice(-48) } : {}),
     });
   }, [
@@ -2327,6 +2332,7 @@ export default function TradeScreen() {
     displayLabel,
     klineInterval,
     klines,
+    logoUrl,
     navigation,
     quoteAsset,
     symbol,

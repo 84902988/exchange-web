@@ -48,7 +48,7 @@ describe('SplashScreen', () => {
     jest.useRealTimers();
   });
 
-  it('shows the persisted English startup status', async () => {
+  it('shows the loading status with persisted English language', async () => {
     await AsyncStorage.clear();
     await AsyncStorage.setItem(MOBILE_LOCALE_STORAGE_KEY, 'en');
     const replace = jest.fn();
@@ -72,7 +72,7 @@ describe('SplashScreen', () => {
     expect(
       renderer.root
         .findAllByType(Text)
-        .some(node => node.props.children === 'Starting up'),
+        .some(node => node.props.children === 'loading'),
     ).toBe(true);
     act(() => renderer.unmount());
   });

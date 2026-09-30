@@ -11,6 +11,13 @@ import {
   savePendingTradeIntent,
 } from '../src/services/pendingTradeIntent';
 
+let mockLogoCatalog: Array<Record<string, unknown>> = [];
+jest.mock('../src/api/market', () => ({
+  ...jest.requireActual('../src/api/market'),
+  getCachedMobileMarkets: () => mockLogoCatalog,
+  fetchMobileMarkets: async () => mockLogoCatalog,
+}));
+
 const mockNavigate = jest.fn();
 const mockCancelSpotOrder = jest.fn();
 const mockCreateSpotOrder = jest.fn();
@@ -308,6 +315,7 @@ describe('TradeScreen execution confirmation lifecycle', () => {
     mockUserId = 7;
     mockSpotMarketState = executableMarketState();
     mockRouteParams = undefined;
+    mockLogoCatalog = [];
     mockOrderFormProps = null;
     mockTradeBottomTabsProps = null;
     mockKlineChartProps = null;
@@ -384,6 +392,22 @@ describe('TradeScreen execution confirmation lifecycle', () => {
       displayLabel: 'BTC/USDT',
       initialInterval: '1m',
     });
+  });
+
+  it('fills the default trade header from catalog metadata and carries its logo to details', async () => {
+    mockLogoCatalog = [{symbol: 'BTC', tradeSymbol: 'BTCUSDT', tradeMarket: 'spot', logoUrl: '/uploads/btc.svg'}];
+    renderer = await renderReadyTradeScreen();
+    expect(mockSymbolHeaderProps?.logoUrl).toBe('/uploads/btc.svg');
+    act(() => { mockSymbolHeaderProps?.onOpenChart(); });
+    expect(mockNavigate).toHaveBeenCalledWith('MarketDetail', expect.objectContaining({symbol: 'BTCUSDT', logoUrl: '/uploads/btc.svg'}));
+  });
+
+  it('keeps the logo received from the market list when opening details', async () => {
+    mockRouteParams = {symbol: 'ETHUSDT', baseAsset: 'ETH', quoteAsset: 'USDT', displayLabel: 'ETH/USDT', logoUrl: '/uploads/list.png'};
+    renderer = await renderReadyTradeScreen();
+    expect(mockSymbolHeaderProps?.logoUrl).toBe('/uploads/list.png');
+    act(() => { mockSymbolHeaderProps?.onOpenChart(); });
+    expect(mockNavigate).toHaveBeenCalledWith('MarketDetail', expect.objectContaining({logoUrl: '/uploads/list.png'}));
   });
 
   it('passes the already visible Spot Klines into the detail preview', async () => {

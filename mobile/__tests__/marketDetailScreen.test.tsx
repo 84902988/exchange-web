@@ -2,6 +2,15 @@ import React from 'react';
 import {Dimensions} from 'react-native';
 import ReactTestRenderer, {act} from 'react-test-renderer';
 
+jest.mock('../src/api/market', () => ({
+  getCachedMobileMarkets: () => [],
+  fetchMobileMarkets: async () => [],
+}));
+jest.mock('../src/api/tradingCatalog', () => ({
+  getCachedContractTradingCatalog: () => [],
+  fetchContractTradingCatalog: async () => [],
+}));
+
 const mockGoBack = jest.fn();
 const mockSetOptions = jest.fn();
 const mockUseSpotMarketRealtime = jest.fn();
@@ -92,6 +101,15 @@ const contractRoute = {
 } as any;
 
 describe('MarketDetailScreen', () => {
+  it.each([spotRoute, contractRoute])('preserves the route logo through detail parsing and rendering ($params.market)', async sourceRoute => {
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = ReactTestRenderer.create(<MarketDetailScreen navigation={navigation} route={{...sourceRoute, params: {...sourceRoute.params, logoUrl: '/uploads/btc.svg'}}} />);
+    });
+    expect(detailProps?.logoUrl).toBe('/uploads/btc.svg');
+    act(() => renderer.unmount());
+  });
+
   beforeEach(() => {
     jest.clearAllMocks();
     preventRemoveEnabled = false;

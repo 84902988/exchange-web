@@ -4623,6 +4623,7 @@ def _mobile_market_item(
         "display_symbol": _mobile_display_symbol(pair_data),
         "name": _mobile_market_name(pair_data),
         "category": category,
+        "market_category": str(pair_data.get("market_category") or pair_data.get("asset_type") or "").upper(),
         "price": str(raw_price) if raw_price is not None else None,
         "change_pct": str(raw_change) if raw_change is not None else None,
         "volume": str(pair_data.get("quote_volume_24h") or pair_data.get("volume_24h") or "0"),
@@ -4788,21 +4789,19 @@ def _mobile_stock_contract_rows(
         )
     )
     rank = {symbol: index for index, symbol in enumerate(priority_symbols)}
-    preferred_stock_count = sum(
-        1
-        for item in catalog_rows
-        if str(getattr(item, "symbol", "") or "").upper()
-        in set(preferred_symbols or [])
-    )
     selected = sorted(
         catalog_rows,
         key=lambda item: (
             rank.get(str(getattr(item, "symbol", "") or "").upper(), 999),
             str(getattr(item, "symbol", "") or "").upper(),
         ),
-    )[:max(MOBILE_OVERVIEW_SECTION_LIMIT, preferred_stock_count)]
+    )
     symbols = [str(item.symbol or "").upper() for item in selected if str(item.symbol or "").strip()]
-    ticker_rows = get_contract_tickers(db, symbols=symbols, limit=len(symbols))
+    # The ticker service caps each request at 200; retain the entire catalog.
+    ticker_rows = []
+    for start in range(0, len(symbols), 200):
+        batch = symbols[start:start + 200]
+        ticker_rows.extend(get_contract_tickers(db, symbols=batch, limit=len(batch)))
     return _mobile_stock_contract_pair_rows(selected, ticker_rows)
 
 
@@ -4931,7 +4930,9 @@ def get_mobile_market_overview(
     for key, title in section_configs:
         section_items = [item for item in items if item.get("category") == key]
         section_items = sorted(section_items, key=_mobile_sort_key)
-        if key != "contract_cfd":
+        # The app also uses these rows as its searchable category catalog.
+        # Keep every enabled spot pair; overview cards are bounded separately.
+        if key not in {"contract_cfd", "spot", "stocks"}:
             section_items = section_items[:MOBILE_OVERVIEW_SECTION_LIMIT]
         sections.append({"key": key, "title": title, "items": section_items})
 

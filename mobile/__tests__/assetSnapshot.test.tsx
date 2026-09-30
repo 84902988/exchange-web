@@ -46,6 +46,11 @@ jest.mock('@react-navigation/native', () => ({
   useNavigation: () => ({ navigate: mockNavigate }),
 }));
 
+jest.mock('../src/services/assetUsdRate', () => ({
+  ...jest.requireActual('../src/services/assetUsdRate'),
+  fetchAssetUsdRate: jest.fn(async () => null),
+}));
+
 jest.mock('../src/hooks/useAssetSnapshot', () => ({
   useAssetSnapshot: () => mockAssetSnapshotState,
 }));
@@ -60,6 +65,23 @@ function balance(
 }
 
 describe('asset valuation', () => {
+  it.each([false, true])('matches the web portfolio total and account values with stale=%s', stale => {
+    const {buildPortfolioValuation} = jest.requireActual('../../web/lib/asset/portfolioValuation');
+    const balances = [balance('USDT', 'funding', 1.92), balance('TOKEN', 'funding', 2),
+      balance('USDT', 'spot', 0.2), balance('TOKEN', 'spot', 90, 2),
+      balance('USDT', 'contract', 8.82)];
+    const tickers = [{symbol: 'TOKENUSDT', last_price: '2', stale}];
+    const mobile = calculateAssetSnapshot({userId: 7, balances, fetchedAt: 1,
+      pricesUsdt: normalizeAssetTickerPrices(tickers, ['TOKEN'])});
+    const web = buildPortfolioValuation(balances.map(row => ({symbol: row.symbol,
+      account_key: row.accountKey, available: String(row.available), frozen: String(row.frozen)})), tickers);
+    if (mobile.totalUsdt === null) expect(web.total).toBeNull();
+    else expect(web.total).toBeCloseTo(mobile.totalUsdt, 10);
+    for (const account of mobile.accounts) {
+      if (account.totalUsdt === null) expect(web.accounts.get(account.accountKey)).toBeNull();
+      else expect(web.accounts.get(account.accountKey)).toBeCloseTo(account.totalUsdt, 10);
+    }
+  });
   it('normalizes numeric identities without accepting a zero user', () => {
     expect(normalizeAssetSnapshotUserId(7)).toBe('7');
     expect(normalizeAssetSnapshotUserId('0007')).toBe('7');
@@ -386,6 +408,7 @@ describe('Home asset summary snapshot wiring', () => {
       snapshot: calculateAssetSnapshot({
         userId: 1,
         balances: [balance('USDT', 'funding', 42)],
+        usdRate: {rate: 0.99, asOf: 1_000},
         pricesUsdt: {},
         fetchedAt: 1_000,
       }),
@@ -404,7 +427,7 @@ describe('Home asset summary snapshot wiring', () => {
       .flatMap(node => node.props.children)
       .filter(value => typeof value === 'string')
       .join(' ');
-    expect(renderedText).toContain('42 USDT');
+    expect(renderedText).toContain('41.58 USD');
     expect(renderedText).not.toContain('5.22');
 
     act(() => {
@@ -472,7 +495,7 @@ describe('asset snapshot presentation', () => {
             hidden={false}
             isLoggedIn
             snapshotAvailable
-            totalUsdt={incomplete.totalUsdt}
+            totalUsd={incomplete.totalUsdt}
             valuationComplete={incomplete.valuationComplete}
             onToggleHidden={jest.fn()}
           />
@@ -486,10 +509,11 @@ describe('asset snapshot presentation', () => {
       .flatMap(node => node.props.children)
       .filter(value => typeof value === 'string')
       .join(' ');
-    expect(renderedText).toContain('-- USDT');
+    expect(renderedText).toContain('-- USD');
     expect(renderedText).toContain('估值不可用');
-    expect(renderedText).not.toContain('0 USDT');
-    expect(renderedText).not.toContain('≈');
+    expect(renderedText).not.toContain('0 USD');
+    expect(renderedText).not.toContain('≈ 0');
+    expect(renderedText).toContain('USDT/USD');
   });
 
   it('presents a neutral login state instead of an asset-data warning', () => {
@@ -501,7 +525,7 @@ describe('asset snapshot presentation', () => {
           hidden={false}
           isLoggedIn={false}
           snapshotAvailable={false}
-          totalUsdt={null}
+          totalUsd={null}
           valuationComplete={false}
           onToggleHidden={jest.fn()}
         />,

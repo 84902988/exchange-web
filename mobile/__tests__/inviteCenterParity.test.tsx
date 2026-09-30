@@ -2,6 +2,7 @@ import React from 'react';
 import { Share, Text } from 'react-native';
 import ReactTestRenderer, { act } from 'react-test-renderer';
 import { normalizeAssetInviteOverview } from '../src/api/assets';
+import { branding } from '../src/config/brandingConfig';
 import AssetInviteCommissionRecords, {
   inviteCommissionStatusLabel,
 } from '../src/components/assets/AssetInviteCommissionRecords';
@@ -135,7 +136,7 @@ describe('mobile invite center parity', () => {
         ' https://exchange.example/register?invite_code=INVITE88&invite_type=user ',
       ),
     ).toBe(
-      'Exchange 邀请链接：https://exchange.example/register?invite_code=INVITE88&invite_type=user\n邀请码：INVITE88',
+      `${branding.displayName} 邀请链接：https://exchange.example/register?invite_code=INVITE88&invite_type=user\n邀请码：INVITE88`,
     );
     await act(async () => {
       await renderer!.root
@@ -143,9 +144,9 @@ describe('mobile invite center parity', () => {
         .props.onPress();
     });
     expect(shareSpy).toHaveBeenCalledWith({
-      title: 'Exchange 邀请链接',
+      title: `${branding.displayName} 邀请链接`,
       message:
-        'Exchange 邀请链接：https://exchange.example/register?invite_code=INVITE88&invite_type=user\n邀请码：INVITE88',
+        `${branding.displayName} 邀请链接：https://exchange.example/register?invite_code=INVITE88&invite_type=user\n邀请码：INVITE88`,
     });
     expect(renderedText(renderer!)).toContain('已打开系统分享');
     shareSpy.mockRestore();

@@ -48,6 +48,8 @@ import type { MainTabParamList } from '../../navigation/types';
 import { useLanguage, type TranslationKey, type Translator } from '../../i18n';
 import { colors, layout, typography } from '../../theme';
 import {resolveResponsiveLayout} from '../../constants/responsiveLayout';
+import MarketCfdTabs from '../../components/markets/MarketCfdTabs';
+import type {CfdFilter} from '../../utils/marketCfd';
 
 const CATEGORY_TAB_KEYS: Array<{
   key: MarketCategoryKey;
@@ -133,6 +135,7 @@ export default function MarketsScreen() {
   const route = useRoute<RouteProp<MainTabParamList, 'Markets'>>();
   const cachedMarkets = useMemo(() => getCachedMobileMarkets(), []);
   const [query, setQuery] = useState('');
+  const [cfdFilter, setCfdFilter] = useState<CfdFilter>('all');
   const [activeCategory, setActiveCategory] =
     useState<MarketCategoryKey>('overview');
   const [markets, setMarkets] = useState<MarketInstrument[]>(cachedMarkets);
@@ -221,13 +224,15 @@ export default function MarketsScreen() {
 
   const filteredMarkets = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
-    const categoryItems = filterByCategory(markets, activeCategory);
+    const categoryItems = filterByCategory(markets, activeCategory).filter(item =>
+      activeCategory !== 'cfd' || cfdFilter === 'all' || (item.cfdGroup || 'other') === cfdFilter,
+    );
 
     if (!normalizedQuery) return categoryItems;
     return categoryItems.filter(item =>
       getSearchText(item).includes(normalizedQuery),
     );
-  }, [activeCategory, markets, query]);
+  }, [activeCategory, cfdFilter, markets, query]);
 
   const overviewCards = useMemo(() => {
     const source = query.trim() ? filteredMarkets : markets;
@@ -259,6 +264,7 @@ export default function MarketsScreen() {
       activeNavigationRowRef.current = null;
       setRouteError(null);
       setActiveCategory(nextCategory);
+      setCfdFilter('all');
     },
     [],
   );
@@ -421,6 +427,13 @@ export default function MarketsScreen() {
               tabs={categoryTabs}
               onChange={handleCategoryChange}
             />
+            {activeCategory === 'cfd' ? (
+              <MarketCfdTabs
+                active={cfdFilter}
+                onChange={setCfdFilter}
+                showOther={markets.some(item => item.category === 'cfd' && (!item.cfdGroup || item.cfdGroup === 'other'))}
+              />
+            ) : null}
 
             {error ? (
               <View style={styles.warning}>

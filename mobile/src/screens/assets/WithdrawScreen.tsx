@@ -28,10 +28,13 @@ import {
 import type { RootStackParamList } from '../../navigation/types';
 import {
   confirmWithdraw,
+  sendWithdrawTx,
+  type WithdrawRecord,
   createWithdrawDraft,
   fetchAssetAccountBalances,
   fetchWithdrawFee,
   fetchWithdrawOptions,
+  fetchWithdrawRecords,
   sendWithdrawCode,
   type AssetAccountBalance,
   type AssetChainOption,
@@ -39,7 +42,10 @@ import {
   type WithdrawFeeEstimate,
 } from '../../api/assets';
 import { useAuth } from '../../store/authStore';
-import { useLanguage, type Translator } from '../../i18n';
+import { useLanguage } from '../../i18n';
+import WithdrawRecords from '../../components/assets/action/WithdrawRecords';
+import {mapWithdrawStatus} from '../../utils/withdrawStatus';
+import {confirmationRecordStatus, findWithdrawalConfirmation} from '../../utils/withdrawConfirmation';
 import { colors, typography } from '../../theme';
 import {
   compareNonNegativeDecimalText,
@@ -50,6 +56,11 @@ type RootNavigation = NativeStackNavigationProp<RootStackParamList>;
 type Step = 'form' | 'verify' | 'done';
 
 export default function WithdrawScreen() {
+  const {isLoggedIn, user} = useAuth();
+  return <WithdrawScreenContent key={isLoggedIn ? user?.id ?? 'signed-in' : 'guest'} />;
+}
+
+function WithdrawScreenContent() {
   const navigation = useNavigation<RootNavigation>();
   const { isLoggedIn } = useAuth();
   const { t } = useLanguage();
@@ -68,12 +79,16 @@ export default function WithdrawScreen() {
   const [feeFingerprint, setFeeFingerprint] = useState<string | null>(null);
   const [feeError, setFeeError] = useState('');
   const [feeRequestNonce, setFeeRequestNonce] = useState(0);
+  const [showRecords, setShowRecords] = useState(false);
+  const [recordsRevision, setRecordsRevision] = useState(0);
+  const [sendError, setSendError] = useState(false);
   const [step, setStep] = useState<Step>('form');
   const [loading, setLoading] = useState(false);
   const [feeLoading, setFeeLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [codeSending, setCodeSending] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [confirmationUncertain, setConfirmationUncertain] = useState(false);
   const [cooldown, setCooldown] = useState(0);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
@@ -84,6 +99,18 @@ export default function WithdrawScreen() {
   const draftSubmitLockRef = useRef(false);
   const codeSendLockRef = useRef(false);
   const confirmLockRef = useRef(false);
+  const recoveryLockRef = useRef(false);
+  const confirmationUncertainRef = useRef(false);
+  const flowGenerationRef = useRef(0);
+  const draftIdRef = useRef(draft?.withdrawId);
+  draftIdRef.current = draft?.withdrawId;
+
+  const setUncertain = useCallback((value: boolean) => {
+    confirmationUncertainRef.current = value;
+    setConfirmationUncertain(value);
+  }, []);
+
+  useEffect(() => () => { flowGenerationRef.current += 1; }, []);
 
   const loadData = useCallback(async () => {
     if (!isLoggedIn || !mountedRef.current || dataLoadLockRef.current) return;
@@ -310,6 +337,9 @@ export default function WithdrawScreen() {
   ]);
 
   const resetFlow = useCallback(() => {
+    if (confirmLockRef.current || recoveryLockRef.current || confirmationUncertainRef.current) return;
+    flowGenerationRef.current += 1;
+    setSendError(false);
     setStep('form');
     setDraft(null);
     setCode('');
@@ -320,6 +350,7 @@ export default function WithdrawScreen() {
 
   const changeCoin = useCallback(
     (nextCoin: string) => {
+      if (draftSubmitLockRef.current || confirmLockRef.current || recoveryLockRef.current || confirmationUncertainRef.current) return;
       setCoin(nextCoin);
       setNetwork('');
       setAmount('');
@@ -331,6 +362,7 @@ export default function WithdrawScreen() {
 
   const changeNetwork = useCallback(
     (nextNetwork: string) => {
+      if (draftSubmitLockRef.current || confirmLockRef.current || recoveryLockRef.current || confirmationUncertainRef.current) return;
       setNetwork(nextNetwork);
       setAddress('');
       resetFlow();
@@ -457,8 +489,52 @@ export default function WithdrawScreen() {
     }
   }, [cooldown, draft?.withdrawId]);
 
+  const applyConfirmationRecord = useCallback((row: WithdrawRecord) => {
+    if (!mountedRef.current || row.withdrawId !== draftIdRef.current) return;
+    const status = confirmationRecordStatus(row);
+    if (!status) return;
+    setUncertain(false);
+    setStep(status === 'VERIFYING' ? 'verify' : 'done');
+    setMessage('');
+    setError('');
+    setSendError(false);
+    if (status !== 'VERIFYING') setCode('');
+    setDraft(current => current?.withdrawId === row.withdrawId
+      ? {...current, status, feeEstimate: row.fee, feeCoin: row.feeCoin} : current);
+  }, [setUncertain]);
+
+  const recoverConfirmation = useCallback(async (id: number, generation: number, verificationError = '') => {
+    if (recoveryLockRef.current) return;
+    const isCurrent = () => mountedRef.current && flowGenerationRef.current === generation && draftIdRef.current === id;
+    if (!isCurrent()) return;
+    recoveryLockRef.current = true;
+    setConfirming(true);
+    setUncertain(true);
+    setStep('done');
+    setMessage('');
+    setError('');
+    setDraft(current => current?.withdrawId === id ? {...current, status: 'UNKNOWN'} : current);
+    try {
+      const row = await findWithdrawalConfirmation(id, offset => fetchWithdrawRecords(offset), isCurrent);
+      if (!isCurrent()) return;
+      if (row) {
+        applyConfirmationRecord(row);
+        if (confirmationRecordStatus(row) === 'VERIFYING' && verificationError) setError(verificationError);
+      }
+    } catch {
+      // An unreadable result is uncertainty, never proof of a failed confirmation.
+    } finally {
+      recoveryLockRef.current = false;
+      if (isCurrent()) {
+        setShowRecords(true);
+        setRecordsRevision(value => value + 1);
+        if (!confirmLockRef.current) setConfirming(false);
+      }
+    }
+  }, [applyConfirmationRecord, setUncertain]);
+
   const confirm = useCallback(async () => {
-    if (confirmLockRef.current) return;
+    if (confirmLockRef.current || recoveryLockRef.current || confirmationUncertainRef.current) return;
     if (!draft?.withdrawId) {
       setError(tRef.current('withdraw.missingId'));
       return;
@@ -468,17 +544,22 @@ export default function WithdrawScreen() {
       return;
     }
     confirmLockRef.current = true;
+    const id = draft.withdrawId;
+    const generation = flowGenerationRef.current;
+    const isCurrent = () => mountedRef.current && flowGenerationRef.current === generation && draftIdRef.current === id;
     setConfirming(true);
     setError('');
     try {
       const result = await confirmWithdraw({
-        withdrawId: draft.withdrawId,
+        withdrawId: id,
         code,
       });
-      if (!mountedRef.current) return;
+      if (!isCurrent()) return;
+      if (result.withdrawId !== id || result.status !== 'FROZEN') throw new Error('Unconfirmed withdrawal response');
+      setUncertain(false);
       setStep('done');
       setDraft(current =>
-        current
+        current?.withdrawId === id
           ? {
               ...current,
               status: result.status,
@@ -488,27 +569,50 @@ export default function WithdrawScreen() {
             }
           : current,
       );
-      setMessage(
-        tRef.current('withdraw.submittedResult', {
-          status: mapWithdrawStatus(result.status, tRef.current),
-        }),
-      );
+      setMessage('');
+      setCode('');
+      setSendError(false);
+      try {
+        // Confirm reserves the funds; sending is a separate, authenticated step.
+        const sent = await sendWithdrawTx(result.withdrawId);
+        if (!isCurrent()) return;
+        setDraft(current => current?.withdrawId === result.withdrawId
+          ? {...current, status: sent.status} : current);
+      } catch {
+        if (!isCurrent()) return;
+        setSendError(true);
+      }
+      setShowRecords(true);
+      setRecordsRevision(value => value + 1);
       await loadData();
     } catch (requestError) {
-      if (mountedRef.current) {
-        setError(
-          toChineseError(
-            requestError,
-            tRef.current('withdraw.confirmFailed'),
-            tRef.current,
-          ),
-        );
+      if (isCurrent()) {
+        await recoverConfirmation(id, generation, toChineseError(
+          requestError, tRef.current('withdraw.confirmFailed'), tRef.current,
+        ));
       }
     } finally {
       confirmLockRef.current = false;
-      if (mountedRef.current) setConfirming(false);
+      if (isCurrent()) setConfirming(false);
     }
-  }, [code, draft?.withdrawId, loadData]);
+  }, [code, draft?.withdrawId, loadData, recoverConfirmation, setUncertain]);
+
+  const onRecordsChange = useCallback((rows: WithdrawRecord[]) => {
+    if (confirmLockRef.current || recoveryLockRef.current || !mountedRef.current) return;
+    const row = rows.find(item => item.withdrawId === draft?.withdrawId);
+    if (confirmationUncertainRef.current) {
+      if (row) applyConfirmationRecord(row);
+      return;
+    }
+    if (row) {
+      setMessage('');
+      if (row.status !== 'FROZEN') setSendError(false);
+    }
+    setDraft(current => {
+      const matching = rows.find(item => item.withdrawId === current?.withdrawId);
+      return current && matching ? {...current, status: matching.status} : current;
+    });
+  }, [draft?.withdrawId, applyConfirmationRecord]);
 
   return (
     <AppScreen>
@@ -580,6 +684,7 @@ export default function WithdrawScreen() {
               maxLength={256}
               value={address}
               onChangeText={value => {
+                if (draftSubmitLockRef.current || confirmLockRef.current || recoveryLockRef.current || confirmationUncertainRef.current) return;
                 setAddress(value);
                 resetFlow();
               }}
@@ -591,6 +696,7 @@ export default function WithdrawScreen() {
               value={amount}
               keyboardType="decimal-pad"
               onChangeText={value => {
+                if (draftSubmitLockRef.current || confirmLockRef.current || recoveryLockRef.current || confirmationUncertainRef.current) return;
                 setAmount(value.replace(/[^0-9.]/g, ''));
                 resetFlow();
               }}
@@ -598,7 +704,9 @@ export default function WithdrawScreen() {
               right={
                 <SmallTextButton
                   title={t('assetAction.all')}
+                  disabled={submitting || confirming}
                   onPress={() => {
+                    if (draftSubmitLockRef.current || confirmLockRef.current || recoveryLockRef.current || confirmationUncertainRef.current) return;
                     setAmount(
                       isPositiveDecimalText(fundingBalance.text)
                         ? fundingBalance.text
@@ -684,7 +792,7 @@ export default function WithdrawScreen() {
               />
               <InfoRow
                 label={t('assetAction.status')}
-                value={mapWithdrawStatus(draft.status, t)}
+                value={confirmationUncertain ? t('withdraw.confirmPendingTitle') : mapWithdrawStatus(draft.status, t)}
                 tone="gold"
               />
               <InfoRow label={t('assetAction.coin')} value={draft.symbol} />
@@ -759,17 +867,25 @@ export default function WithdrawScreen() {
               <Text style={styles.cardTitle}>
                 {t('withdraw.currentResult')}
               </Text>
+              {sendError ? <InlineNotice>{t('withdraw.sendPending')}</InlineNotice> : null}
               <Text style={styles.resultText}>
-                {message ||
+                {confirmationUncertain ? t('withdraw.confirmPending') : message ||
                   t('withdraw.currentStatus', {
                     status: mapWithdrawStatus(draft.status, t),
                   })}
               </Text>
               <View style={styles.buttonWrap}>
+                {confirmationUncertain ? <PrimaryButton
+                  title={t('withdraw.refreshConfirmation')}
+                  disabled={confirming}
+                  onPress={() => recoverConfirmation(draft.withdrawId, flowGenerationRef.current)}
+                /> : null}
                 <PrimaryButton
                   title={t('withdraw.continue')}
+                  disabled={confirming || confirmationUncertain}
                   variant="secondary"
                   onPress={() => {
+                    if (confirmLockRef.current || recoveryLockRef.current || confirmationUncertainRef.current) return;
                     setAmount('');
                     setAddress('');
                     resetFlow();
@@ -780,6 +896,13 @@ export default function WithdrawScreen() {
           ) : null}
         </>
       )}
+      {isLoggedIn ? <ActionCard>
+        <SmallTextButton title={t('withdraw.records')} onPress={() => setShowRecords(value => !value)} />
+      </ActionCard> : null}
+      {isLoggedIn && showRecords ? <WithdrawRecords
+        revision={recordsRevision} disabled={confirming}
+        onChange={onRecordsChange} onMutation={loadData}
+      /> : null}
     </AppScreen>
   );
 }
@@ -822,32 +945,6 @@ export function isWithdrawFeeReady(
   return Boolean(
     fee && feeFingerprint && feeFingerprint === currentFingerprint,
   );
-}
-
-function mapWithdrawStatus(status: string, t: Translator) {
-  const normalized = status.toUpperCase();
-  if (normalized === 'REVIEWING') {
-    return t('withdraw.status.reviewing');
-  }
-  if (normalized === 'VERIFYING') {
-    return t('withdraw.status.verifying');
-  }
-  if (normalized === 'FROZEN') {
-    return t('withdraw.status.frozen');
-  }
-  if (normalized === 'PROCESSING' || normalized === 'SENDING') {
-    return t('withdraw.status.processing');
-  }
-  if (normalized === 'SENT' || normalized === 'SUCCESS') {
-    return t('withdraw.status.completed');
-  }
-  if (normalized === 'FAILED') {
-    return t('withdraw.status.failed');
-  }
-  if (normalized === 'CANCELED' || normalized === 'CANCELLED') {
-    return t('withdraw.status.canceled');
-  }
-  return t('withdraw.status.updating');
 }
 
 const styles = StyleSheet.create({

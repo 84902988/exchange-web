@@ -1,4 +1,4 @@
-import React, {useEffect, useMemo, useState} from 'react';
+import React, {useCallback, useMemo, useState} from 'react';
 import {Image, StyleSheet, Text, View} from 'react-native';
 import {SvgCssUri} from 'react-native-svg/css';
 import {API_BASE_URL} from '../../config/env';
@@ -39,11 +39,17 @@ export default function MarketLogo({
   size = 30,
 }: Props) {
   const resolvedUrl = useMemo(() => resolveMarketLogoUrl(logoUrl), [logoUrl]);
-  const [failed, setFailed] = useState(false);
+  return <MarketLogoContent key={resolvedUrl ?? 'fallback'} label={label} resolvedUrl={resolvedUrl} positive={positive} size={size} />;
+}
 
-  useEffect(() => {
-    setFailed(false);
-  }, [resolvedUrl]);
+function MarketLogoContent({label, resolvedUrl, positive, size}: {
+  label: string;
+  resolvedUrl: string | null;
+  positive: boolean;
+  size: number;
+}) {
+  const [failed, setFailed] = useState(false);
+  const onError = useCallback(() => setFailed(true), []);
 
   const frameStyle = {
     width: size,
@@ -66,28 +72,34 @@ export default function MarketLogo({
         showLogo && styles.logoFrame,
         frameStyle,
       ]}>
-      {showLogo && isSvg ? (
-        <SvgCssUri
-          accessibilityLabel={label}
-          height={logoSize}
-          onError={() => setFailed(true)}
-          uri={resolvedUrl}
-          width={logoSize}
-        />
-      ) : showLogo ? (
-        <Image
-          accessibilityLabel={label}
-          onError={() => setFailed(true)}
-          source={{uri: resolvedUrl}}
+      {showLogo ? (
+        <View
           style={[
-            styles.image,
+            styles.logoMask,
             {
               width: logoSize,
               height: logoSize,
               borderRadius: logoSize / 2,
             },
-          ]}
-        />
+          ]}>
+          {isSvg ? (
+            <SvgCssUri
+              accessibilityLabel={label}
+              height={logoSize}
+              onError={onError}
+              preserveAspectRatio="xMidYMid meet"
+              uri={resolvedUrl}
+              width={logoSize}
+            />
+          ) : (
+            <Image
+              accessibilityLabel={label}
+              onError={onError}
+              source={{uri: resolvedUrl}}
+              style={[styles.image, {width: logoSize, height: logoSize}]}
+            />
+          )}
+        </View>
       ) : (
         <Text
           maxFontSizeMultiplier={1.1}
@@ -103,7 +115,6 @@ const styles = StyleSheet.create({
   frame: {
     alignItems: 'center',
     justifyContent: 'center',
-    overflow: 'hidden',
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: colors.marketLine,
   },
@@ -114,10 +125,18 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(240, 90, 90, 0.14)',
   },
   logoFrame: {
-    backgroundColor: colors.white,
+    backgroundColor: 'transparent',
+    borderWidth: 0,
+  },
+  logoMask: {
+    // Clip both raster and SVG backgrounds without zooming the artwork.
+    overflow: 'hidden',
+    backgroundColor: colors.marketCardAlt,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   image: {
-    resizeMode: 'cover',
+    resizeMode: 'contain',
   },
   fallbackText: {
     ...typography.semibold,

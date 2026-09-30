@@ -22,6 +22,7 @@ import type { KlineInterval } from '../../components/trade/kline.utils';
 import { useContractKlineRealtime } from '../../hooks/useContractKlineRealtime';
 import { useContractMarketRealtime } from '../../hooks/useContractMarketRealtime';
 import { useMarketScreenActive } from '../../hooks/useMarketScreenActive';
+import { useTradingMarketLogo } from '../../hooks/useTradingMarketLogo';
 import { useSpotMarketRealtime } from '../../hooks/useSpotMarketRealtime';
 import { parseMarketDetailRouteParams } from '../../navigation/marketDetailRoute';
 import type {
@@ -70,6 +71,9 @@ function ValidMarketDetail({
   params: MarketDetailRouteParams;
 }) {
   const active = useMarketScreenActive();
+  const logoUrl = useTradingMarketLogo(
+    params.market, params.symbol, params.logoUrl, active,
+  );
   const [interval, setInterval] = useState<KlineInterval>(
     params.initialInterval ?? '1m',
   );
@@ -107,6 +111,7 @@ function ValidMarketDetail({
 
   const sharedUi = {
     active,
+    logoUrl,
     fullscreen: fullscreenRequested,
     interval,
     onBack: handleBack,
@@ -128,6 +133,7 @@ function ValidMarketDetail({
 
 type SharedDetailProps = {
   active: boolean;
+  logoUrl: string | null;
   fullscreen: boolean;
   interval: KlineInterval;
   onBack: () => void;
@@ -139,6 +145,7 @@ type SharedDetailProps = {
 function SpotMarketDetail({
   params,
   active,
+  logoUrl,
   fullscreen,
   interval,
   onBack,
@@ -175,6 +182,7 @@ function SpotMarketDetail({
       high24h={ticker?.high24h ?? null}
       interval={interval}
       low24h={ticker?.low24h ?? null}
+      logoUrl={logoUrl}
       market="spot"
       marketStatus={ticker?.marketStatus ?? null}
       price={ticker?.lastPrice ?? null}
@@ -199,6 +207,7 @@ function SpotMarketDetail({
 function ContractMarketDetail({
   params,
   active,
+  logoUrl,
   fullscreen,
   interval,
   onBack,
@@ -253,6 +262,7 @@ function ContractMarketDetail({
       high24h={quote?.high24h ?? null}
       interval={interval}
       low24h={quote?.low24h ?? null}
+      logoUrl={logoUrl}
       market="contract"
       marketStatus={quote?.marketStatus ?? null}
       markPrice={quote?.markPrice ?? null}

@@ -39,6 +39,7 @@ from app.core.cookie_policy import get_cookie_options
 from app.core.redis import get_redis
 from app.core.request_utils import get_client_ip, get_user_agent
 from app.core.security import verify_password
+from app.services.svg_viewbox import normalize_svg_viewbox
 from app.db.models.collection import CollectionTask, CollectionTaskStatus, GasTask, GasTaskStatus
 from app.db.models.bd_commission_record import BdCommissionRecord
 from app.db.models.user_invite_commission_record import UserInviteCommissionRecord
@@ -2706,7 +2707,7 @@ async def upload_admin_site_image(
         target = _transcode_site_video(content, original_ext, upload_dir)
     elif media_type == "svg":
         target = upload_dir / f"{uuid.uuid4().hex}{UPLOAD_SITE_MEDIA_DEFAULT_EXT[content_type]}"
-        target.write_bytes(content)
+        target.write_bytes(normalize_svg_viewbox(content))
         _ensure_output_within_limit(target, "图片最大 20MB，上传后会自动压缩")
     else:
         target = upload_dir / f"{uuid.uuid4().hex}.webp"
@@ -2771,7 +2772,7 @@ async def upload_asset_icon(
         ext = original_ext if original_ext in allowed_exts else UPLOAD_IMAGE_DEFAULT_EXT[content_type]
         filename = f"asset_icon_{uuid.uuid4().hex}{ext}"
         target = upload_dir / filename
-        target.write_bytes(content)
+        target.write_bytes(normalize_svg_viewbox(content))
     else:
         filename = f"asset_icon_{uuid.uuid4().hex}.webp"
         target = upload_dir / filename
@@ -8751,6 +8752,7 @@ def asset_config_asset_chain_create(
     asset_id: str = Form(""),
     chain_id: str = Form(""),
     contract_address: str = Form(""),
+    native_deposit_enabled: str = Form("0"),
     decimals: str = Form(""),
     min_deposit: str = Form(""),
     min_withdraw: str = Form(""),
@@ -8781,6 +8783,7 @@ def asset_config_asset_chain_create(
             "asset_id": asset_id,
             "chain_id": chain_id,
             "contract_address": contract_address,
+            "native_deposit_enabled": native_deposit_enabled,
             "decimals": decimals,
             "min_deposit": min_deposit,
             "min_withdraw": min_withdraw,
@@ -8816,6 +8819,7 @@ def asset_config_asset_chain_update(
     request: Request,
     asset_chain_id: int,
     contract_address: str = Form(""),
+    native_deposit_enabled: str = Form("0"),
     decimals: str = Form(""),
     min_deposit: str = Form(""),
     min_deposit_amount: str = Form("", alias="min_deposit_amount"),
@@ -8850,6 +8854,7 @@ def asset_config_asset_chain_update(
             asset_chain_id,
             {
                 "contract_address": contract_address,
+                "native_deposit_enabled": native_deposit_enabled,
                 "decimals": decimals,
                 "min_deposit": min_deposit_amount or min_deposit,
                 "min_withdraw": min_withdraw_amount or min_withdraw,

@@ -1,3 +1,4 @@
+import {useApplicationActive} from './useApplicationState';
 import {
   startTransition,
   useCallback,
@@ -26,6 +27,7 @@ type AssetSnapshotState = {
 
 export function useAssetSnapshot() {
   const { loading: authLoading, user } = useAuth();
+  const applicationActive = useApplicationActive();
   const userId = getAssetSnapshotUserId(user?.id);
   const generationRef = useRef(0);
   const forceReloadRef = useRef(false);
@@ -41,7 +43,7 @@ export function useAssetSnapshot() {
 
   useFocusEffect(
     useCallback(() => {
-      if (!userId || authLoading) {
+      if (!userId || authLoading || !applicationActive) {
         return undefined;
       }
 
@@ -59,7 +61,7 @@ export function useAssetSnapshot() {
 
       const force = reloadRevision > 0 && forceReloadRef.current;
       forceReloadRef.current = false;
-      loadAssetSnapshot({ userId, force }).then(result => {
+      const refresh = (forceRefresh: boolean) => loadAssetSnapshot({ userId, force: forceRefresh }).then(result => {
         if (
           !active ||
           generation !== generationRef.current ||
@@ -83,13 +85,16 @@ export function useAssetSnapshot() {
         });
       });
 
+      refresh(force);
+      const timer = setInterval(() => refresh(true), 25_000);
       return () => {
+        clearInterval(timer);
         active = false;
         if (generationRef.current === generation) {
           generationRef.current += 1;
         }
       };
-    }, [authLoading, reloadRevision, userId]),
+    }, [applicationActive, authLoading, reloadRevision, userId]),
   );
 
   const reload = useCallback(() => {

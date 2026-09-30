@@ -48,6 +48,7 @@ def test_mobile_overview_serves_last_good_and_revalidates_after_response(monkeyp
         "filter_active_mobile_market_overview",
         lambda db, payload: payload,
     )
+    monkeypatch.setattr(market, "enrich_mobile_market_logos", lambda db, payload: payload)
     monkeypatch.setattr(
         market,
         "get_mobile_market_overview",
@@ -102,6 +103,7 @@ def test_mobile_overview_active_cache_does_not_schedule_refresh(monkeypatch) -> 
         "filter_active_mobile_market_overview",
         lambda db, payload: payload,
     )
+    monkeypatch.setattr(market, "enrich_mobile_market_logos", lambda db, payload: payload)
 
     payload = market.mobile_overview(background_tasks=background_tasks, db=object())
 

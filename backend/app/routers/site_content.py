@@ -10,6 +10,7 @@ from app.db.session import get_db
 from app.deps.auth import get_optional_current_user_id
 from app.schemas.response import ok
 from app.services.help_content_service import get_public_help_content
+from app.services.mobile_content_service import get_public_bank_portal_url
 from app.services.site_content_service import (
     get_public_about_page,
     get_public_announcement,
@@ -32,7 +33,9 @@ def site_config(
 ):
     trace_id = getattr(request.state, "trace_id", None)
     locale = resolve_content_locale(lang, request.headers.get("accept-language"))
-    return ok(data=get_public_site_config(db, locale=locale), trace_id=trace_id)
+    data = get_public_site_config(db, locale=locale)
+    data["bank_portal_url"] = get_public_bank_portal_url(db)
+    return ok(data=data, trace_id=trace_id)
 
 
 @router.get("/home/banners")

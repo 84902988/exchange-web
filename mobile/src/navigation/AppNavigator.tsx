@@ -41,6 +41,7 @@ import ActivityDetailScreen from '../screens/home/ActivityDetailScreen';
 import HelpCenterScreen from '../screens/home/HelpCenterScreen';
 import HelpArticleScreen from '../screens/home/HelpArticleScreen';
 import AboutPageScreen from '../screens/home/AboutPageScreen';
+import BankScreen from '../screens/home/BankScreen';
 import LanguageSettingsScreen from '../screens/settings/LanguageSettingsScreen';
 import type { RootStackParamList } from './types';
 import {resolveAppOrientation} from '../constants/responsiveLayout';
@@ -134,6 +135,7 @@ export default function AppNavigator() {
         <Stack.Screen name="HelpCenter" component={HelpCenterScreen} />
         <Stack.Screen name="HelpArticle" component={HelpArticleScreen} />
         <Stack.Screen name="AboutPage" component={AboutPageScreen} />
+        <Stack.Screen name="Bank" component={BankScreen} />
         <Stack.Screen
           name="LanguageSettings"
           component={LanguageSettingsScreen}

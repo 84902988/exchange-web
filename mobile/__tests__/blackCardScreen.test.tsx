@@ -42,7 +42,7 @@ describe('BlackCard screen', () => {
     });
 
     const rendered = JSON.stringify(renderer!.toJSON());
-    expect(rendered).toContain('Exchange 黑卡');
+    expect(rendered).toContain(`${branding.displayName} 黑卡`);
     expect(rendered).toContain('卡片服务信息尚未发布');
     expect(rendered).not.toContain('USDT');
     expect(rendered).not.toContain('mailto:');

@@ -84,6 +84,7 @@ import { useContractKlineRealtime } from '../../hooks/useContractKlineRealtime';
 import { useContractMarketRealtime } from '../../hooks/useContractMarketRealtime';
 import { useDeferredScreenContent } from '../../hooks/useDeferredScreenContent';
 import { useMarketScreenActive } from '../../hooks/useMarketScreenActive';
+import { useTradingMarketLogo } from '../../hooks/useTradingMarketLogo';
 import { usePrivateTradingRealtime } from '../../hooks/usePrivateTradingRealtime';
 import { isContractExecutionLeaseActive } from '../../realtime/contractExecutionLease';
 import { getContractMarketRealtimeStore } from '../../realtime/contractMarketRealtime';
@@ -329,7 +330,6 @@ export default function ContractScreen() {
   const {
     baseAsset,
     displayLabel,
-    logoUrl,
     marketCategory,
     quoteAsset,
     symbol,
@@ -349,6 +349,9 @@ export default function ContractScreen() {
       : null;
   const orderIntentScope = `${orderIntentOwnerKey || 'anonymous'}|${symbol}`;
   const marketScreenActive = useMarketScreenActive();
+  const logoUrl = useTradingMarketLogo(
+    'contract', symbol, instrument.logoUrl, marketScreenActive,
+  );
   const deferredScreenContentReady =
     useDeferredScreenContent(marketScreenActive);
   const [klineInterval, setKlineInterval] = useState<KlineInterval>('1m');
@@ -3814,6 +3817,7 @@ export default function ContractScreen() {
       displayLabel: localizedDisplayLabel,
       marketCategory,
       initialInterval: klineInterval,
+      ...(logoUrl ? { logoUrl } : {}),
       ...(contractKline.items.length > 0
         ? { initialKlines: contractKline.items.slice(-48) }
         : {}),
@@ -3826,6 +3830,7 @@ export default function ContractScreen() {
     contractKline.items,
     klineInterval,
     localizedDisplayLabel,
+    logoUrl,
     marketCategory,
     navigation,
     positionPriceLines,

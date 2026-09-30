@@ -148,6 +148,7 @@ class AssetChain(Base):
     contract_address: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     decimals: Mapped[int] = mapped_column(Integer, nullable=False, default=18)
     deposit_enabled: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    native_deposit_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
     withdraw_enabled: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     enabled: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     min_deposit: Mapped[Decimal] = mapped_column(AMOUNT, nullable=False, default=Decimal("0"))

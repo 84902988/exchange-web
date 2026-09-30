@@ -16,14 +16,14 @@ export default function AssetSummary() {
   const {t} = useLanguage();
   const assetState = useAssetSnapshot();
   const {loading, snapshot} = assetState;
-  const totalUsdt =
-    snapshot?.valuationComplete && snapshot.totalUsdt !== null
-      ? snapshot.totalUsdt
+  const totalUsd =
+    snapshot?.usdValuationComplete && snapshot.totalUsd != null
+      ? snapshot.totalUsd
       : null;
   const amountText =
-    !loading && totalUsdt !== null
-      ? `${formatAssetNumber(totalUsdt, 2)} USDT`
-      : '-- USDT';
+    !loading && totalUsd != null
+      ? `${formatAssetNumber(totalUsd, 2)} USD`
+      : '-- USD';
   const statusText = getAssetSummaryStatus(assetState, t);
 
   return (
@@ -54,7 +54,7 @@ function getAssetSummaryStatus(
   if (!state.userId) return t('home.assetLogin');
   if (state.loading) return t('home.assetLoading');
   if (!state.snapshot) return t('home.assetMissing');
-  if (!state.snapshot.valuationComplete) {
+  if (!state.snapshot.usdValuationComplete) {
     return t('home.assetIncomplete');
   }
   return t('home.assetUpdated');

@@ -37,6 +37,7 @@ from app.services.market_cache import (
     market_cache_key,
 )
 from app.services.market_ws import market_ws_manager
+from app.services.mobile_market_logos import enrich_mobile_market_logos
 from app.services.spot_market_view import get_spot_market_view
 from app.services.reference_overlay_service import get_reference_overlay_for_symbol
 
@@ -46,11 +47,17 @@ router = APIRouter(
 )
 logger = logging.getLogger(__name__)
 
+
+@router.get('/valuation-rate', summary='USDT/USD asset valuation rate')
+def get_asset_valuation_rate():
+    from app.services.asset_valuation_rate import get_usdt_usd_valuation_rate
+    return get_usdt_usd_valuation_rate()
+
 MARKET_TICKER_CACHE_VERSION = "1"
 MARKET_TICKER_FIELD_VERSION = "ticker_fields_v2"
 MARKET_TICKER_PROVIDER_VERSION = "default"
-MARKET_MOBILE_OVERVIEW_CACHE_VERSION = "4"
-MARKET_MOBILE_OVERVIEW_FIELD_VERSION = "mobile_overview_v4_admin_shortcuts"
+MARKET_MOBILE_OVERVIEW_CACHE_VERSION = "6"
+MARKET_MOBILE_OVERVIEW_FIELD_VERSION = "mobile_overview_v6_stock_catalog_cfd_groups"
 MARKET_MOBILE_OVERVIEW_CACHE_TTL_SECONDS = 10
 MARKET_MOBILE_OVERVIEW_LAST_GOOD_TTL_SECONDS = 24 * 60 * 60
 
@@ -261,6 +268,7 @@ def mobile_overview(background_tasks: BackgroundTasks, db: Session = Depends(get
                     last_good_ttl_seconds=MARKET_MOBILE_OVERVIEW_LAST_GOOD_TTL_SECONDS,
                 )
         payload = filter_active_mobile_market_overview(db, payload)
+        payload = enrich_mobile_market_logos(db, payload)
         if isinstance(payload, dict) and payload.get("is_stale"):
             payload = {
                 **payload,

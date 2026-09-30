@@ -17,6 +17,7 @@ import { useLocaleContext } from '@/contexts/LocaleContext';
 import enTranslations from '@/config/locales/en.json';
 import HeaderMarketSearch from './HeaderMarketSearch';
 import { DEFAULT_SITE_LOGO_URL, resolveSiteLogoUrl } from '@/lib/siteLogo';
+import { withBankPortal } from '@/lib/bankPortal';
 
 const FALLBACK_LOGO_URL = fallbackSiteConfig.logo_url || DEFAULT_SITE_LOGO_URL;
 const FALLBACK_SITE_NAME = fallbackSiteConfig.site_name || 'Exchange';
@@ -50,6 +51,7 @@ export default function Header() {
     appIosQrUrl: '',
     appDownloadTitle: '',
     appDownloadSubtitle: '',
+    bankPortalUrl: '',
   });
   const [unreadAnnouncements, setUnreadAnnouncements] = useState(0);
   const stableIsLoggedIn = mounted && isLoggedIn;
@@ -97,6 +99,7 @@ export default function Header() {
           appIosQrUrl: config.app_ios_qr_url || '',
           appDownloadTitle: config.app_download_title || '',
           appDownloadSubtitle: config.app_download_subtitle || '',
+          bankPortalUrl: config.bank_portal_url || '',
         });
       })
       .catch(() => {
@@ -109,6 +112,7 @@ export default function Header() {
           appIosQrUrl: fallbackSiteConfig.app_ios_qr_url || '',
           appDownloadTitle: fallbackSiteConfig.app_download_title || '',
           appDownloadSubtitle: fallbackSiteConfig.app_download_subtitle || '',
+          bankPortalUrl: '',
         });
       });
 
@@ -226,6 +230,7 @@ export default function Header() {
     return () => desktop.removeEventListener('change', closeOnDesktop);
   }, [showMobileMenu]);
   const headerT = (key: string) => (mounted ? t(key, 'common') : DEFAULT_COMMON_TRANSLATIONS[key] || key);
+  const navigationItems = withBankPortal(menuConfig.items, siteBrand.bankPortalUrl);
   const appDownloadTitle = siteBrand.appDownloadTitle || headerT('appDownloadTitle');
   const appDownloadSubtitle = siteBrand.appDownloadSubtitle || headerT('appDownloadSubtitle');
   const appQrItems = [
@@ -267,7 +272,7 @@ export default function Header() {
           </Link>
 
           <nav className="hidden items-center gap-4 whitespace-nowrap lg:order-3 lg:flex lg:min-h-11 lg:w-full lg:justify-center xl:min-h-0 xl:w-auto xl:gap-3 2xl:gap-4">
-            {menuConfig.items.map((item) => {
+            {navigationItems.map((item) => {
               const hasMegaMenu = 'megaMenu' in item;
               const translatedLabel = headerT(item.labelKey);
 
@@ -295,6 +300,15 @@ export default function Header() {
                     >
                       {translatedLabel}
                     </button>
+                  ) : item.isExternal ? (
+                    <a
+                      href={item.href}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-sm font-semibold text-white/85 transition-colors duration-200 hover:text-white 2xl:text-base"
+                    >
+                      {translatedLabel}
+                    </a>
                   ) : (
                     <Link
                       href={item.href}
@@ -504,7 +518,7 @@ export default function Header() {
         open={showMobileMenu}
         onClose={() => setShowMobileMenu(false)}
         isLoggedIn={stableIsLoggedIn}
-        menuItems={menuConfig.items}
+        menuItems={navigationItems}
       />
 
       {showSearch ? (

@@ -397,11 +397,11 @@
   {% endif %}
 
   {% if show_operations %}
-    <details class="group" {% if active_group == 'operations' or active in ['reference_overlays', 'site_settings', 'site_legal_pages', 'home_banners', 'activity_banners', 'activities', 'announcements', 'help_categories', 'help_articles', 'mobile_content_settings', 'mobile_banners', 'mobile_announcements', 'dividend_config', 'dividend_pools', 'dividend_stats'] %}open{% endif %}>
+    <details class="group" {% if active_group == 'operations' or active in ['reference_overlays', 'site_settings', 'site_about_page', 'site_legal_pages', 'home_banners', 'activity_banners', 'activities', 'announcements', 'help_categories', 'help_articles', 'mobile_content_settings', 'mobile_banners', 'mobile_announcements', 'dividend_config', 'dividend_pools', 'dividend_stats'] %}open{% endif %}>
       <summary>运营 <span class="chev">▾</span></summary>
       <div class="nav">
         {% if can_site_settings or can_banners or can_announcements or can_help_content or can_pairs %}
-          <details class="admin-nav-group" {% if active in ['site_settings', 'site_legal_pages', 'home_banners', 'activity_banners', 'activities', 'announcements', 'help_categories', 'help_articles', 'reference_overlays'] %}open{% endif %}>
+          <details class="admin-nav-group" {% if active in ['site_settings', 'site_about_page', 'site_legal_pages', 'home_banners', 'activity_banners', 'activities', 'announcements', 'help_categories', 'help_articles', 'reference_overlays'] %}open{% endif %}>
             <summary class="admin-nav-group-summary">内容运营 <span class="chev">▾</span></summary>
             <div class="admin-nav-group-items">
               {% if can_site_settings %}
@@ -426,6 +426,9 @@
                 </a>
               {% endif %}
               {% if can_help_content %}
+                <a href="/admin/site-about-page" class="{% if active == 'site_about_page' %}active{% endif %}">
+                  <span class="icon">A</span> 关于我们页面
+                </a>
                 <a href="/admin/site-legal-pages" class="{% if active == 'site_legal_pages' %}active{% endif %}">
                   <span class="icon">L</span> 风险与协议页面
                 </a>

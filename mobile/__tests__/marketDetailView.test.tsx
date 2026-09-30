@@ -1,5 +1,5 @@
 import React from 'react';
-import { Dimensions, StyleSheet } from 'react-native';
+import { Dimensions, Image, StyleSheet } from 'react-native';
 import ReactTestRenderer, { act } from 'react-test-renderer';
 
 let nativeChartProps: Record<string, any> | null = null;
@@ -108,6 +108,23 @@ function makeProps(
 }
 
 describe('MarketDetailView', () => {
+  it('renders the supplied portrait logo through the shared circular component and retains fallback on failure', () => {
+    let renderer!: ReactTestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = ReactTestRenderer.create(
+        <MarketDetailView {...makeProps({logoUrl: 'https://cdn.example.com/btc.png'})} />,
+      );
+    });
+    const logo = renderer.root.findByType(Image);
+    expect(logo.props.source.uri).toBe('https://cdn.example.com/btc.png');
+    expect(logo.props.accessibilityLabel).toBe('BTC');
+    const mask = StyleSheet.flatten(logo.parent!.props.style);
+    expect(mask).toEqual(expect.objectContaining({borderRadius: 13, overflow: 'hidden'}));
+    act(() => { logo.props.onError(); });
+    expect(renderer.root.findAllByType(Image)).toHaveLength(0);
+    expect(JSON.stringify(renderer.toJSON())).toContain('BT');
+    act(() => renderer.unmount());
+  });
   it('shows an overflow cue until the indicator strip reaches its end', () => {
     expect(
       getHorizontalOverflowPresentation({

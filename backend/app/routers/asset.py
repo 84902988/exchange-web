@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -21,6 +21,7 @@ from app.deps.auth import get_current_user_id
 from app.services.address_service import get_or_create_deposit_address
 from app.services.balance import FUNDING_BALANCE_CHAIN_KEY, SPOT_BALANCE_CHAIN_KEY, transfer_available
 from app.services.moralis_service import add_address_to_streams, get_stream_id_for_chain
+from app.services.deposit_credit_status import load_deposit_credit_destinations
 
 router = APIRouter(prefix="/asset", tags=["asset"])
 logger = logging.getLogger(__name__)
@@ -50,6 +51,19 @@ def _d(v: Any) -> str:
     if isinstance(v, Decimal):
         return format(v, "f")
     return str(v)
+
+
+def _balance_log_display_amount(row: Mapping[str, Any]) -> str:
+    """Withdrawal logs store a magnitude; apply their direction for display only."""
+    raw_amount = row.get("change_amount")
+    change_type = str(row.get("change_type") or "").strip().upper()
+    biz_type = str(row.get("raw_biz_type") or "").strip().upper()
+    direction = row.get("direction")
+    if (change_type.startswith("WITHDRAW") or biz_type == "WITHDRAW") and direction in (-1, 1):
+        # Preserve decimal precision and leave the underlying ledger unchanged.
+        magnitude = Decimal(_d(raw_amount)).copy_abs()
+        return _d(magnitude.copy_negate() if direction == -1 and magnitude else magnitude)
+    return _d(raw_amount)
 
 
 def _sum_balance_rows(
@@ -427,6 +441,10 @@ def _query_asset_chain_options(db: Session, *, scene: str) -> List[Dict[str, Any
             continue
         if scene == "deposit" and not is_chain_deposit_supported(chain_key):
             continue
+        if scene == "deposit" and not str(row.get("contract_address") or "").strip():
+            from app.services.native_deposit_service import load_native_asset
+            if not load_native_asset(db, chain_key, str(row["coin_symbol"])):
+                continue
         if scene == "withdraw" and not is_chain_withdraw_supported(chain_key):
             continue
 
@@ -689,6 +707,14 @@ def get_deposit_address(
             status_code=400,
             detail={"code": "ASSET_CHAIN_DISABLED", "message": f"{symbol_u}-{chain_key} disabled"},
         )
+
+    if not str(info.get("contract_address") or "").strip():
+        from app.services.native_deposit_service import load_native_asset
+        if not load_native_asset(db, chain_key, symbol_u):
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "NATIVE_DEPOSIT_DISABLED", "message": f"{symbol_u}-{chain_key} native deposit not configured"},
+            )
 
     try:
         address, memo = get_or_create_deposit_address(db, user_id=user_id, chain_key=chain_key)
@@ -1135,11 +1161,14 @@ def list_deposits(
         params,
     ).mappings().all()
 
+    credit_destinations = load_deposit_credit_destinations(db, user_id, [r['id'] for r in rows])
     items: List[Dict[str, Any]] = []
     for r in rows:
         items.append(
             {
                 "id": int(r["id"]),
+                "credited": credit_destinations.get(int(r["id"])) is not None,
+                "credit_destination": credit_destinations.get(int(r["id"])),
                 "symbol": r["symbol"],
                 "chain_key": r["chain_key"],
                 "address": r.get("address"),
@@ -1228,6 +1257,7 @@ def list_my_balance_logs(
               biz_type AS raw_biz_type,
               biz_id,
               request_id,
+              direction,
               change_amount,
               after_available,
               remark,
@@ -1254,7 +1284,7 @@ def list_my_balance_logs(
                 "request_id": r.get("request_id"),
                 "coin_symbol": r.get("coin_symbol"),
                 "chain_key": r.get("chain_key"),
-                "change_amount": _d(r.get("change_amount")),
+                "change_amount": _balance_log_display_amount(r),
                 "after_available": _d(r.get("after_available")),
                 "remark": r.get("remark") or "",
             }

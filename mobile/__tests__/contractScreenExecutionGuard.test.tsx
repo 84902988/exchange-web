@@ -13,6 +13,13 @@ import {
   CONTRACT_TRADE_CONFIRM_HIDDEN_STORAGE_KEY,
 } from '../src/services/contractTradeConfirmPreference';
 
+let mockLogoCatalog: Array<Record<string, unknown>> = [];
+jest.mock('../src/api/tradingCatalog', () => ({
+  ...jest.requireActual('../src/api/tradingCatalog'),
+  getCachedContractTradingCatalog: () => mockLogoCatalog,
+  fetchContractTradingCatalog: async () => mockLogoCatalog,
+}));
+
 const mockNavigate = jest.fn();
 const mockCancelContractOrder = jest.fn();
 const mockOpenContractOrder = jest.fn();
@@ -414,6 +421,7 @@ describe('ContractScreen execution confirmation lifecycle', () => {
     mockContractMarketState = executableMarketState();
     mockWaitForExecutionLease.mockResolvedValue(null);
     mockRouteParams = undefined;
+    mockLogoCatalog = [];
     mockOrderFormProps = null;
     mockBottomTabsProps = null;
     mockKlineChartProps = null;
@@ -512,6 +520,22 @@ describe('ContractScreen execution confirmation lifecycle', () => {
       marketCategory: 'crypto',
       initialInterval: '1m',
     });
+  });
+
+  it('fills the default contract header from catalog metadata and carries its logo to details', async () => {
+    mockLogoCatalog = [{symbol: 'BTCUSDT_PERP', logoUrl: '/uploads/btc.svg'}];
+    renderer = await renderReadyContractScreen();
+    expect(mockSymbolHeaderProps?.logoUrl).toBe('/uploads/btc.svg');
+    act(() => { mockSymbolHeaderProps?.onOpenChart(); });
+    expect(mockNavigate).toHaveBeenCalledWith('MarketDetail', expect.objectContaining({symbol: 'BTCUSDT_PERP', logoUrl: '/uploads/btc.svg'}));
+  });
+
+  it('keeps the logo received from the market list when opening details', async () => {
+    mockRouteParams = {symbol: 'NVDAUSDT_PERP', baseAsset: 'NVDA', quoteAsset: 'USDT', displayLabel: 'NVDA/USDT', marketCategory: 'stock', logoUrl: '/uploads/list.png'};
+    renderer = await renderReadyContractScreen();
+    expect(mockSymbolHeaderProps?.logoUrl).toBe('/uploads/list.png');
+    act(() => { mockSymbolHeaderProps?.onOpenChart(); });
+    expect(mockNavigate).toHaveBeenCalledWith('MarketDetail', expect.objectContaining({logoUrl: '/uploads/list.png'}));
   });
 
   it('passes the retained Contract Klines into the detail preview', async () => {
